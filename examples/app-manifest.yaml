@@ -1,0 +1,35 @@
+schema_version: 1
+
+source:        # one of build | image
+  type: build
+  dockerfile: Dockerfile
+  context: .               # Reject anything outside of `.`
+# image: strm/helloworld-http:latest
+
+routing:
+  hosts: [my-app.example.com, www.my-app.example.com]        # when hostname already registered, fail
+
+container:
+  port: 8080                    # Defaults to a single `EXPOSE` (tcp) in the image config
+                                # (error if not present or more than one `EXPOSE`)
+  health:
+    readiness:          # omit entirely -> tcp connect to the route port
+      type: http                # http|tcp|none   (tagged one-of, all other fields invalid when `none`)
+      path: /healthz            # required when `http`, no default
+      port: 8080                # defaults to the first container port
+      interval: 10s             # default: `10s`
+      initial_delay: 10s        # default: `1s`
+      timeout: 3s               # default: `5s`
+      failure_threshold: 3      # default: `3`
+      success_threshold: 1      # default: `1`
+    liveness:
+      # Same as above
+  volumes:                      # volumes are kept when an app is deleted
+    - name: data                # host path is calculated as <data-dir>/app-id/<volume-name>
+      mount: /var/lib/my-app/data
+      read_only: false
+  secrets:
+    - DB_PASSWORD               # Sanitation is the job of the user
+  env:
+    DATABASE_URL: postgres://user:{{DB_PASSWORD}}@db:5432/my-app
+    ENVIRONMENT: production
