@@ -474,12 +474,16 @@ mod tests {
         false
     }
 
+    /// A tiny http server that exposes exactly one port, and — unlike the
+    /// image the examples use — is built for every architecture spaceport
+    /// runs on. An emulated container takes seconds to start and seconds more
+    /// to answer a signal, all of it paid by this test.
     fn hello_manifest() -> AppManifest {
         AppManifest::parse(
             "schema_version: 1
 source:
   type: image
-  image: strm/helloworld-http:latest
+  image: traefik/whoami:latest
 routing:
   hosts: [alpha.test]
 ",
