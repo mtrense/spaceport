@@ -1,0 +1,16 @@
+schema_version: 1
+source:
+  type: image
+  image: hashicorp/http-echo:latest
+routing:
+  hosts: [echo.test]
+container:
+  port: 8080
+  health:
+    readiness:
+      type: tcp
+      interval: 1s
+      initial_delay: 0s
+      timeout: 5s
+      failure_threshold: 30
+      success_threshold: 1
