@@ -12,7 +12,7 @@ repository = "https://github.com/mx/spaceport"
 spaceport-core = { path = "crates/spaceport-core" }
 anyhow = "1"
 async-trait = "0.1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 # Maintained fork of the deprecated serde_yaml, same API.
 serde_norway = "0.9"

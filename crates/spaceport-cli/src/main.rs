@@ -73,7 +73,7 @@ struct ApplyArgs {
     manifest: PathBuf,
 
     #[command(flatten)]
-    operator: OperatorArgs,
+    server: ServerArgs,
 }
 
 #[derive(Debug, Args)]
@@ -82,7 +82,7 @@ struct ListArgs {
     pattern: Option<Pattern>,
 
     #[command(flatten)]
-    operator: OperatorArgs,
+    server: ServerArgs,
 }
 
 #[derive(Debug, Args)]
@@ -91,14 +91,21 @@ struct DestroyArgs {
     app_id: AppId,
 
     #[command(flatten)]
-    operator: OperatorArgs,
+    server: ServerArgs,
 }
 
 #[derive(Debug, Args)]
-struct OperatorArgs {
-    /// The operator interface of the spaceport to talk to.
-    #[arg(short, long, value_name = "SOCKET|ADDRESS", default_value = DEFAULT_OPERATOR_ENDPOINT)]
-    operator: OperatorEndpoint,
+struct ServerArgs {
+    /// The spaceport to talk to: an operator socket, or an address over the
+    /// network.
+    #[arg(
+        short,
+        long,
+        value_name = "SOCKET|ADDRESS",
+        env = "SPACEPORT_SERVER",
+        default_value = DEFAULT_OPERATOR_ENDPOINT
+    )]
+    server: OperatorEndpoint,
 }
 
 #[derive(Debug, Args)]
@@ -217,7 +224,7 @@ async fn apply(args: ApplyArgs) -> Result<()> {
 
     print!(
         "{}",
-        client::apply(&args.operator.operator, &args.app_id, manifest).await?
+        client::apply(&args.server.server, &args.app_id, manifest).await?
     );
 
     Ok(())
@@ -226,7 +233,7 @@ async fn apply(args: ApplyArgs) -> Result<()> {
 async fn list(args: ListArgs) -> Result<()> {
     print!(
         "{}",
-        client::list(&args.operator.operator, args.pattern.as_ref()).await?
+        client::list(&args.server.server, args.pattern.as_ref()).await?
     );
 
     Ok(())
@@ -235,7 +242,7 @@ async fn list(args: ListArgs) -> Result<()> {
 async fn destroy(args: DestroyArgs) -> Result<()> {
     print!(
         "{}",
-        client::destroy(&args.operator.operator, &args.app_id).await?
+        client::destroy(&args.server.server, &args.app_id).await?
     );
 
     Ok(())
