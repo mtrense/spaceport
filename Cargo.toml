@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = ["crates/spaceport-cli", "crates/spaceport-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/mx/spaceport"
+
+[workspace.dependencies]
+spaceport-core = { path = "crates/spaceport-core" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }

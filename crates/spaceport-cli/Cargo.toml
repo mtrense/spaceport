@@ -1,0 +1,15 @@
+[package]
+name = "spaceport-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "spaceport"
+path = "src/main.rs"
+
+[dependencies]
+spaceport-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
