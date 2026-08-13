@@ -7,8 +7,9 @@
 //!
 //! Every container spaceport creates is named and labelled after its app. The
 //! name is what makes re-applying a manifest idempotent — the old container is
-//! found and removed by name — and the label is what will let a restarted
-//! spaceport find the containers it left running.
+//! found and removed by name, and found and adopted by name across a restart —
+//! and the label is what lets a restarted spaceport find every container it
+//! left behind, including the ones no app is named for any more.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -202,6 +203,89 @@ impl ContainerRuntime for DockerRuntime {
                 Err(error.context(format!("starting app `{app}`")))
             }
         }
+    }
+
+    async fn adopt(&self, app: &AppId, manifest: &AppManifest) -> Result<Option<Container>> {
+        // Every question below is asked of the container the engine already
+        // has, and of nothing else: no image is inspected, and nothing is
+        // pulled. A restart of spaceport must not depend on a registry being
+        // reachable to bring back apps that never stopped running.
+        let Source::Image { image } = &manifest.source else {
+            return Ok(None);
+        };
+
+        let name = container_name(app);
+        let inspect = match self
+            .docker
+            .inspect_container(&name, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(inspect) => inspect,
+            Err(error) if is_not_found(&error) => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspecting container `{name}`"));
+            }
+        };
+
+        let Some(id) = inspect.id.map(ContainerId::new) else {
+            return Ok(None);
+        };
+
+        // A container that exited while spaceport was down has no published
+        // port and nothing behind it. Starting it again is what `launch` is
+        // for, and it is the same work as starting a new one.
+        if inspect.state.and_then(|state| state.running) != Some(true) {
+            debug!(app = %app, container = %id, "the container from before is not running");
+            return Ok(None);
+        }
+
+        let config = inspect.config.unwrap_or_default();
+
+        // The name is spaceport's own, but the label is what says so. A
+        // container under this name that spaceport did not create is somebody
+        // else's, and adopting it would route traffic into it.
+        if config
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(MANAGED_LABEL))
+            .map(String::as_str)
+            != Some("true")
+        {
+            warn!(app = %app, container = %id, "a container named `{name}` is not spaceport's, so it is not adopted");
+            return Ok(None);
+        }
+
+        // Not the image *id*: two manifests can resolve to the same digest and
+        // it is the manifest this container was created from that says whether
+        // it is still the right container.
+        if config.image.as_deref() != Some(image.as_str()) {
+            debug!(app = %app, container = %id, running = ?config.image, wanted = %image, "the container from before runs another image");
+            return Ok(None);
+        }
+
+        // Both of these can only fail for a container spaceport would refuse
+        // to launch anyway, so they decline rather than report: whatever the
+        // real problem is, `launch` is about to say it properly.
+        let Ok(port) = container_port(
+            manifest.container.port,
+            image,
+            &config.exposed_ports.unwrap_or_default(),
+        ) else {
+            return Ok(None);
+        };
+        let ports = inspect
+            .network_settings
+            .and_then(|settings| settings.ports)
+            .unwrap_or_default();
+        let upstream = match published_upstream(&ports, port) {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                debug!(app = %app, container = %id, %error, "cannot reach the container from before");
+                return Ok(None);
+            }
+        };
+
+        Ok(Some(Container { id, upstream }))
     }
 
     async fn remove(&self, id: &ContainerId) -> Result<()> {
@@ -582,6 +666,50 @@ routing:
         assert!(
             !managed.iter().any(|found| found.id == container.id),
             "{managed:?}",
+        );
+    }
+
+    /// What a restart is now able to skip: the container the previous spaceport
+    /// started is found by name, at the port it was published on.
+    #[tokio::test]
+    async fn adopts_the_container_it_left_running() {
+        let Some(runtime) = daemon().await else {
+            eprintln!("skipping: no docker daemon");
+            return;
+        };
+        let app: AppId = "spaceport-selftest-adopt".parse().unwrap();
+        let container = runtime.launch(&app, &hello_manifest()).await.unwrap();
+
+        let adopted = runtime.adopt(&app, &hello_manifest()).await.unwrap();
+
+        assert_eq!(adopted, Some(container.clone()));
+
+        // A manifest that names another image does not describe this
+        // container, so there is nothing here to adopt — and answering that
+        // must not need the image to be pullable.
+        let elsewhere = AppManifest::parse(
+            "schema_version: 1
+source:
+  type: image
+  image: spaceport.invalid/nothing:v1
+routing:
+  hosts: [alpha.test]
+container:
+  port: 80
+",
+        )
+        .unwrap();
+        assert_eq!(runtime.adopt(&app, &elsewhere).await.unwrap(), None);
+
+        // Nor is there once it is gone.
+        runtime.remove(&container.id).await.unwrap();
+        assert_eq!(runtime.adopt(&app, &hello_manifest()).await.unwrap(), None);
+
+        // And an app that never ran here has nothing to adopt either.
+        let unknown: AppId = "spaceport-selftest-never-ran".parse().unwrap();
+        assert_eq!(
+            runtime.adopt(&unknown, &hello_manifest()).await.unwrap(),
+            None
         );
     }
 

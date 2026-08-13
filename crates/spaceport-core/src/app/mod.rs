@@ -8,7 +8,7 @@ pub mod reconcile;
 pub mod repository;
 pub mod store;
 
-pub use apply::Applier;
+pub use apply::{Applier, Restored};
 pub use manifest::AppManifest;
 pub use pattern::Pattern;
 pub use reconcile::reconcile;

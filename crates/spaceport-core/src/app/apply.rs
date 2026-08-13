@@ -16,7 +16,7 @@ use tracing::{info, warn};
 
 use super::repository::AppRepository;
 use super::{App, AppId, AppManifest, AppStore, health};
-use crate::runtime::ContainerRuntime;
+use crate::runtime::{Container, ContainerRuntime};
 
 /// Why an apply did not happen. The distinction is worth keeping because the
 /// operator interface answers differently: a conflict is the operator's to fix,
@@ -57,6 +57,31 @@ impl fmt::Display for DestroyError {
 }
 
 impl std::error::Error for DestroyError {}
+
+/// How an app came back at a restart.
+///
+/// Both mean the app is running and routed; they differ in what it cost. The
+/// distinction is worth reporting, because "adopted" is the answer that says a
+/// restart of spaceport did not interrupt anybody's traffic.
+#[derive(Debug)]
+pub enum Restored {
+    /// Its container was still running and was taken over untouched.
+    Adopted(Arc<App>),
+    /// There was nothing to take over, so it was started again.
+    Relaunched(Arc<App>),
+}
+
+impl Restored {
+    pub fn app(&self) -> &Arc<App> {
+        match self {
+            Self::Adopted(app) | Self::Relaunched(app) => app,
+        }
+    }
+
+    pub fn was_adopted(&self) -> bool {
+        matches!(self, Self::Adopted(_))
+    }
+}
 
 /// Turns manifests into running, routed apps, and takes them back down again.
 pub struct Applier {
@@ -146,21 +171,49 @@ impl Applier {
         Ok(app)
     }
 
-    /// Start a manifest that is *already* recorded, without recording it again.
+    /// Bring back an app that is *already* recorded, without recording it again.
     ///
     /// This is what a restart runs. It leaves `applied_at` saying when the
     /// operator applied the app, not when spaceport last rebooted.
-    pub async fn restore(&self, id: AppId, manifest: AppManifest) -> Result<Arc<App>, ApplyError> {
-        self.start(id, manifest).await
+    ///
+    /// The container from before is taken over where the engine still has one,
+    /// so an app that never stopped running is not stopped now: what spaceport
+    /// is restarting is spaceport, and an app whose container survived it only
+    /// has to be found, checked and routed to. Everything that is not that —
+    /// no container, the wrong container, or one that has stopped answering —
+    /// is a relaunch, which is what a restart used to cost every app.
+    pub async fn restore(&self, id: AppId, manifest: AppManifest) -> Result<Restored, ApplyError> {
+        self.free_of_conflict(&id, &manifest)?;
+
+        match self.runtime.adopt(&id, &manifest).await {
+            Ok(Some(container)) => {
+                info!(app = %id, container = %container.id, upstream = %container.upstream, "the container from before is still running");
+
+                match self.route(id.clone(), manifest.clone(), container).await {
+                    Ok(app) => return Ok(Restored::Adopted(app)),
+                    // It is running but it is not serving, and `route` has
+                    // already taken it down. Whatever is wrong with it, a
+                    // container started fresh from the same manifest is the
+                    // best answer spaceport has.
+                    Err(error) => {
+                        warn!(app = %id, %error, "the container from before is not serving, starting a new one");
+                    }
+                }
+            }
+            Ok(None) => {}
+            // Adoption is an optimisation, and a failed one costs a relaunch
+            // rather than an app.
+            Err(error) => {
+                warn!(app = %id, %error, "could not tell what the previous spaceport left running");
+            }
+        }
+
+        self.start(id, manifest).await.map(Restored::Relaunched)
     }
 
     /// Everything an apply does except remember it.
     async fn start(&self, id: AppId, manifest: AppManifest) -> Result<Arc<App>, ApplyError> {
-        if let Some((host, owner)) = self.store.conflict(&id, &manifest.routing.hosts) {
-            return Err(ApplyError::Conflict(anyhow!(
-                "host `{host}` is already served by app `{owner}`"
-            )));
-        }
+        self.free_of_conflict(&id, &manifest)?;
 
         let container = self
             .runtime
@@ -168,6 +221,31 @@ impl Applier {
             .await
             .map_err(ApplyError::Failed)?;
 
+        self.route(id, manifest, container).await
+    }
+
+    /// Refuse early what the store would refuse later anyway, so that no
+    /// container is started for an app that was never going to be reachable.
+    fn free_of_conflict(&self, id: &AppId, manifest: &AppManifest) -> Result<(), ApplyError> {
+        match self.store.conflict(id, &manifest.routing.hosts) {
+            Some((host, owner)) => Err(ApplyError::Conflict(anyhow!(
+                "host `{host}` is already served by app `{owner}`"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Wait for a container to answer, then send the app's traffic to it.
+    ///
+    /// Takes the container back down if it never does: whether it was just
+    /// started or adopted from the spaceport before, a container nothing will
+    /// ever route to is not one to leave running.
+    async fn route(
+        &self,
+        id: AppId,
+        manifest: AppManifest,
+        container: Container,
+    ) -> Result<Arc<App>, ApplyError> {
         // The routes go in only once the app answers. A container's port is
         // published the moment it starts, well before whatever is inside has
         // finished booting, so routing on `launch` alone means the first
@@ -184,7 +262,7 @@ impl Applier {
             let _ = self.runtime.remove(&container.id).await;
 
             return Err(ApplyError::Failed(
-                error.context(format!("app `{id}` started but never became ready")),
+                error.context(format!("app `{id}` never became ready")),
             ));
         }
         info!(app = %id, after = ?waited.elapsed(), "app is ready");
@@ -227,10 +305,17 @@ mod tests {
         removed: Mutex<Vec<ContainerId>>,
         refuse: bool,
         refuse_removal: bool,
+        /// What the spaceport before this one is pretending to have left
+        /// running, for every app.
+        survivor: Option<Container>,
     }
 
     #[async_trait]
     impl ContainerRuntime for FakeRuntime {
+        async fn adopt(&self, _app: &AppId, _manifest: &AppManifest) -> Result<Option<Container>> {
+            Ok(self.survivor.clone())
+        }
+
         async fn launch(&self, app: &AppId, _manifest: &AppManifest) -> Result<Container> {
             if self.refuse {
                 bail!("no image for you");
@@ -562,6 +647,87 @@ container:
         assert_eq!(desired[0].applied_at, applied_at);
         // It is running all the same.
         assert!(store.routes().lookup("alpha.test").is_some());
+    }
+
+    /// The point of adoption: the app that was running before the restart is
+    /// the app that is running after it, in the same container.
+    #[tokio::test]
+    async fn restoring_takes_over_the_container_that_survived() {
+        let survivor = Container {
+            id: ContainerId::new("survivor"),
+            upstream: SocketAddr::from(([127, 0, 0, 1], 7000)),
+        };
+        let runtime = Arc::new(FakeRuntime {
+            survivor: Some(survivor.clone()),
+            ..Default::default()
+        });
+        let (applier, store) = applier(runtime.clone());
+
+        let restored = applier
+            .restore("hello".parse().unwrap(), manifest("alpha.test"))
+            .await
+            .unwrap();
+
+        assert!(restored.was_adopted(), "{restored:?}");
+        assert_eq!(restored.app().container, survivor.id);
+        assert_eq!(
+            store.routes().lookup("alpha.test").unwrap().upstream,
+            survivor.upstream
+        );
+        // Nothing was started, and nothing was taken down, to get there.
+        assert!(runtime.launched.lock().unwrap().is_empty());
+        assert!(runtime.removed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restoring_starts_an_app_whose_container_is_gone() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+
+        let restored = applier
+            .restore("hello".parse().unwrap(), manifest("alpha.test"))
+            .await
+            .unwrap();
+
+        assert!(!restored.was_adopted(), "{restored:?}");
+        assert_eq!(runtime.launched.lock().unwrap().len(), 1);
+        assert!(store.routes().lookup("alpha.test").is_some());
+    }
+
+    /// A container that is up but no longer answering is not something to route
+    /// traffic to just because it survived.
+    #[tokio::test]
+    async fn restoring_starts_again_when_the_survivor_does_not_answer() {
+        let runtime = Arc::new(FakeRuntime {
+            survivor: Some(Container {
+                id: ContainerId::new("survivor"),
+                upstream: SocketAddr::from(([127, 0, 0, 1], 7000)),
+            }),
+            ..Default::default()
+        });
+        let (applier, store) = applier(runtime.clone());
+
+        // Nothing is listening on either port, so the relaunched container
+        // fails its readiness check too — what this asserts is that spaceport
+        // stopped trusting the survivor and went and started one.
+        applier
+            .restore(
+                "hello".parse().unwrap(),
+                manifest_awaiting_readiness("alpha.test"),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(runtime.launched.lock().unwrap().len(), 1);
+        // And the survivor it gave up on was not left running.
+        assert!(
+            runtime
+                .removed
+                .lock()
+                .unwrap()
+                .contains(&ContainerId::new("survivor"))
+        );
+        assert!(store.apps().is_empty());
     }
 
     #[tokio::test]

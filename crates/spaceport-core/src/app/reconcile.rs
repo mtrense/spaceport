@@ -6,12 +6,11 @@
 //! containers of the previous spaceport are only evidence of how it once got
 //! there.
 //!
-//! Every recorded app is *relaunched*. A container that survived the restart is
-//! stopped and started again rather than adopted, which costs each app a few
-//! seconds of downtime at every restart of spaceport itself. Reattaching to a
-//! survivor — reading back the port the engine published it on, health-checking
-//! it, and routing to it untouched — is the obvious next step, and it slots
-//! into this same loop without changing a single record.
+//! An app whose container survived is *adopted*: the engine is asked where it
+//! published that container, the app is health-checked there, and traffic goes
+//! back to it untouched. Restarting spaceport then costs its apps nothing, and
+//! only what is actually missing — a container that was removed, exited, or no
+//! longer matches its manifest — is started again.
 //!
 //! Nothing here is fatal. An app whose manifest no longer parses, or whose
 //! image has since been deleted, must not stop the other nine coming back.
@@ -29,6 +28,9 @@ use super::{AppId, AppManifest};
 pub struct Report {
     /// Apps that are running and routed again.
     pub restored: Vec<AppId>,
+    /// How many of them never had to be restarted, because their container was
+    /// still running and was taken over as it was.
+    pub adopted: usize,
     /// Apps that were recorded but could not be brought back, and why.
     pub failed: Vec<(AppId, String)>,
     /// Containers left over from a previous spaceport that no record claims.
@@ -67,8 +69,12 @@ pub async fn reconcile(applier: &Arc<Applier>) -> Result<Report> {
         };
 
         match applier.restore(record.id.clone(), manifest).await {
-            Ok(app) => {
-                info!(app = %app.id, upstream = %app.upstream, "restored app");
+            Ok(restored) => {
+                let app = restored.app();
+                if restored.was_adopted() {
+                    report.adopted += 1;
+                }
+                info!(app = %app.id, upstream = %app.upstream, adopted = restored.was_adopted(), "restored app");
                 report.restored.push(app.id.clone());
             }
             Err(error) => {
@@ -129,6 +135,7 @@ mod tests {
     use crate::state::Db;
     use anyhow::bail;
     use async_trait::async_trait;
+    use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::Mutex;
 
@@ -137,6 +144,9 @@ mod tests {
     #[derive(Default)]
     struct FakeRuntime {
         containers: Mutex<Vec<Managed>>,
+        /// Where each container it started was published, so a restart can find
+        /// its way back to one.
+        upstreams: Mutex<HashMap<ContainerId, SocketAddr>>,
         launches: Mutex<usize>,
         refuse: Vec<String>,
     }
@@ -152,6 +162,7 @@ mod tests {
             *launches += 1;
             let port = 9000 + u16::try_from(*launches).unwrap();
             let id = ContainerId::new(format!("{app}-{port}"));
+            let upstream = SocketAddr::from(([127, 0, 0, 1], port));
 
             let mut containers = self.containers.lock().unwrap();
             containers.retain(|container| container.app.as_ref() != Some(app));
@@ -159,11 +170,31 @@ mod tests {
                 id: id.clone(),
                 app: Some(app.clone()),
             });
+            self.upstreams.lock().unwrap().insert(id.clone(), upstream);
 
-            Ok(Container {
-                id,
-                upstream: SocketAddr::from(([127, 0, 0, 1], port)),
-            })
+            Ok(Container { id, upstream })
+        }
+
+        /// Whatever this runtime is still running under that app's name — which
+        /// is what a second `Applier` over the same runtime finds.
+        async fn adopt(&self, app: &AppId, _manifest: &AppManifest) -> Result<Option<Container>> {
+            let containers = self.containers.lock().unwrap();
+            let Some(found) = containers
+                .iter()
+                .find(|container| container.app.as_ref() == Some(app))
+            else {
+                return Ok(None);
+            };
+
+            Ok(self
+                .upstreams
+                .lock()
+                .unwrap()
+                .get(&found.id)
+                .map(|upstream| Container {
+                    id: found.id.clone(),
+                    upstream: *upstream,
+                }))
         }
 
         async fn remove(&self, id: &ContainerId) -> Result<()> {
@@ -333,13 +364,14 @@ container:
     }
 
     /// The whole point of the records: what was applied before the restart is
-    /// what is running after it.
+    /// what is running after it — and, because its container outlived the
+    /// spaceport that started it, in the very same container.
     #[tokio::test]
     async fn survives_a_restart_end_to_end() {
         let db = Db::in_memory().unwrap();
         let runtime = Arc::new(FakeRuntime::default());
         let (applier, _, _) = restarted(runtime.clone(), db.clone());
-        applier
+        let before = applier
             .apply(
                 id("hello"),
                 AppManifest::parse(&manifest("alpha.test")).unwrap(),
@@ -348,11 +380,44 @@ container:
             .unwrap();
 
         // A new spaceport over the same database and the same engine.
-        let (restarted_applier, store, _) = restarted(runtime, db);
+        let (restarted_applier, store, _) = restarted(runtime.clone(), db);
         let report = reconcile(&restarted_applier).await.unwrap();
 
         assert_eq!(report.restored, [id("hello")]);
+        assert_eq!(report.adopted, 1);
         assert_eq!(report.swept, 0);
-        assert!(store.routes().lookup("alpha.test").is_some());
+        let after = store.routes().lookup("alpha.test").unwrap().clone();
+        assert_eq!(after.container, before.container);
+        assert_eq!(after.upstream, before.upstream);
+        // Nothing was started to get there: the app never went down.
+        assert_eq!(*runtime.launches.lock().unwrap(), 1);
+    }
+
+    /// And where the container did not survive — removed by hand, or exited
+    /// while spaceport was down — the app is started again.
+    #[tokio::test]
+    async fn starts_an_app_again_when_its_container_did_not_survive() {
+        let db = Db::in_memory().unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _, _) = restarted(runtime.clone(), db.clone());
+        let before = applier
+            .apply(
+                id("hello"),
+                AppManifest::parse(&manifest("alpha.test")).unwrap(),
+            )
+            .await
+            .unwrap();
+        runtime.remove(&before.container).await.unwrap();
+
+        let (restarted_applier, store, _) = restarted(runtime.clone(), db);
+        let report = reconcile(&restarted_applier).await.unwrap();
+
+        assert_eq!(report.restored, [id("hello")]);
+        assert_eq!(report.adopted, 0);
+        assert_eq!(*runtime.launches.lock().unwrap(), 2);
+        assert_ne!(
+            store.routes().lookup("alpha.test").unwrap().container,
+            before.container
+        );
     }
 }

@@ -168,6 +168,7 @@ async fn run(args: RunArgs) -> Result<()> {
     if !report.is_empty() {
         info!(
             restored = report.restored.len(),
+            adopted = report.adopted,
             failed = report.failed.len(),
             swept = report.swept,
             "reconciled with what was recorded",

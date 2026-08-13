@@ -74,6 +74,27 @@ pub trait ContainerRuntime: Send + Sync {
     /// checks are for, and they do not exist yet.
     async fn launch(&self, app: &AppId, manifest: &AppManifest) -> Result<Container>;
 
+    /// The container this runtime is *already* running for `app`, if it is one
+    /// this manifest would have produced.
+    ///
+    /// This is what makes a restart of spaceport cheap: the apps it was running
+    /// keep running, and it only has to find out where they ended up. Returning
+    /// `None` is always allowed and always safe — it costs the app a relaunch,
+    /// which is what every restart used to cost — so anything the engine cannot
+    /// vouch for it should decline rather than guess at.
+    ///
+    /// Note what adoption deliberately does *not* do: re-resolve the image. A
+    /// container started from `:latest` a week ago is adopted as it is, tag
+    /// moved or not. Restarting spaceport is not a way to redeploy an app;
+    /// applying its manifest again is.
+    ///
+    /// The default is to adopt nothing, for an engine that cannot tell.
+    async fn adopt(&self, app: &AppId, manifest: &AppManifest) -> Result<Option<Container>> {
+        let _ = (app, manifest);
+
+        Ok(None)
+    }
+
     /// Stop and delete a container. Succeeds if it is already gone.
     async fn remove(&self, id: &ContainerId) -> Result<()>;
 
