@@ -1,4 +1,13 @@
-//! The operator endpoint: where spaceport exposes its control interface.
+//! The operator interface: where spaceport is told what to run.
+//!
+//! Separate from the edge in every way that matters. The edge is public and
+//! serves whoever connects; this is private, and whoever reaches it can start
+//! containers. Hence the default of a unix socket, where the filesystem does
+//! the access control — a TCP endpoint is available for the cases that need it
+//! and is nobody's default.
+
+pub mod client;
+pub mod server;
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -6,6 +15,10 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::{Result, anyhow};
+
+/// Where `spaceport apps` looks for a running spaceport when not told
+/// otherwise.
+pub const DEFAULT_OPERATOR_ENDPOINT: &str = "/run/spaceport.sock";
 
 /// Address the operator interface listens on.
 #[derive(Debug, Clone, PartialEq, Eq)]

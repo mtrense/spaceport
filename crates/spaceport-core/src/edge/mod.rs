@@ -5,7 +5,7 @@
 //! the TLS handshake, so a slow or hostile client can never stall the loop
 //! that is admitting everyone else.
 
-mod proxy;
+pub(crate) mod proxy;
 mod routes;
 mod service;
 mod tls;
@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::Config;
+use crate::app::AppStore;
 use service::EdgeService;
 
 /// What every connection shares. Cheap to clone behind an `Arc`; nothing in
@@ -34,6 +35,10 @@ use service::EdgeService;
 pub struct EdgeState {
     /// The routes spaceport answers itself.
     pub router: Router,
+    /// The apps traffic is forwarded to.
+    pub apps: Arc<AppStore>,
+    /// The connection pool traffic is forwarded through.
+    pub upstreams: proxy::Upstreams,
     /// Port plaintext clients are redirected to.
     pub https_port: u16,
 }
@@ -42,11 +47,17 @@ pub struct EdgeState {
 ///
 /// Returns once every in-flight connection has finished, so the caller can
 /// treat a normal return as "nothing is still being served".
-pub async fn serve(config: &Config, shutdown: CancellationToken) -> Result<()> {
+pub async fn serve(
+    config: &Config,
+    apps: Arc<AppStore>,
+    shutdown: CancellationToken,
+) -> Result<()> {
     let listen = &config.edge.listen;
 
     let state = Arc::new(EdgeState {
         router: routes::router(),
+        apps,
+        upstreams: proxy::Upstreams::new(),
         https_port: listen.https.port(),
     });
 
@@ -70,7 +81,13 @@ pub async fn serve(config: &Config, shutdown: CancellationToken) -> Result<()> {
 
     tokio::join!(
         accept_loop(http, None, state.clone(), shutdown.clone(), alive.clone()),
-        accept_loop(https, Some(acceptor), state, shutdown.clone(), alive.clone()),
+        accept_loop(
+            https,
+            Some(acceptor),
+            state,
+            shutdown.clone(),
+            alive.clone()
+        ),
     );
 
     drop(alive);

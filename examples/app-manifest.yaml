@@ -14,13 +14,13 @@ container:
                                 # (error if not present or more than one `EXPOSE`)
   health:
     readiness:          # omit entirely -> tcp connect to the route port
-      type: http                # http|tcp|none   (tagged one-of, all other fields invalid when `none`)
+      type: http                # http|tcp|none   (`path` invalid unless `http`)
       path: /healthz            # required when `http`, no default
-      port: 8080                # defaults to the first container port
-      interval: 10s             # default: `10s`
-      initial_delay: 10s        # default: `1s`
-      timeout: 3s               # default: `5s`
-      failure_threshold: 3      # default: `3`
+      interval: 1s              # default: `1s`
+      initial_delay: 0s         # default: `0s`
+      timeout: 5s               # default: `5s`
+      failure_threshold: 30     # default: `30` — with the interval, how long an
+                                # apply waits for a slow app before giving up
       success_threshold: 1      # default: `1`
     liveness:
       # Same as above

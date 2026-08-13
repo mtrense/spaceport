@@ -1,0 +1,15 @@
+schema_version: 1
+source:
+  type: image
+  image: strm/helloworld-http:latest
+routing:
+  hosts: [alpha.test, beta.test]
+container:
+  health:
+    readiness:
+      type: tcp
+      interval: 1s
+      initial_delay: 0s
+      timeout: 5s
+      failure_threshold: 30
+      success_threshold: 1

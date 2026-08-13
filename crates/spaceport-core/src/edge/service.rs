@@ -115,7 +115,7 @@ impl Service<Request<Incoming>> for EdgeService {
             return Box::pin(async move { Ok(redirect(location)) });
         }
 
-        Box::pin(proxy::handle(req))
+        Box::pin(proxy::handle(self.state.clone(), req))
     }
 }
 
@@ -150,7 +150,7 @@ fn https_location<B>(req: &Request<B>, https_port: u16) -> Option<HeaderValue> {
 }
 
 /// The host without its port. Handles bracketed IPv6 literals.
-fn host_name(host: &str) -> Option<&str> {
+pub(super) fn host_name(host: &str) -> Option<&str> {
     if host.is_empty() {
         return None;
     }

@@ -1,8 +1,12 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use spaceport_core::app::{AppId, AppStore, Applier};
+use spaceport_core::operator::{DEFAULT_OPERATOR_ENDPOINT, client, server};
+use spaceport_core::runtime::DockerRuntime;
 use spaceport_core::{Config, OperatorEndpoint, config::DEFAULT_CONFIG_PATH, edge};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -24,6 +28,11 @@ enum Command {
         #[command(subcommand)]
         command: CheckCommand,
     },
+    /// Manage the apps a running spaceport serves.
+    Apps {
+        #[command(subcommand)]
+        command: AppsCommand,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -42,6 +51,25 @@ enum CheckCommand {
     Config(ConfigArgs),
 }
 
+#[derive(Debug, Subcommand)]
+enum AppsCommand {
+    /// Run an app from a manifest, replacing it if it is already running.
+    Apply(ApplyArgs),
+}
+
+#[derive(Debug, Args)]
+struct ApplyArgs {
+    /// The name to run the app under.
+    app_id: AppId,
+
+    /// Path to the app manifest.
+    manifest: PathBuf,
+
+    /// The operator interface of the spaceport to talk to.
+    #[arg(short, long, value_name = "SOCKET|ADDRESS", default_value = DEFAULT_OPERATOR_ENDPOINT)]
+    operator: OperatorEndpoint,
+}
+
 #[derive(Debug, Args)]
 struct ConfigArgs {
     /// Path to the config file.
@@ -56,6 +84,9 @@ async fn main() -> Result<()> {
         Command::Check {
             command: CheckCommand::Config(args),
         } => check_config(args),
+        Command::Apps {
+            command: AppsCommand::Apply(args),
+        } => apply(args).await,
     }
 }
 
@@ -70,10 +101,14 @@ async fn run(args: RunArgs) -> Result<()> {
     let config = Config::load(&args.config.config)?;
     info!(path = %args.config.config.display(), "loaded config");
 
-    // TODO: start the operator interface if one was requested.
-    if let Some(operator) = &args.operator {
-        info!(%operator, "operator interface not implemented yet");
-    }
+    // Checked at startup rather than at the first apply: an unreachable
+    // container engine is a broken host, and finding out about it while
+    // starting is a great deal cheaper than finding out about it later.
+    let runtime = Arc::new(DockerRuntime::connect()?);
+    runtime.ping().await?;
+
+    let apps = Arc::new(AppStore::new());
+    let applier = Arc::new(Applier::new(apps.clone(), runtime));
 
     let shutdown = CancellationToken::new();
     tokio::spawn({
@@ -87,7 +122,48 @@ async fn run(args: RunArgs) -> Result<()> {
         }
     });
 
-    edge::serve(&config, shutdown).await
+    // Without `--operator` there is no way to tell spaceport what to run, which
+    // is a legitimate way to start it: the edge still serves, and still says so.
+    let operator = args.operator.map(|endpoint| {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let result = server::serve(&endpoint, applier, shutdown.clone()).await;
+
+            // An operator interface that never came up is a startup failure,
+            // and one nobody would otherwise hear about until they tried to
+            // use it. Take the edge down with it and report at the exit.
+            if result.is_err() {
+                shutdown.cancel();
+            }
+
+            result
+        })
+    });
+
+    let served = edge::serve(&config, apps, shutdown.clone()).await;
+
+    // Whatever stopped the edge stops the operator interface too, so a failure
+    // to bind one port does not leave the other half of spaceport running.
+    shutdown.cancel();
+    if let Some(operator) = operator {
+        operator
+            .await
+            .context("the operator interface panicked")??;
+    }
+
+    served
+}
+
+async fn apply(args: ApplyArgs) -> Result<()> {
+    let manifest = std::fs::read_to_string(&args.manifest)
+        .with_context(|| format!("reading app manifest `{}`", args.manifest.display()))?;
+
+    print!(
+        "{}",
+        client::apply(&args.operator, &args.app_id, manifest).await?
+    );
+
+    Ok(())
 }
 
 fn check_config(args: ConfigArgs) -> Result<()> {

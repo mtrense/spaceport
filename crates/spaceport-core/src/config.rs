@@ -9,7 +9,7 @@ use serde::{Deserialize, Deserializer, de};
 /// Path used when no `--config` is given.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/spaceport/spaceport.yaml";
 
-/// The only config schema this build understands.
+/// The only schema this build understands, for configs and app manifests alike.
 pub const SCHEMA_VERSION: u64 = 1;
 
 /// A parsed and validated spaceport configuration.
@@ -37,7 +37,7 @@ impl<'de> Deserialize<'de> for SchemaVersion {
         let version = u64::deserialize(deserializer)?;
         if version != SCHEMA_VERSION {
             return Err(de::Error::custom(format!(
-                "unsupported config schema version {version}, this spaceport reads {SCHEMA_VERSION}"
+                "unsupported schema version {version}, this spaceport reads {SCHEMA_VERSION}"
             )));
         }
         Ok(Self)
@@ -122,7 +122,10 @@ edge:
 
     #[test]
     fn accepts_the_current_schema_version() {
-        assert_eq!(Config::parse(MINIMAL).unwrap().schema_version, SchemaVersion);
+        assert_eq!(
+            Config::parse(MINIMAL).unwrap().schema_version,
+            SchemaVersion
+        );
     }
 
     #[test]
@@ -130,7 +133,7 @@ edge:
         let raw = MINIMAL.replace("schema_version: 1", "schema_version: 2");
         let err = Config::parse(&raw).unwrap_err().to_string();
 
-        assert!(err.contains("unsupported config schema version 2"), "{err}");
+        assert!(err.contains("unsupported schema version 2"), "{err}");
     }
 
     #[test]

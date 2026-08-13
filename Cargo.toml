@@ -11,17 +11,24 @@ repository = "https://github.com/mx/spaceport"
 [workspace.dependencies]
 spaceport-core = { path = "crates/spaceport-core" }
 anyhow = "1"
+async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 # Maintained fork of the deprecated serde_yaml, same API.
 serde_norway = "0.9"
 
+# The docker engine API, over the daemon socket.
+bollard = "0.21"
+futures-util = { version = "0.3", default-features = false }
+
 axum = "0.8"
 bytes = "1"
 http = "1"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = [
+  "client",
+  "client-legacy",
   "server",
   "server-auto",
   "service",
