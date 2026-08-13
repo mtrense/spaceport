@@ -19,10 +19,10 @@ struct Cli {
 enum Command {
     /// Start spaceport in the foreground.
     Run(RunArgs),
-    /// Inspect and manage the configuration.
-    Config {
+    /// Check that spaceport is set up correctly.
+    Check {
         #[command(subcommand)]
-        command: ConfigCommand,
+        command: CheckCommand,
     },
 }
 
@@ -37,9 +37,9 @@ struct RunArgs {
 }
 
 #[derive(Debug, Subcommand)]
-enum ConfigCommand {
+enum CheckCommand {
     /// Validate the config file.
-    Check(ConfigArgs),
+    Config(ConfigArgs),
 }
 
 #[derive(Debug, Args)]
@@ -53,9 +53,9 @@ struct ConfigArgs {
 async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Run(args) => run(args).await,
-        Command::Config {
-            command: ConfigCommand::Check(args),
-        } => config_check(args),
+        Command::Check {
+            command: CheckCommand::Config(args),
+        } => check_config(args),
     }
 }
 
@@ -90,7 +90,7 @@ async fn run(args: RunArgs) -> Result<()> {
     edge::serve(&config, shutdown).await
 }
 
-fn config_check(args: ConfigArgs) -> Result<()> {
+fn check_config(args: ConfigArgs) -> Result<()> {
     let config = Config::load(&args.config)?;
 
     println!("{}: ok", args.config.display());
