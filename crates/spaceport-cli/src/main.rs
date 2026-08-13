@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -60,16 +61,31 @@ fn run(args: RunArgs) -> Result<()> {
 
     // TODO: start the proxy, and the operator interface if one was requested.
     println!("loaded config from {}", args.config.config.display());
+    for (proto, addr) in listeners(&config) {
+        println!("edge would listen for {proto} on {addr}");
+    }
     if let Some(operator) = &args.operator {
         println!("operator interface would listen on {operator}");
     }
-    let _ = config;
 
     Ok(())
 }
 
 fn config_check(args: ConfigArgs) -> Result<()> {
-    Config::load(&args.config)?;
+    let config = Config::load(&args.config)?;
+
     println!("{}: ok", args.config.display());
+    for (proto, addr) in listeners(&config) {
+        println!("  edge listens for {proto} on {addr}");
+    }
+
     Ok(())
+}
+
+/// The configured edge listeners, in protocol order.
+fn listeners(config: &Config) -> impl Iterator<Item = (&'static str, SocketAddr)> {
+    let listen = &config.edge.listen;
+    [("http", listen.http), ("https", listen.https)]
+        .into_iter()
+        .filter_map(|(proto, addr)| addr.map(|addr| (proto, addr)))
 }
