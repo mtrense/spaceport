@@ -4,17 +4,44 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 
 /// Path used when no `--config` is given.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/spaceport/spaceport.yaml";
+
+/// The only config schema this build understands.
+pub const SCHEMA_VERSION: u64 = 1;
 
 /// A parsed and validated spaceport configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Declares which schema the rest of the document is written against.
+    /// Mandatory, so a file that predates versioning is refused rather than
+    /// guessed at.
+    pub schema_version: SchemaVersion,
+
     /// How spaceport faces the outside world.
     pub edge: Edge,
+}
+
+/// A schema version this build accepts.
+///
+/// Carries no value: the only version that parses is [`SCHEMA_VERSION`], so
+/// having a parsed one in hand already says which schema it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaVersion;
+
+impl<'de> Deserialize<'de> for SchemaVersion {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let version = u64::deserialize(deserializer)?;
+        if version != SCHEMA_VERSION {
+            return Err(de::Error::custom(format!(
+                "unsupported config schema version {version}, this spaceport reads {SCHEMA_VERSION}"
+            )));
+        }
+        Ok(Self)
+    }
 }
 
 /// The edge is where client traffic enters spaceport.
@@ -76,6 +103,7 @@ mod tests {
 
     /// A config with everything mandatory filled in, for tests to extend.
     const MINIMAL: &str = "
+schema_version: 1
 edge:
   listen:
     http: 0.0.0.0:80
@@ -90,6 +118,33 @@ edge:
         let raw = std::fs::read_to_string(&path).unwrap();
 
         Config::parse(&raw).unwrap();
+    }
+
+    #[test]
+    fn accepts_the_current_schema_version() {
+        assert_eq!(Config::parse(MINIMAL).unwrap().schema_version, SchemaVersion);
+    }
+
+    #[test]
+    fn rejects_a_future_schema_version() {
+        let raw = MINIMAL.replace("schema_version: 1", "schema_version: 2");
+        let err = Config::parse(&raw).unwrap_err().to_string();
+
+        assert!(err.contains("unsupported config schema version 2"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_missing_schema_version() {
+        let raw = MINIMAL.replace("schema_version: 1\n", "");
+        let err = Config::parse(&raw).unwrap_err().to_string();
+
+        assert!(err.contains("schema_version"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_non_numeric_schema_version() {
+        let raw = MINIMAL.replace("schema_version: 1", "schema_version: '1'");
+        assert!(Config::parse(&raw).is_err());
     }
 
     #[test]
@@ -121,7 +176,7 @@ edge:
 
     #[test]
     fn rejects_a_missing_listener() {
-        let err = Config::parse("edge:\n  listen:\n    https: '[::]:443'\n")
+        let err = Config::parse("schema_version: 1\nedge:\n  listen:\n    https: '[::]:443'\n")
             .unwrap_err()
             .to_string();
         assert!(err.contains("http"), "{err}");
@@ -137,6 +192,9 @@ edge:
 
     #[test]
     fn rejects_a_malformed_address() {
-        assert!(Config::parse("edge:\n  listen:\n    http: 0.0.0.0\n    https: 0.0.0.0:443\n").is_err());
+        let raw = MINIMAL.replace("http: 0.0.0.0:80", "http: 0.0.0.0");
+        let err = Config::parse(&raw).unwrap_err().to_string();
+
+        assert!(err.contains("edge.listen.http"), "{err}");
     }
 }
