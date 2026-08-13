@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, de};
 
 /// Path used when no `--config` is given.
@@ -89,6 +89,10 @@ pub struct Edge {
 pub struct Tls {
     #[serde(default)]
     pub provider: TlsProvider,
+
+    /// Which CA to order from, and on whose behalf. Only meaningful — and
+    /// mandatory — when the provider is [`TlsProvider::Acme`].
+    pub acme: Option<Acme>,
 }
 
 /// The source of the certificate the `https` listener serves.
@@ -99,6 +103,76 @@ pub enum TlsProvider {
     /// this is for development only.
     #[default]
     SelfSigned,
+    /// Order a certificate per host from an ACME CA, proving control over each
+    /// one with an `HTTP-01` challenge served off the plaintext listener.
+    Acme,
+}
+
+/// What an ACME CA has to be told before it will issue anything.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Acme {
+    /// The CA to order from. Defaults to Let's Encrypt's staging environment,
+    /// because the first run of a new setup is the one most likely to be wrong
+    /// and staging is the environment that forgives that.
+    #[serde(default)]
+    pub directory: Directory,
+
+    /// How the CA reaches the operator — `mailto:` URIs — for expiry warnings
+    /// and the occasional "we are revoking your certificate" mail. Optional,
+    /// and a setup that gives none gets no warning.
+    #[serde(default)]
+    pub contact: Vec<String>,
+
+    /// Whether the operator agrees to the CA's terms of service. No CA issues
+    /// without it, so spaceport refuses to start rather than ask the CA a
+    /// question it already knows the answer to.
+    #[serde(default)]
+    pub terms_of_service_agreed: bool,
+}
+
+/// The ACME directory to order from.
+///
+/// Two well-known environments have names, because typing a Let's Encrypt URL
+/// from memory is how a setup meant for staging ends up burning production rate
+/// limits. Anything else is given as a URL.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Directory {
+    /// Let's Encrypt's staging environment. Certificates nothing trusts, rate
+    /// limits nothing minds.
+    #[default]
+    Staging,
+    /// Let's Encrypt proper.
+    Production,
+    /// Any other CA's directory URL.
+    Url(String),
+}
+
+impl Directory {
+    /// The directory URL to point an ACME client at.
+    pub fn url(&self) -> &str {
+        match self {
+            Self::Staging => instant_acme::LetsEncrypt::Staging.url(),
+            Self::Production => instant_acme::LetsEncrypt::Production.url(),
+            Self::Url(url) => url,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Directory {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        match raw.as_str() {
+            "staging" => Ok(Self::Staging),
+            "production" => Ok(Self::Production),
+            // An ACME account key travels over this connection. A directory
+            // that is not `https` is not one to send it to.
+            url if url.starts_with("https://") => Ok(Self::Url(raw)),
+            other => Err(de::Error::custom(format!(
+                "`{other}` is neither `staging`, `production`, nor an https directory URL"
+            ))),
+        }
+    }
 }
 
 /// Addresses the edge binds to. Both are mandatory: spaceport always serves
@@ -121,7 +195,29 @@ impl Config {
 
     /// Parse and validate a configuration document.
     pub fn parse(raw: &str) -> Result<Self> {
-        Ok(serde_norway::from_str(raw)?)
+        let config: Self = serde_norway::from_str(raw)?;
+        config.validate()?;
+
+        Ok(config)
+    }
+
+    /// What serde cannot express: the rules that span more than one field.
+    fn validate(&self) -> Result<()> {
+        match (self.edge.tls.provider, &self.edge.tls.acme) {
+            (TlsProvider::Acme, None) => {
+                bail!("edge.tls.acme is required when the tls provider is `acme`")
+            }
+            (TlsProvider::Acme, Some(acme)) if !acme.terms_of_service_agreed => bail!(
+                "edge.tls.acme.terms_of_service_agreed must be `true`: no CA issues a \
+                 certificate to somebody who has not agreed to its terms"
+            ),
+            // Settings that are read by nobody are settings an operator
+            // believes are in force. Say so now rather than at the incident.
+            (TlsProvider::SelfSigned, Some(_)) => {
+                bail!("edge.tls.acme is set, but the tls provider is `self-signed`")
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -186,10 +282,101 @@ edge:
 
     #[test]
     fn rejects_an_unknown_tls_provider() {
+        let err = Config::parse(&format!("{MINIMAL}  tls:\n    provider: magic\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("magic"), "{err}");
+    }
+
+    /// An acme block, indented to sit under `edge.tls`.
+    fn with_acme(body: &str) -> String {
+        format!("{MINIMAL}  tls:\n    provider: acme\n    acme:\n{body}")
+    }
+
+    #[test]
+    fn orders_from_staging_unless_told_otherwise() {
+        let config = Config::parse(&with_acme("      terms_of_service_agreed: true\n")).unwrap();
+        let acme = config.edge.tls.acme.unwrap();
+
+        assert_eq!(config.edge.tls.provider, TlsProvider::Acme);
+        assert_eq!(acme.directory, Directory::Staging);
+        assert!(acme.contact.is_empty());
+        assert!(acme.directory.url().contains("staging"));
+    }
+
+    #[test]
+    fn takes_the_directory_and_contacts_the_config_names() {
+        let config = Config::parse(&with_acme(
+            "      terms_of_service_agreed: true\n      directory: production\n      \
+             contact: [mailto:ops@example.com]\n",
+        ))
+        .unwrap();
+        let acme = config.edge.tls.acme.unwrap();
+
+        assert_eq!(acme.directory, Directory::Production);
+        assert_eq!(
+            acme.directory.url(),
+            instant_acme::LetsEncrypt::Production.url()
+        );
+        assert_eq!(acme.contact, ["mailto:ops@example.com"]);
+    }
+
+    #[test]
+    fn takes_another_cas_directory_url() {
+        let config = Config::parse(&with_acme(
+            "      terms_of_service_agreed: true\n      directory: https://acme.example/dir\n",
+        ))
+        .unwrap();
+
+        assert_eq!(
+            config.edge.tls.acme.unwrap().directory.url(),
+            "https://acme.example/dir"
+        );
+    }
+
+    /// The account key is posted to this URL. Plaintext is not a place to
+    /// send it, and a typo that downgrades it must not pass silently.
+    #[test]
+    fn rejects_a_directory_that_is_not_https() {
+        let err = Config::parse(&with_acme(
+            "      terms_of_service_agreed: true\n      directory: http://acme.example/dir\n",
+        ))
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("https"), "{err}");
+    }
+
+    #[test]
+    fn rejects_acme_without_a_ca_to_order_from() {
         let err = Config::parse(&format!("{MINIMAL}  tls:\n    provider: acme\n"))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("acme"), "{err}");
+
+        assert!(err.contains("edge.tls.acme is required"), "{err}");
+    }
+
+    #[test]
+    fn rejects_acme_without_agreeing_to_the_terms() {
+        let err = Config::parse(&with_acme("      contact: [mailto:ops@example.com]\n"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("terms_of_service_agreed"), "{err}");
+    }
+
+    /// Configuration that is read by nobody reads as configuration that is in
+    /// force. It is not, and saying so at startup is the cheapest place to.
+    #[test]
+    fn rejects_acme_settings_the_provider_would_ignore() {
+        let err = Config::parse(&format!(
+            "{MINIMAL}  tls:\n    provider: self-signed\n    acme:\n      \
+             terms_of_service_agreed: true\n"
+        ))
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("self-signed"), "{err}");
     }
 
     #[test]

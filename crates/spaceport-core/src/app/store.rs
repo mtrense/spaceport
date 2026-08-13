@@ -11,12 +11,12 @@
 //! new map, so a request already holding a snapshot keeps serving the routes it
 //! started with rather than seeing a half-applied one.
 
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Result, bail};
+use tokio::sync::watch;
 
 use super::AppId;
 use super::manifest::{AppManifest, Host};
@@ -47,6 +47,14 @@ pub struct Routes {
 }
 
 impl Routes {
+    /// Every host anything is served on.
+    ///
+    /// What certificate acquisition works from: these are the names spaceport
+    /// answers to, and so the names it needs to be trusted for.
+    pub fn hosts(&self) -> BTreeSet<Host> {
+        self.by_host.keys().cloned().collect()
+    }
+
     /// The app serving `host`, if any.
     ///
     /// Case-insensitive, because `Host` headers are — but the common case is a
@@ -70,9 +78,22 @@ impl Routes {
 }
 
 /// The apps spaceport is running.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AppStore {
     inner: RwLock<Inner>,
+    /// Bumped whenever the routes change, so that work which depends on *which
+    /// hosts are served* — certificate acquisition, so far — can act on an
+    /// apply instead of finding out at its next tick.
+    generation: watch::Sender<u64>,
+}
+
+impl Default for AppStore {
+    fn default() -> Self {
+        Self {
+            inner: RwLock::default(),
+            generation: watch::Sender::new(0),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -108,8 +129,26 @@ impl AppStore {
 
         inner.apps.insert(app.id.clone(), app.clone());
         inner.rebuild_routes();
+        drop(inner);
+        self.announce();
 
         Ok(app)
+    }
+
+    /// A handle that resolves whenever the routes change.
+    ///
+    /// The value is a generation counter and means nothing on its own; what
+    /// matters is that it moved, and that the reader then asks
+    /// [`AppStore::routes`] what it moved to.
+    pub fn changed(&self) -> watch::Receiver<u64> {
+        self.generation.subscribe()
+    }
+
+    /// Say that the routes are not what they were. Called with no lock held:
+    /// a receiver wakes and asks for the routes, and should not find them held
+    /// by the thread that just told it to look.
+    fn announce(&self) {
+        self.generation.send_modify(|generation| *generation += 1);
     }
 
     /// The first of `hosts` another app already serves, and which app that is.
@@ -126,6 +165,8 @@ impl AppStore {
         let mut inner = self.write();
         let removed = inner.apps.remove(id)?;
         inner.rebuild_routes();
+        drop(inner);
+        self.announce();
 
         Some(removed)
     }

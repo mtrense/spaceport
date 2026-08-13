@@ -1,5 +1,6 @@
 //! Core types and logic for spaceport, a reverse proxy for small and internal apps.
 
+pub mod acme;
 pub mod app;
 pub mod config;
 pub mod duration;

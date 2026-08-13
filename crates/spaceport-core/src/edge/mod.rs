@@ -6,9 +6,9 @@
 //! that is admitting everyone else.
 
 pub(crate) mod proxy;
-mod routes;
+pub(crate) mod routes;
 mod service;
-mod tls;
+pub mod tls;
 
 pub use service::{ConnInfo, Scheme};
 
@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::Config;
+use crate::acme::Challenges;
 use crate::app::AppStore;
 use service::EdgeService;
 
@@ -45,17 +46,24 @@ pub struct EdgeState {
 
 /// Serve both listeners until `shutdown` is cancelled.
 ///
+/// `acceptor` decides which certificate each TLS connection is served, and
+/// `challenges` is what the plaintext listener answers an ACME CA out of. Both
+/// are built by the caller: what certificates spaceport has is not the edge's
+/// business, and serving them is not [`crate::acme`]'s.
+///
 /// Returns once every in-flight connection has finished, so the caller can
 /// treat a normal return as "nothing is still being served".
 pub async fn serve(
     config: &Config,
     apps: Arc<AppStore>,
+    acceptor: TlsAcceptor,
+    challenges: Arc<Challenges>,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let listen = &config.edge.listen;
 
     let state = Arc::new(EdgeState {
-        router: routes::router(),
+        router: routes::router(challenges),
         apps,
         upstreams: proxy::Upstreams::new(),
         https_port: listen.https.port(),
@@ -69,7 +77,6 @@ pub async fn serve(
     let https = TcpListener::bind(listen.https)
         .await
         .with_context(|| format!("binding the https listener to {}", listen.https))?;
-    let acceptor = tls::acceptor(&config.edge.tls)?;
 
     info!(addr = %listen.http, "listening for http, redirecting to https");
     info!(addr = %listen.https, "listening for https");

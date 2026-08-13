@@ -4,11 +4,14 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use spaceport_core::acme::account::{AcmeCa, Transport};
+use spaceport_core::acme::{CertificateRepository, Certificates, Challenges};
 use spaceport_core::app::{AppId, AppRepository, AppStore, Applier, Pattern, reconcile};
+use spaceport_core::config::TlsProvider;
 use spaceport_core::operator::{DEFAULT_OPERATOR_ENDPOINT, client, server};
 use spaceport_core::runtime::DockerRuntime;
 use spaceport_core::state::{self, Db, StateLock};
-use spaceport_core::{Config, OperatorEndpoint, config::DEFAULT_CONFIG_PATH, edge};
+use spaceport_core::{Config, OperatorEndpoint, acme, config::DEFAULT_CONFIG_PATH, edge};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -175,6 +178,28 @@ async fn run(args: RunArgs) -> Result<()> {
         );
     }
 
+    // The certificate machinery, before the listeners: the resolver has to
+    // exist for the acceptor to be built from, and a restart should be serving
+    // the certificates it already had from its very first handshake.
+    let resolver = edge::tls::resolver()?;
+    let challenges = Arc::new(Challenges::new());
+    let certificates = match (&config.edge.tls.provider, &config.edge.tls.acme) {
+        (TlsProvider::Acme, Some(acme)) => {
+            let repository = CertificateRepository::new(db.clone());
+            let ca = Arc::new(
+                AcmeCa::connect(acme, &repository, challenges.clone(), &Transport::Network).await?,
+            );
+
+            Some(Arc::new(
+                Certificates::load(ca, repository, resolver.clone()).await?,
+            ))
+        }
+        // Without acme nothing ever puts a certificate in the resolver, and
+        // every host is served the development one.
+        _ => None,
+    };
+    let acceptor = edge::tls::acceptor(resolver)?;
+
     let shutdown = CancellationToken::new();
     tokio::spawn({
         let shutdown = shutdown.clone();
@@ -205,7 +230,13 @@ async fn run(args: RunArgs) -> Result<()> {
         })
     });
 
-    let served = edge::serve(&config, apps, shutdown.clone()).await;
+    // Ordering and renewing runs alongside the edge rather than before it: the
+    // challenges it publishes are answered by the listener it is waiting on.
+    if let Some(certificates) = certificates {
+        tokio::spawn(acme::maintain(certificates, apps.clone(), shutdown.clone()));
+    }
+
+    let served = edge::serve(&config, apps, acceptor, challenges, shutdown.clone()).await;
 
     // Whatever stopped the edge stops the operator interface too, so a failure
     // to bind one port does not leave the other half of spaceport running.
@@ -261,12 +292,31 @@ async fn check_state(args: ConfigArgs) -> Result<()> {
     println!("{}: ok", Db::path_in(directory).display());
     println!("  schema version {}", db.schema_version().await?);
 
-    let desired = AppRepository::new(db).desired().await?;
+    let desired = AppRepository::new(db.clone()).desired().await?;
     if desired.is_empty() {
         println!("  no apps recorded");
     }
     for record in desired {
         println!("  app {} applied {}", record.id, record.applied_at);
+    }
+
+    let certificates = CertificateRepository::new(db).all().await?;
+    if certificates.is_empty() {
+        println!("  no certificates held");
+    }
+    for certificate in certificates {
+        // A certificate whose validity will not parse is worth naming rather
+        // than hiding: it is one the edge is not serving either.
+        match certificate.validity() {
+            Ok(validity) => println!(
+                "  certificate for {} expires {}",
+                certificate.host, validity.not_after
+            ),
+            Err(error) => println!(
+                "  certificate for {}: unreadable ({error:#})",
+                certificate.host
+            ),
+        }
     }
 
     Ok(())
@@ -278,6 +328,12 @@ fn check_config(args: ConfigArgs) -> Result<()> {
     println!("{}: ok", args.config.display());
     for (proto, addr) in listeners(&config) {
         println!("  edge listens for {proto} on {addr}");
+    }
+    match (&config.edge.tls.provider, &config.edge.tls.acme) {
+        (TlsProvider::Acme, Some(acme)) => {
+            println!("  edge orders certificates from {}", acme.directory.url())
+        }
+        _ => println!("  edge serves a self-signed certificate, trusted by nothing"),
     }
 
     Ok(())

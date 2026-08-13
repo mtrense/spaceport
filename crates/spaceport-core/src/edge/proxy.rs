@@ -317,7 +317,7 @@ mod tests {
     /// client's would — `Incoming` body and all.
     async fn edge(apps: Arc<AppStore>) -> SocketAddr {
         let state = Arc::new(EdgeState {
-            router: routes::router(),
+            router: routes::router(std::sync::Arc::new(crate::acme::Challenges::new())),
             apps,
             upstreams: Upstreams::new(),
             https_port: 443,

@@ -4,9 +4,27 @@ edge:
     http: 0.0.0.0:80
     https: 0.0.0.0:443
   tls:
+    # `self-signed` generates a throwaway certificate at every start. Nothing
+    # trusts it, so it is for development and nothing else.
     provider: self-signed
+
+    # `acme` gets a real certificate per host from a CA, proving control of each
+    # host over the plaintext listener. It needs the hosts' DNS to point here
+    # and port 80 to be reachable from the internet.
+    #
+    # provider: acme
+    # acme:
+    #   # `staging`, `production`, or another CA's directory URL. Staging by
+    #   # default: the first run of a new setup is the one most likely to be
+    #   # wrong, and staging is the environment that forgives that.
+    #   directory: staging
+    #   # Where the CA sends expiry and revocation notices.
+    #   contact: [mailto:ops@example.com]
+    #   # No CA issues without this, so spaceport refuses to start without it.
+    #   terms_of_service_agreed: true
 state:
-  # Where spaceport remembers the apps it has been told to run. Created if it
-  # is not there, and readable only by the user spaceport runs as.
+  # Where spaceport remembers the apps it has been told to run, and the
+  # certificates it has been issued. Created if it is not there, and readable
+  # only by the user spaceport runs as.
   # directory: /var/lib/spaceport
   directory: ./tmp-spaceport-data

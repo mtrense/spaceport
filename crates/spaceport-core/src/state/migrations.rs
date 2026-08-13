@@ -23,6 +23,30 @@ const MIGRATIONS: &[&str] = &[
         manifest       TEXT    NOT NULL,
         applied_at     TEXT    NOT NULL
     ) STRICT;",
+    // 2 — what an ACME CA has issued, and the account it was issued to.
+    //
+    // Accounts are keyed by directory URL, so moving a setup from staging to
+    // production registers a new account rather than presenting a staging key
+    // to a CA that has never heard of it — and moving back finds the old one
+    // still there.
+    //
+    // Certificates are keyed by host, one order per host: a host that fails
+    // its challenge then costs its own certificate rather than everybody's.
+    //
+    // There is no expiry column. When a certificate expires is written inside
+    // the certificate, and a column saying so could only ever be a second
+    // answer to a question that already has one.
+    "CREATE TABLE acme_accounts (
+        directory   TEXT PRIMARY KEY,
+        credentials TEXT NOT NULL,
+        created_at  TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE certificates (
+        host        TEXT PRIMARY KEY,
+        chain       TEXT NOT NULL,
+        private_key TEXT NOT NULL,
+        issued_at   TEXT NOT NULL
+    ) STRICT;",
 ];
 
 /// The schema version this build writes.
@@ -103,19 +127,66 @@ mod tests {
         assert!(err.contains("newer spaceport"), "{err}");
     }
 
+    /// The columns of `table`, in declaration order.
+    fn columns(connection: &Connection, table: &str) -> Vec<String> {
+        connection
+            .prepare(&format!(
+                "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
+            ))
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
     #[test]
     fn the_first_migration_creates_the_apps_table() {
         let connection = empty();
         migrate(&connection).unwrap();
 
-        let columns: Vec<String> = connection
-            .prepare("SELECT name FROM pragma_table_info('apps') ORDER BY cid")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
+        assert_eq!(
+            columns(&connection, "apps"),
+            ["id", "schema_version", "manifest", "applied_at"]
+        );
+    }
 
-        assert_eq!(columns, ["id", "schema_version", "manifest", "applied_at"]);
+    #[test]
+    fn the_second_migration_creates_the_certificate_tables() {
+        let connection = empty();
+        migrate(&connection).unwrap();
+
+        assert_eq!(
+            columns(&connection, "acme_accounts"),
+            ["directory", "credentials", "created_at"]
+        );
+        assert_eq!(
+            columns(&connection, "certificates"),
+            ["host", "chain", "private_key", "issued_at"]
+        );
+    }
+
+    /// A database written by the previous build has only the apps table, and
+    /// must gain the rest without losing what is in it.
+    #[test]
+    fn migrates_a_database_that_stopped_at_the_first_step() {
+        let connection = empty();
+        connection.execute_batch(MIGRATIONS[0]).unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        connection
+            .execute(
+                "INSERT INTO apps VALUES ('hello', 1, 'schema_version: 1', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(migrate(&connection).unwrap(), LATEST_VERSION);
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM apps", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(!columns(&connection, "certificates").is_empty());
     }
 }

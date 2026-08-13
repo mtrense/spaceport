@@ -16,6 +16,9 @@ clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 # Maintained fork of the deprecated serde_yaml, same API.
 serde_norway = "0.9"
+# Only for the ACME account credentials blob, which instant-acme hands over as
+# an opaque `Serialize`.
+serde_json = "1"
 
 # The docker engine API, over the daemon socket.
 bollard = "0.21"
@@ -48,6 +51,19 @@ hyper-util = { version = "0.1", features = [
   "http2",
 ] }
 rcgen = "0.14"
+# The ACME protocol itself — accounts, orders, challenges. Everything around it
+# (serving the challenge, storing the certificate, deciding when to renew) is
+# spaceport's. `ring` for the same reason as below; no `aws-lc-rs`.
+instant-acme = { version = "0.8", default-features = false, features = [
+  "hyper-rustls",
+  "rcgen",
+  "ring",
+] }
+# Reading `notAfter` off an issued certificate: the only thing that can say
+# when it has to be renewed.
+x509-parser = "0.18"
+# Turning the PEM an ACME server issues into the DER rustls serves.
+rustls-pemfile = "2"
 # `ring` rather than the default `aws-lc-rs`: no cmake/nasm in the build.
 rustls = { version = "0.23", default-features = false, features = [
   "ring",
