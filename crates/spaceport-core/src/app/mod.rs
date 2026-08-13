@@ -4,11 +4,15 @@ pub mod apply;
 pub mod health;
 pub mod manifest;
 pub mod pattern;
+pub mod reconcile;
+pub mod repository;
 pub mod store;
 
 pub use apply::Applier;
 pub use manifest::AppManifest;
 pub use pattern::Pattern;
+pub use reconcile::reconcile;
+pub use repository::{AppRecord, AppRepository};
 pub use store::{App, AppStore, Routes};
 
 use std::fmt;

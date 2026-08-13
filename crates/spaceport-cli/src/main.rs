@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use spaceport_core::app::{AppId, AppStore, Applier, Pattern};
+use spaceport_core::app::{AppId, AppRepository, AppStore, Applier, Pattern, reconcile};
 use spaceport_core::operator::{DEFAULT_OPERATOR_ENDPOINT, client, server};
 use spaceport_core::runtime::DockerRuntime;
+use spaceport_core::state::{self, Db, StateLock};
 use spaceport_core::{Config, OperatorEndpoint, config::DEFAULT_CONFIG_PATH, edge};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -49,6 +50,8 @@ struct RunArgs {
 enum CheckCommand {
     /// Validate the config file.
     Config(ConfigArgs),
+    /// Open the state store and report what it holds.
+    State(ConfigArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -109,9 +112,10 @@ struct ConfigArgs {
 async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Run(args) => run(args).await,
-        Command::Check {
-            command: CheckCommand::Config(args),
-        } => check_config(args),
+        Command::Check { command } => match command {
+            CheckCommand::Config(args) => check_config(args),
+            CheckCommand::State(args) => check_state(args).await,
+        },
         Command::Apps { command } => match command {
             AppsCommand::Apply(args) => apply(args).await,
             AppsCommand::List(args) => list(args).await,
@@ -131,6 +135,13 @@ async fn run(args: RunArgs) -> Result<()> {
     let config = Config::load(&args.config.config)?;
     info!(path = %args.config.config.display(), "loaded config");
 
+    // Before anything is started: two spaceports over one state directory
+    // would spend their lives undoing each other's reconciliation.
+    state::create_directory(&config.state.directory)?;
+    let _lock = StateLock::acquire(&config.state.directory)?;
+    let db = Db::open(&config.state.directory)?;
+    info!(path = %Db::path_in(&config.state.directory).display(), "opened the state store");
+
     // Checked at startup rather than at the first apply: an unreachable
     // container engine is a broken host, and finding out about it while
     // starting is a great deal cheaper than finding out about it later.
@@ -138,7 +149,23 @@ async fn run(args: RunArgs) -> Result<()> {
     runtime.ping().await?;
 
     let apps = Arc::new(AppStore::new());
-    let applier = Arc::new(Applier::new(apps.clone(), runtime));
+    let applier = Arc::new(Applier::new(
+        apps.clone(),
+        runtime,
+        AppRepository::new(db.clone()),
+    ));
+
+    // Ahead of the listeners, so a restart does not answer 404 for apps it is
+    // in the middle of bringing back.
+    let report = reconcile(&applier).await?;
+    if !report.is_empty() {
+        info!(
+            restored = report.restored.len(),
+            failed = report.failed.len(),
+            swept = report.swept,
+            "reconciled with what was recorded",
+        );
+    }
 
     let shutdown = CancellationToken::new();
     tokio::spawn({
@@ -210,6 +237,29 @@ async fn destroy(args: DestroyArgs) -> Result<()> {
         "{}",
         client::destroy(&args.operator.operator, &args.app_id).await?
     );
+
+    Ok(())
+}
+
+/// Open the state store the way `run` would, and say what is in it.
+///
+/// Deliberately does not take the lock: this is a question, and asking it
+/// while spaceport is running is exactly when the answer is interesting.
+async fn check_state(args: ConfigArgs) -> Result<()> {
+    let config = Config::load(&args.config)?;
+    let directory = &config.state.directory;
+    let db = Db::open(directory)?;
+
+    println!("{}: ok", Db::path_in(directory).display());
+    println!("  schema version {}", db.schema_version().await?);
+
+    let desired = AppRepository::new(db).desired().await?;
+    if desired.is_empty() {
+        println!("  no apps recorded");
+    }
+    for record in desired {
+        println!("  app {} applied {}", record.id, record.applied_at);
+    }
 
     Ok(())
 }

@@ -307,8 +307,9 @@ fn refuse(status: StatusCode, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, AppStore};
-    use crate::runtime::{Container, ContainerId, ContainerRuntime};
+    use crate::app::{App, AppRepository, AppStore};
+    use crate::runtime::{Container, ContainerId, ContainerRuntime, Managed};
+    use crate::state::Db;
     use async_trait::async_trait;
     use axum::body::Body;
     use http::Request;
@@ -342,6 +343,11 @@ mod tests {
         async fn remove(&self, _id: &ContainerId) -> Result<()> {
             Ok(())
         }
+
+        /// Nothing here reconciles, so nothing here has leftovers.
+        async fn managed(&self) -> Result<Vec<Managed>> {
+            Ok(Vec::new())
+        }
     }
 
     const MANIFEST: &str = "schema_version: 1
@@ -367,7 +373,8 @@ container:
 
     fn store_and_router_on(runtime: OneContainer) -> (Arc<AppStore>, Router) {
         let store = Arc::new(AppStore::new());
-        let applier = Applier::new(store.clone(), Arc::new(runtime));
+        let repository = AppRepository::new(Db::in_memory().unwrap());
+        let applier = Applier::new(store.clone(), Arc::new(runtime), repository);
 
         (store, router(Arc::new(applier)))
     }

@@ -50,6 +50,19 @@ pub struct Container {
     pub upstream: SocketAddr,
 }
 
+/// A container this runtime is running on spaceport's behalf, as found rather
+/// than as started.
+///
+/// This is how a restarted spaceport sees what the one before it left behind.
+/// The app is optional because the label can be missing or unreadable, and a
+/// container spaceport marked as its own is still its own to clean up even when
+/// it can no longer say whose it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Managed {
+    pub id: ContainerId,
+    pub app: Option<AppId>,
+}
+
 /// A container engine spaceport can run apps on.
 #[async_trait]
 pub trait ContainerRuntime: Send + Sync {
@@ -63,4 +76,11 @@ pub trait ContainerRuntime: Send + Sync {
 
     /// Stop and delete a container. Succeeds if it is already gone.
     async fn remove(&self, id: &ContainerId) -> Result<()>;
+
+    /// Every container this runtime is running for spaceport, running or not.
+    ///
+    /// Spaceport's containers outlive the spaceport that started them, so this
+    /// is what a restart reconciles against: anything here that no app is
+    /// recorded for is a leftover, and nothing else may be touched.
+    async fn managed(&self) -> Result<Vec<Managed>>;
 }

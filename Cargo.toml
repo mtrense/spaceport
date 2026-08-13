@@ -21,6 +21,17 @@ serde_norway = "0.9"
 bollard = "0.21"
 futures-util = { version = "0.3", default-features = false }
 
+# The state store. `bundled` so the build does not depend on a system sqlite,
+# and so every host runs the version this was tested against.
+rusqlite = { version = "0.40", features = ["bundled"] }
+# Only for stamping records with the time they were written.
+time = { version = "0.3", default-features = false, features = [
+  "std",
+  "formatting",
+] }
+# Only for `flock` on the state directory's lock file.
+libc = "0.2"
+
 axum = "0.8"
 bytes = "1"
 http = "1"

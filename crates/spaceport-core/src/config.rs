@@ -1,7 +1,7 @@
 //! Configuration loading and validation.
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, de};
@@ -23,6 +23,34 @@ pub struct Config {
 
     /// How spaceport faces the outside world.
     pub edge: Edge,
+
+    /// Where spaceport keeps what it must not forget. Defaulted, so an
+    /// existing config file keeps working and a host that is happy with
+    /// `/var/lib/spaceport` never has to say so.
+    #[serde(default)]
+    pub state: State,
+}
+
+/// Where spaceport's durable state lives.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct State {
+    /// The directory holding the state database and its lock. Created at
+    /// startup if it is not there, owner-only.
+    #[serde(default = "default_state_dir")]
+    pub directory: PathBuf,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            directory: default_state_dir(),
+        }
+    }
+}
+
+fn default_state_dir() -> PathBuf {
+    PathBuf::from(crate::state::DEFAULT_STATE_DIR)
 }
 
 /// A schema version this build accepts.
@@ -183,6 +211,21 @@ edge:
             .unwrap_err()
             .to_string();
         assert!(err.contains("http"), "{err}");
+    }
+
+    #[test]
+    fn defaults_the_state_directory() {
+        let config = Config::parse(MINIMAL).unwrap();
+
+        assert_eq!(config.state.directory, PathBuf::from("/var/lib/spaceport"));
+    }
+
+    #[test]
+    fn takes_the_state_directory_the_config_names() {
+        let config =
+            Config::parse(&format!("{MINIMAL}state:\n  directory: /srv/spaceport\n")).unwrap();
+
+        assert_eq!(config.state.directory, PathBuf::from("/srv/spaceport"));
     }
 
     #[test]

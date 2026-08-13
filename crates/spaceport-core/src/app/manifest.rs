@@ -39,6 +39,16 @@ pub struct AppManifest {
     /// says nothing here is complete.
     #[serde(default)]
     pub container: Container,
+
+    /// The document this was parsed from, kept verbatim.
+    ///
+    /// Private, and filled in by [`AppManifest::parse`] rather than by serde:
+    /// it is not a field of the schema, it is the schema's own text. Spaceport
+    /// stores this, not a re-serialization, so that what an operator applied is
+    /// what a later spaceport reads back — including whatever this build's
+    /// structs do not model.
+    #[serde(skip)]
+    source_text: String,
 }
 
 /// Where the app's image comes from.
@@ -362,9 +372,16 @@ impl AppManifest {
 
     /// Parse and validate a manifest document.
     pub fn parse(raw: &str) -> Result<Self> {
-        let manifest: Self = serde_norway::from_str(raw)?;
+        let mut manifest: Self = serde_norway::from_str(raw)?;
         manifest.validate()?;
+        manifest.source_text = raw.to_owned();
+
         Ok(manifest)
+    }
+
+    /// The document this manifest was parsed from, byte for byte.
+    pub fn source_text(&self) -> &str {
+        &self.source_text
     }
 
     /// What serde cannot express: the rules that span more than one field.
@@ -416,6 +433,23 @@ routing:
         let raw = std::fs::read_to_string(&path).unwrap();
 
         AppManifest::parse(&raw).unwrap();
+    }
+
+    /// The state store keeps this text and nothing else, so a manifest that
+    /// dropped a comment or normalized its quoting on the way through would
+    /// give an operator back something they never wrote.
+    #[test]
+    fn keeps_the_document_it_was_parsed_from() {
+        let raw = "# what this app is for\nschema_version: 1\nsource:\n  type: image\n  image: \"strm/helloworld-http:latest\"\nrouting:\n  hosts: [alpha.test]\n";
+
+        let manifest = AppManifest::parse(raw).unwrap();
+
+        assert_eq!(manifest.source_text(), raw);
+        // And what it kept parses back to the same manifest.
+        assert_eq!(
+            AppManifest::parse(manifest.source_text()).unwrap(),
+            manifest
+        );
     }
 
     #[test]

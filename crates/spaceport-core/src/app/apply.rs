@@ -12,8 +12,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::anyhow;
-use tracing::info;
+use tracing::{info, warn};
 
+use super::repository::AppRepository;
 use super::{App, AppId, AppManifest, AppStore, health};
 use crate::runtime::ContainerRuntime;
 
@@ -61,16 +62,35 @@ impl std::error::Error for DestroyError {}
 pub struct Applier {
     store: Arc<AppStore>,
     runtime: Arc<dyn ContainerRuntime>,
+    repository: AppRepository,
 }
 
 impl Applier {
-    pub fn new(store: Arc<AppStore>, runtime: Arc<dyn ContainerRuntime>) -> Self {
-        Self { store, runtime }
+    pub fn new(
+        store: Arc<AppStore>,
+        runtime: Arc<dyn ContainerRuntime>,
+        repository: AppRepository,
+    ) -> Self {
+        Self {
+            store,
+            runtime,
+            repository,
+        }
     }
 
     /// The apps this applier has running.
     pub fn store(&self) -> &AppStore {
         &self.store
+    }
+
+    /// What this applier has been told to run, across restarts.
+    pub fn repository(&self) -> &AppRepository {
+        &self.repository
+    }
+
+    /// The engine it runs apps on.
+    pub fn runtime(&self) -> &dyn ContainerRuntime {
+        self.runtime.as_ref()
     }
 
     /// Stop the app named `id` and forget it, routes and container both.
@@ -85,6 +105,13 @@ impl Applier {
             .store
             .remove(id)
             .ok_or_else(|| DestroyError::Unknown(anyhow!("no app named `{id}` is running")))?;
+
+        // Forgotten before the container goes, so that a crash in between
+        // leaves a container no record claims — which the next start cleans up
+        // — rather than a record for an app that is not coming back.
+        if let Err(error) = self.repository.forget(id).await {
+            warn!(app = %id, %error, "could not forget the app, it will come back on restart");
+        }
 
         self.runtime.remove(&app.container).await.map_err(|error| {
             DestroyError::Failed(error.context(format!(
@@ -105,6 +132,30 @@ impl Applier {
     /// app down. What it does guarantee is that it leaves nothing behind — a
     /// container that ends up unroutable is removed rather than left running.
     pub async fn apply(&self, id: AppId, manifest: AppManifest) -> Result<Arc<App>, ApplyError> {
+        let recorded = manifest.source_text().to_owned();
+        let app = self.start(id, manifest).await?;
+
+        // Recorded last, and only on success: a manifest that never ran is not
+        // something to bring back at the next start. The cost is a window —
+        // from here to the commit — in which a successful apply can be lost to
+        // a crash, and the answer to that is to apply it again.
+        if let Err(error) = self.repository.record_applied(&app.id, &recorded).await {
+            warn!(app = %app.id, %error, "the app is running but was not recorded, so it will not survive a restart");
+        }
+
+        Ok(app)
+    }
+
+    /// Start a manifest that is *already* recorded, without recording it again.
+    ///
+    /// This is what a restart runs. It leaves `applied_at` saying when the
+    /// operator applied the app, not when spaceport last rebooted.
+    pub async fn restore(&self, id: AppId, manifest: AppManifest) -> Result<Arc<App>, ApplyError> {
+        self.start(id, manifest).await
+    }
+
+    /// Everything an apply does except remember it.
+    async fn start(&self, id: AppId, manifest: AppManifest) -> Result<Arc<App>, ApplyError> {
         if let Some((host, owner)) = self.store.conflict(&id, &manifest.routing.hosts) {
             return Err(ApplyError::Conflict(anyhow!(
                 "host `{host}` is already served by app `{owner}`"
@@ -161,7 +212,8 @@ impl Applier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{Container, ContainerId};
+    use crate::runtime::{Container, ContainerId, Managed};
+    use crate::state::Db;
     use anyhow::{Result, bail};
     use async_trait::async_trait;
     use std::net::SocketAddr;
@@ -201,6 +253,23 @@ mod tests {
             self.removed.lock().unwrap().push(id.clone());
             Ok(())
         }
+
+        async fn managed(&self) -> Result<Vec<Managed>> {
+            let removed = self.removed.lock().unwrap();
+
+            Ok(self
+                .launched
+                .lock()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .map(|(index, app)| Managed {
+                    id: ContainerId::new(format!("{app}-{}", 9001 + index)),
+                    app: Some(app.clone()),
+                })
+                .filter(|container| !removed.contains(&container.id))
+                .collect())
+        }
     }
 
     /// A manifest whose app is routed the moment it starts: these tests are
@@ -224,8 +293,9 @@ container:
 
     fn applier(runtime: Arc<FakeRuntime>) -> (Applier, Arc<AppStore>) {
         let store = Arc::new(AppStore::new());
+        let repository = AppRepository::new(Db::in_memory().unwrap());
 
-        (Applier::new(store.clone(), runtime), store)
+        (Applier::new(store.clone(), runtime, repository), store)
     }
 
     #[tokio::test]
@@ -402,7 +472,11 @@ container:
             refuse_removal: true,
             ..Default::default()
         });
-        let applier = Applier::new(store.clone(), runtime);
+        let applier = Applier::new(
+            store.clone(),
+            runtime,
+            AppRepository::new(Db::in_memory().unwrap()),
+        );
 
         let error = applier
             .destroy(&"hello".parse().unwrap())
@@ -413,6 +487,81 @@ container:
         assert!(error.to_string().contains("is still there"), "{error}");
         assert!(store.apps().is_empty());
         assert!(store.routes().lookup("alpha.test").is_none());
+    }
+
+    #[tokio::test]
+    async fn records_an_applied_app_verbatim() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _) = applier(runtime);
+        let manifest = manifest("alpha.test");
+
+        applier
+            .apply("hello".parse().unwrap(), manifest.clone())
+            .await
+            .unwrap();
+
+        let desired = applier.repository().desired().await.unwrap();
+        assert_eq!(desired.len(), 1);
+        assert_eq!(desired[0].id.as_str(), "hello");
+        assert_eq!(desired[0].manifest, manifest.source_text());
+    }
+
+    /// An app that never came up is not something to bring back at the next
+    /// start, so nothing about it is written down.
+    #[tokio::test]
+    async fn records_nothing_for_an_app_that_never_started() {
+        let runtime = Arc::new(FakeRuntime {
+            refuse: true,
+            ..Default::default()
+        });
+        let (applier, _) = applier(runtime);
+
+        applier
+            .apply("hello".parse().unwrap(), manifest("alpha.test"))
+            .await
+            .unwrap_err();
+
+        assert!(applier.repository().desired().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn destroying_an_app_forgets_it() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _) = applier(runtime);
+        applier
+            .apply("hello".parse().unwrap(), manifest("alpha.test"))
+            .await
+            .unwrap();
+
+        applier.destroy(&"hello".parse().unwrap()).await.unwrap();
+
+        assert!(applier.repository().desired().await.unwrap().is_empty());
+    }
+
+    /// A restart re-runs what was recorded; it did not learn anything new, so
+    /// it must not restate when the operator applied it.
+    #[tokio::test]
+    async fn restoring_an_app_does_not_re_record_it() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime);
+        applier
+            .apply("hello".parse().unwrap(), manifest("alpha.test"))
+            .await
+            .unwrap();
+        let applied_at = applier.repository().desired().await.unwrap()[0]
+            .applied_at
+            .clone();
+
+        applier
+            .restore("hello".parse().unwrap(), manifest("alpha.test"))
+            .await
+            .unwrap();
+
+        let desired = applier.repository().desired().await.unwrap();
+        assert_eq!(desired.len(), 1);
+        assert_eq!(desired[0].applied_at, applied_at);
+        // It is running all the same.
+        assert!(store.routes().lookup("alpha.test").is_some());
     }
 
     #[tokio::test]

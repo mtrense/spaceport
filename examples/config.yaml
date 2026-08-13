@@ -5,3 +5,8 @@ edge:
     https: 0.0.0.0:443
   tls:
     provider: self-signed
+state:
+  # Where spaceport remembers the apps it has been told to run. Created if it
+  # is not there, and readable only by the user spaceport runs as.
+  # directory: /var/lib/spaceport
+  directory: ./tmp-spaceport-data

@@ -6,7 +6,9 @@ pub mod duration;
 pub mod edge;
 pub mod operator;
 pub mod runtime;
+pub mod state;
 
 pub use app::{AppId, AppManifest};
 pub use config::Config;
 pub use operator::OperatorEndpoint;
+pub use state::Db;

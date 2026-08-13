@@ -20,12 +20,13 @@ use bollard::errors::Error as DockerError;
 use bollard::models::{ContainerCreateBody, HostConfig, PortBinding, PortMap};
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptionsBuilder, InspectContainerOptions,
-    RemoveContainerOptionsBuilder, StartContainerOptions, StopContainerOptionsBuilder,
+    ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
+    StopContainerOptionsBuilder,
 };
 use futures_util::StreamExt;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use super::{Container, ContainerId, ContainerRuntime};
+use super::{Container, ContainerId, ContainerRuntime, Managed};
 use crate::app::manifest::Source;
 use crate::app::{AppId, AppManifest};
 
@@ -217,6 +218,44 @@ impl ContainerRuntime for DockerRuntime {
         self.remove_container(id.as_str()).await?;
 
         Ok(())
+    }
+
+    async fn managed(&self) -> Result<Vec<Managed>> {
+        // `all`, not just the running ones: a container that died while
+        // spaceport was down is still spaceport's to account for, and one left
+        // stopped under an app's name is exactly what the next launch would
+        // collide with.
+        let managed = format!("{MANAGED_LABEL}=true");
+        let options = ListContainersOptionsBuilder::new()
+            .all(true)
+            .filters(&HashMap::from([("label", vec![managed.as_str()])]))
+            .build();
+
+        let containers = self
+            .docker
+            .list_containers(Some(options))
+            .await
+            .context("listing the containers spaceport manages")?;
+
+        Ok(containers
+            .into_iter()
+            .filter_map(|container| {
+                let id = ContainerId::new(container.id?);
+                let app = container
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get(APP_LABEL))
+                    .and_then(|app| match app.parse::<AppId>() {
+                        Ok(app) => Some(app),
+                        Err(error) => {
+                            warn!(container = %id, label = app, %error, "a spaceport container is labelled with an id spaceport cannot read");
+                            None
+                        }
+                    });
+
+                Some(Managed { id, app })
+            })
+            .collect())
     }
 }
 
@@ -515,6 +554,35 @@ routing:
         runtime.remove(&replacement.id).await.unwrap();
         // Removing what is already gone is not an error.
         runtime.remove(&replacement.id).await.unwrap();
+    }
+
+    /// What a restarted spaceport sees. Nothing else on the host may be in
+    /// this list, and the label has to survive a round trip through the engine
+    /// well enough to say which app a container belongs to.
+    #[tokio::test]
+    async fn finds_the_containers_it_manages() {
+        let Some(runtime) = daemon().await else {
+            eprintln!("skipping: no docker daemon");
+            return;
+        };
+        let app: AppId = "spaceport-selftest-managed".parse().unwrap();
+        let container = runtime.launch(&app, &hello_manifest()).await.unwrap();
+
+        let managed = runtime.managed().await.unwrap();
+
+        let found = managed
+            .iter()
+            .find(|found| found.id == container.id)
+            .unwrap_or_else(|| panic!("{} is not in {managed:?}", container.id));
+        assert_eq!(found.app, Some(app));
+
+        runtime.remove(&container.id).await.unwrap();
+        // And a container that is gone is no longer managed.
+        let managed = runtime.managed().await.unwrap();
+        assert!(
+            !managed.iter().any(|found| found.id == container.id),
+            "{managed:?}",
+        );
     }
 
     #[tokio::test]
