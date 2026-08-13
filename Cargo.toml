@@ -15,3 +15,42 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 # Maintained fork of the deprecated serde_yaml, same API.
 serde_norway = "0.9"
+
+axum = "0.8"
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = [
+  "server",
+  "server-auto",
+  "service",
+  "tokio",
+  "http1",
+  "http2",
+] }
+rcgen = "0.14"
+# `ring` rather than the default `aws-lc-rs`: no cmake/nasm in the build.
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "logging",
+  "std",
+  "tls12",
+] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "signal",
+  "sync",
+  "time",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+  "ring",
+  "logging",
+  "tls12",
+] }
+tokio-util = "0.7"
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

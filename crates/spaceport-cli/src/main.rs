@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
-use spaceport_core::{Config, OperatorEndpoint, config::DEFAULT_CONFIG_PATH};
+use spaceport_core::{Config, OperatorEndpoint, config::DEFAULT_CONFIG_PATH, edge};
+use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 /// A reverse proxy for small and internal apps.
 #[derive(Debug, Parser)]
@@ -47,28 +49,45 @@ struct ConfigArgs {
     config: PathBuf,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Run(args) => run(args),
+        Command::Run(args) => run(args).await,
         Command::Config {
             command: ConfigCommand::Check(args),
         } => config_check(args),
     }
 }
 
-fn run(args: RunArgs) -> Result<()> {
+async fn run(args: RunArgs) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "spaceport=info,warn".into()),
+        )
+        .init();
+
     let config = Config::load(&args.config.config)?;
+    info!(path = %args.config.config.display(), "loaded config");
 
-    // TODO: start the proxy, and the operator interface if one was requested.
-    println!("loaded config from {}", args.config.config.display());
-    for (proto, addr) in listeners(&config) {
-        println!("edge would listen for {proto} on {addr}");
-    }
+    // TODO: start the operator interface if one was requested.
     if let Some(operator) = &args.operator {
-        println!("operator interface would listen on {operator}");
+        info!(%operator, "operator interface not implemented yet");
     }
 
-    Ok(())
+    let shutdown = CancellationToken::new();
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => info!("shutting down"),
+                Err(error) => tracing::error!(%error, "could not listen for ctrl-c"),
+            }
+            shutdown.cancel();
+        }
+    });
+
+    edge::serve(&config, shutdown).await
 }
 
 fn config_check(args: ConfigArgs) -> Result<()> {
@@ -85,7 +104,5 @@ fn config_check(args: ConfigArgs) -> Result<()> {
 /// The configured edge listeners, in protocol order.
 fn listeners(config: &Config) -> impl Iterator<Item = (&'static str, SocketAddr)> {
     let listen = &config.edge.listen;
-    [("http", listen.http), ("https", listen.https)]
-        .into_iter()
-        .filter_map(|(proto, addr)| addr.map(|addr| (proto, addr)))
+    [("http", listen.http), ("https", listen.https)].into_iter()
 }
