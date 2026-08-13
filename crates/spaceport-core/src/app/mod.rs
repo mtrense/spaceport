@@ -3,10 +3,12 @@
 pub mod apply;
 pub mod health;
 pub mod manifest;
+pub mod pattern;
 pub mod store;
 
 pub use apply::Applier;
 pub use manifest::AppManifest;
+pub use pattern::Pattern;
 pub use store::{App, AppStore, Routes};
 
 use std::fmt;

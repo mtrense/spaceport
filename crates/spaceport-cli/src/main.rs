@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use spaceport_core::app::{AppId, AppStore, Applier};
+use spaceport_core::app::{AppId, AppStore, Applier, Pattern};
 use spaceport_core::operator::{DEFAULT_OPERATOR_ENDPOINT, client, server};
 use spaceport_core::runtime::DockerRuntime;
 use spaceport_core::{Config, OperatorEndpoint, config::DEFAULT_CONFIG_PATH, edge};
@@ -55,6 +55,10 @@ enum CheckCommand {
 enum AppsCommand {
     /// Run an app from a manifest, replacing it if it is already running.
     Apply(ApplyArgs),
+    /// List the apps spaceport is running.
+    List(ListArgs),
+    /// Stop an app and remove it.
+    Destroy(DestroyArgs),
 }
 
 #[derive(Debug, Args)]
@@ -65,6 +69,30 @@ struct ApplyArgs {
     /// Path to the app manifest.
     manifest: PathBuf,
 
+    #[command(flatten)]
+    operator: OperatorArgs,
+}
+
+#[derive(Debug, Args)]
+struct ListArgs {
+    /// Only list apps whose name matches, where `*` stands for any characters.
+    pattern: Option<Pattern>,
+
+    #[command(flatten)]
+    operator: OperatorArgs,
+}
+
+#[derive(Debug, Args)]
+struct DestroyArgs {
+    /// The app to stop and remove.
+    app_id: AppId,
+
+    #[command(flatten)]
+    operator: OperatorArgs,
+}
+
+#[derive(Debug, Args)]
+struct OperatorArgs {
     /// The operator interface of the spaceport to talk to.
     #[arg(short, long, value_name = "SOCKET|ADDRESS", default_value = DEFAULT_OPERATOR_ENDPOINT)]
     operator: OperatorEndpoint,
@@ -84,9 +112,11 @@ async fn main() -> Result<()> {
         Command::Check {
             command: CheckCommand::Config(args),
         } => check_config(args),
-        Command::Apps {
-            command: AppsCommand::Apply(args),
-        } => apply(args).await,
+        Command::Apps { command } => match command {
+            AppsCommand::Apply(args) => apply(args).await,
+            AppsCommand::List(args) => list(args).await,
+            AppsCommand::Destroy(args) => destroy(args).await,
+        },
     }
 }
 
@@ -160,7 +190,25 @@ async fn apply(args: ApplyArgs) -> Result<()> {
 
     print!(
         "{}",
-        client::apply(&args.operator, &args.app_id, manifest).await?
+        client::apply(&args.operator.operator, &args.app_id, manifest).await?
+    );
+
+    Ok(())
+}
+
+async fn list(args: ListArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::list(&args.operator.operator, args.pattern.as_ref()).await?
+    );
+
+    Ok(())
+}
+
+async fn destroy(args: DestroyArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::destroy(&args.operator.operator, &args.app_id).await?
     );
 
     Ok(())

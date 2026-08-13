@@ -68,6 +68,30 @@ pub async fn wait_until_ready(addr: SocketAddr, host: &str, readiness: &Readines
     }
 }
 
+/// One look at an app that is already running, for reporting rather than
+/// gating: does it answer right now?
+///
+/// Uses the app's own check where there is one, and a tcp check where the
+/// manifest asked for none — `none` means "route it without waiting", not
+/// "there is no way to tell". Its own short timeout, because whoever asked is
+/// waiting on a listing and a dead app must not hold it up for the length of
+/// an apply's patience.
+pub async fn probe(addr: SocketAddr, host: &str, readiness: &Readiness) -> Result<()> {
+    let readiness = Readiness {
+        kind: match readiness.kind {
+            Check::None => Check::Tcp,
+            kind => kind,
+        },
+        timeout: PROBE_TIMEOUT,
+        ..readiness.clone()
+    };
+
+    check(addr, host, &readiness).await
+}
+
+/// How long [`probe`] waits for an app to answer.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// One check, given `timeout` to finish.
 async fn check(addr: SocketAddr, host: &str, readiness: &Readiness) -> Result<()> {
     let attempt = async {

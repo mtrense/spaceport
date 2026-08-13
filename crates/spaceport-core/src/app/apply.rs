@@ -38,7 +38,26 @@ impl fmt::Display for ApplyError {
 
 impl std::error::Error for ApplyError {}
 
-/// Turns manifests into running, routed apps.
+/// Why an app could not be destroyed.
+#[derive(Debug)]
+pub enum DestroyError {
+    /// No app is running under that id.
+    Unknown(anyhow::Error),
+    /// Its container would not go away.
+    Failed(anyhow::Error),
+}
+
+impl fmt::Display for DestroyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown(error) | Self::Failed(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
+impl std::error::Error for DestroyError {}
+
+/// Turns manifests into running, routed apps, and takes them back down again.
 pub struct Applier {
     store: Arc<AppStore>,
     runtime: Arc<dyn ContainerRuntime>,
@@ -47,6 +66,35 @@ pub struct Applier {
 impl Applier {
     pub fn new(store: Arc<AppStore>, runtime: Arc<dyn ContainerRuntime>) -> Self {
         Self { store, runtime }
+    }
+
+    /// The apps this applier has running.
+    pub fn store(&self) -> &AppStore {
+        &self.store
+    }
+
+    /// Stop the app named `id` and forget it, routes and container both.
+    ///
+    /// The routes go first, so nothing is forwarded to a container on its way
+    /// out. If the engine then refuses to remove it, the app is already gone
+    /// from the store and nothing will ever route to that container again —
+    /// the error names it, because by then it is a container only the operator
+    /// can clean up.
+    pub async fn destroy(&self, id: &AppId) -> Result<Arc<App>, DestroyError> {
+        let app = self
+            .store
+            .remove(id)
+            .ok_or_else(|| DestroyError::Unknown(anyhow!("no app named `{id}` is running")))?;
+
+        self.runtime.remove(&app.container).await.map_err(|error| {
+            DestroyError::Failed(error.context(format!(
+                "app `{id}` is no longer routed, but its container {} is still there",
+                app.container
+            )))
+        })?;
+        info!(app = %id, container = %app.container, "app destroyed");
+
+        Ok(app)
     }
 
     /// Start `manifest` as the app named `id` and route traffic to it,
@@ -126,6 +174,7 @@ mod tests {
         launched: Mutex<Vec<AppId>>,
         removed: Mutex<Vec<ContainerId>>,
         refuse: bool,
+        refuse_removal: bool,
     }
 
     #[async_trait]
@@ -146,6 +195,9 @@ mod tests {
         }
 
         async fn remove(&self, id: &ContainerId) -> Result<()> {
+            if self.refuse_removal {
+                bail!("that container is staying right where it is");
+            }
             self.removed.lock().unwrap().push(id.clone());
             Ok(())
         }
@@ -299,6 +351,68 @@ container:
             store.routes().lookup("alpha.test").unwrap().upstream.port(),
             9001
         );
+    }
+
+    #[tokio::test]
+    async fn destroying_an_app_stops_it_and_drops_its_routes() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+        let app = applier
+            .apply("hello".parse().unwrap(), manifest("alpha.test"))
+            .await
+            .unwrap();
+
+        let destroyed = applier.destroy(&"hello".parse().unwrap()).await.unwrap();
+
+        assert_eq!(destroyed.id, app.id);
+        assert!(store.apps().is_empty());
+        assert!(store.routes().lookup("alpha.test").is_none());
+        assert_eq!(
+            *runtime.removed.lock().unwrap(),
+            std::slice::from_ref(&app.container)
+        );
+    }
+
+    #[tokio::test]
+    async fn destroying_an_unknown_app_says_so() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _) = applier(runtime.clone());
+
+        let error = applier
+            .destroy(&"ghost".parse().unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, DestroyError::Unknown(_)));
+        assert!(error.to_string().contains("no app named `ghost`"));
+        assert!(runtime.removed.lock().unwrap().is_empty());
+    }
+
+    /// A container that will not go away is still worth unrouting — but the
+    /// operator has to hear that it is still running.
+    #[tokio::test]
+    async fn reports_a_container_that_would_not_go_away() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+        applier
+            .apply("hello".parse().unwrap(), manifest("alpha.test"))
+            .await
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime {
+            refuse_removal: true,
+            ..Default::default()
+        });
+        let applier = Applier::new(store.clone(), runtime);
+
+        let error = applier
+            .destroy(&"hello".parse().unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, DestroyError::Failed(_)));
+        assert!(error.to_string().contains("is still there"), "{error}");
+        assert!(store.apps().is_empty());
+        assert!(store.routes().lookup("alpha.test").is_none());
     }
 
     #[tokio::test]

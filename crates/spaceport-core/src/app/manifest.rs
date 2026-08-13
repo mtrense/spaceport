@@ -57,6 +57,20 @@ pub enum Source {
     },
 }
 
+impl fmt::Display for Source {
+    /// One line, for listings: where the image comes from, and what from
+    /// there.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Image { image } => write!(f, "image {image}"),
+            Self::Build {
+                dockerfile,
+                context,
+            } => write!(f, "build {} in {}", dockerfile.display(), context.display()),
+        }
+    }
+}
+
 fn default_dockerfile() -> PathBuf {
     PathBuf::from("Dockerfile")
 }
