@@ -1,13 +1,18 @@
+mod render;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use render::Colour;
 use spaceport_core::acme::account::{AcmeCa, Transport};
 use spaceport_core::acme::{CertificateRepository, Certificates, Challenges};
 use spaceport_core::app::{AppId, AppRepository, AppStore, Applier, Pattern, reconcile};
 use spaceport_core::config::TlsProvider;
+use spaceport_core::events::{self, Category, Event, EventBus, Level};
+use spaceport_core::operator::client::Watch;
 use spaceport_core::operator::{DEFAULT_OPERATOR_ENDPOINT, client, server};
 use spaceport_core::runtime::DockerRuntime;
 use spaceport_core::setup;
@@ -15,6 +20,23 @@ use spaceport_core::state::{self, Db, StateLock};
 use spaceport_core::{Config, OperatorEndpoint, acme, config::DEFAULT_CONFIG_PATH, edge};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
+use tracing_subscriber::Layer as _;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+/// What goes to stdout, unless `RUST_LOG` says otherwise.
+const DEFAULT_LOG_FILTER: &str = "spaceport=info,warn";
+
+/// What `spaceport stream` carries, unless this names something else.
+const STREAM_FILTER_VAR: &str = "SPACEPORT_STREAM";
+
+/// Spaceport's own events, down to debug, and nothing else.
+///
+/// The crates underneath spaceport — the docker client, rustls, hyper — have a
+/// great deal to say at debug level, and none of it is about what this
+/// spaceport is doing. The prefix covers `spaceport` and `spaceport_core`
+/// alike, which is every module that means anything to an operator.
+const DEFAULT_STREAM_FILTER: &str = "spaceport=debug";
 
 /// A reverse proxy for small and internal apps.
 #[derive(Debug, Parser)]
@@ -41,6 +63,8 @@ enum Command {
         #[command(subcommand)]
         command: AppsCommand,
     },
+    /// Watch what a running spaceport is doing, as it does it.
+    Stream(StreamArgs),
 }
 
 #[derive(Debug, Args)]
@@ -118,6 +142,41 @@ struct DestroyArgs {
 }
 
 #[derive(Debug, Args)]
+struct StreamArgs {
+    /// Only events about apps whose name matches, where `*` stands for any
+    /// characters. Excludes the events that are about no app at all.
+    #[arg(short, long, value_name = "PATTERN")]
+    app: Option<Pattern>,
+
+    /// Only events in this category, or in one below it: `app` selects
+    /// `app.apply` and `app.reconcile` alike.
+    #[arg(short, long)]
+    category: Option<Category>,
+
+    /// The least severe events worth seeing.
+    #[arg(short, long, default_value = "debug")]
+    level: Level,
+
+    /// How many events from before now to show first.
+    #[arg(long, default_value_t = 20, value_name = "COUNT")]
+    history: usize,
+
+    /// Colour the events, even when this is not writing to a terminal.
+    /// Without it, colour is used when a terminal is there to show it and
+    /// `NO_COLOR` is not set.
+    #[arg(short, long)]
+    pretty: bool,
+
+    /// Print the events as the JSON they arrive as, one per line. Never
+    /// coloured: whatever reads this is not looking at it.
+    #[arg(long, conflicts_with = "pretty")]
+    json: bool,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
 struct ServerArgs {
     /// The spaceport to talk to: an operator socket, or an address over the
     /// network.
@@ -152,14 +211,28 @@ async fn main() -> Result<()> {
             AppsCommand::List(args) => list(args).await,
             AppsCommand::Destroy(args) => destroy(args).await,
         },
+        Command::Stream(args) => stream(args).await,
     }
 }
 
 async fn run(args: RunArgs) -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "spaceport=info,warn".into()),
+    // Two consumers of the same events, each filtered for what it is: the log
+    // this service writes, and the stream an operator watches — which can
+    // afford the debug-level detail that would drown a log file, and cannot
+    // afford anything at all from the crates underneath spaceport.
+    let events = Arc::new(EventBus::new());
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer().with_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into()),
+            ),
+        )
+        .with(
+            events::layer(events.clone()).with_filter(
+                tracing_subscriber::EnvFilter::try_from_env(STREAM_FILTER_VAR)
+                    .unwrap_or_else(|_| DEFAULT_STREAM_FILTER.into()),
+            ),
         )
         .init();
 
@@ -238,7 +311,7 @@ async fn run(args: RunArgs) -> Result<()> {
     let operator = args.operator.map(|endpoint| {
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            let result = server::serve(&endpoint, applier, shutdown.clone()).await;
+            let result = server::serve(&endpoint, applier, events, shutdown.clone()).await;
 
             // An operator interface that never came up is a startup failure,
             // and one nobody would otherwise hear about until they tried to
@@ -304,6 +377,38 @@ async fn list(args: ListArgs) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Print what spaceport is doing until the operator has seen enough.
+///
+/// Ends on ctrl-c, which is the only way it ends while spaceport is up — and
+/// that is not a failure, so it says nothing about it.
+async fn stream(args: StreamArgs) -> Result<()> {
+    let watch = Watch {
+        app: args.app,
+        category: args.category,
+        level: Some(args.level),
+        history: args.history,
+    };
+    let colour = Colour::detect(args.pretty);
+
+    let print = |event: Event| {
+        if args.json {
+            // The event as it arrived, for anything that is not a person —
+            // which is also why it is never coloured.
+            match serde_json::to_string(&event) {
+                Ok(line) => println!("{line}"),
+                Err(error) => eprintln!("could not print an event: {error}"),
+            }
+        } else {
+            println!("{}", render::line(&event, colour));
+        }
+    };
+
+    tokio::select! {
+        result = client::stream(&args.server.server, &watch, print) => result,
+        _ = tokio::signal::ctrl_c() => Ok(()),
+    }
 }
 
 async fn destroy(args: DestroyArgs) -> Result<()> {

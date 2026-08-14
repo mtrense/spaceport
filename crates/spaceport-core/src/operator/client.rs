@@ -1,9 +1,11 @@
-//! The operator interface's client side, as used by `spaceport apps`.
+//! The operator interface's client side, as used by `spaceport apps` and
+//! `spaceport stream`.
 //!
 //! One request per command and no connection reuse, so this drives a single
 //! hyper connection directly rather than carrying a pooled client. The
 //! endpoint decides the transport; everything above that is the same HTTP.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -17,6 +19,7 @@ use tokio::net::{TcpStream, UnixStream};
 
 use super::OperatorEndpoint;
 use crate::app::{AppId, Pattern};
+use crate::events::{Category, Event, Level};
 
 /// Ask a running spaceport to apply `manifest` as the app named `id`.
 ///
@@ -49,6 +52,93 @@ pub async fn destroy(endpoint: &OperatorEndpoint, id: &AppId) -> Result<String> 
     send_to(endpoint, request).await
 }
 
+/// Which events `stream` asks for.
+#[derive(Debug, Default, Clone)]
+pub struct Watch {
+    pub app: Option<Pattern>,
+    pub category: Option<Category>,
+    pub level: Option<Level>,
+    /// How many events from before now to be sent first.
+    pub history: usize,
+}
+
+impl Watch {
+    /// The query string that asks for exactly this.
+    ///
+    /// Nothing here needs escaping: a pattern is app-id characters and `*`, a
+    /// category is lowercase and dots, and the rest are a word and a number.
+    fn query(&self) -> String {
+        let mut query = String::new();
+        let mut add = |name: &str, value: &dyn std::fmt::Display| {
+            let separator = if query.is_empty() { '?' } else { '&' };
+            let _ = write!(query, "{separator}{name}={value}");
+        };
+
+        if let Some(app) = &self.app {
+            add("app", app);
+        }
+        if let Some(category) = &self.category {
+            add("category", category);
+        }
+        if let Some(level) = &self.level {
+            add("level", level);
+        }
+        if self.history > 0 {
+            add("history", &self.history);
+        }
+
+        query
+    }
+}
+
+/// Watch what a running spaceport is doing, handing each event to `on_event`
+/// as it arrives.
+///
+/// Returns only when spaceport stops streaming — which it does when it shuts
+/// down, and otherwise not at all. A caller that wants to stop before then
+/// drops the future.
+pub async fn stream(
+    endpoint: &OperatorEndpoint,
+    watch: &Watch,
+    mut on_event: impl FnMut(Event),
+) -> Result<()> {
+    let request = builder("GET", &format!("/events{}", watch.query())).body(Full::default())?;
+    let mut response = send_request(connect(endpoint).await?, request).await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.into_body().collect().await?.to_bytes();
+        bail!("{}", String::from_utf8_lossy(&body).trim_end());
+    }
+
+    // Lines, not frames: what arrives is whatever the network chose to deliver,
+    // and one read can hold half an event or three of them.
+    let mut pending = Vec::new();
+    while let Some(frame) = response.frame().await {
+        let frame = frame.context("reading from the event stream")?;
+        let Some(chunk) = frame.data_ref() else {
+            continue;
+        };
+        pending.extend_from_slice(chunk);
+
+        while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = pending.drain(..=end).collect();
+            let line = &line[..line.len() - 1];
+            // An empty line is a keep-alive, not an event.
+            if line.is_empty() {
+                continue;
+            }
+
+            on_event(
+                serde_json::from_slice(line)
+                    .context("the operator interface sent something that is not an event")?,
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn builder(method: &str, uri: &str) -> http::request::Builder {
     Request::builder()
         .method(method)
@@ -58,25 +148,27 @@ fn builder(method: &str, uri: &str) -> http::request::Builder {
         .header(http::header::HOST, "spaceport")
 }
 
-/// Make the one connection the request needs, over whichever transport the
+/// Whatever the endpoint turned out to be. The transport is chosen once, on
+/// connecting, and nothing above this cares which one it got.
+trait Transport: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Transport for T {}
+
+/// Make the one connection a request needs, over whichever transport the
 /// endpoint names.
-async fn send_to(endpoint: &OperatorEndpoint, request: Request<Full<Bytes>>) -> Result<String> {
-    match endpoint {
-        OperatorEndpoint::Unix(path) => {
-            let stream = UnixStream::connect(path)
+async fn connect(endpoint: &OperatorEndpoint) -> Result<Box<dyn Transport>> {
+    Ok(match endpoint {
+        OperatorEndpoint::Unix(path) => Box::new(
+            UnixStream::connect(path)
                 .await
-                .with_context(|| unreachable_at(path))?;
-
-            send(stream, request).await
-        }
-        OperatorEndpoint::Tcp(addr) => {
-            let stream = TcpStream::connect(addr)
+                .with_context(|| unreachable_at(path))?,
+        ),
+        OperatorEndpoint::Tcp(addr) => Box::new(
+            TcpStream::connect(addr)
                 .await
-                .with_context(|| format!("no spaceport is listening on {addr}"))?;
-
-            send(stream, request).await
-        }
-    }
+                .with_context(|| format!("no spaceport is listening on {addr}"))?,
+        ),
+    })
 }
 
 fn unreachable_at(path: &Path) -> String {
@@ -87,10 +179,12 @@ fn unreachable_at(path: &Path) -> String {
     )
 }
 
-async fn send<S>(stream: S, request: Request<Full<Bytes>>) -> Result<String>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+/// Send `request` and hand back the response with its body still coming: a
+/// command collects it, a stream reads it for as long as it lasts.
+async fn send_request(
+    stream: Box<dyn Transport>,
+    request: Request<Full<Bytes>>,
+) -> Result<http::Response<hyper::body::Incoming>> {
     let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
         .await
         .context("speaking http to the operator interface")?;
@@ -99,10 +193,14 @@ where
     // finishes on its own once the response is done with.
     tokio::spawn(connection);
 
-    let response = sender
+    sender
         .send_request(request)
         .await
-        .context("sending the request to the operator interface")?;
+        .context("sending the request to the operator interface")
+}
+
+async fn send_to(endpoint: &OperatorEndpoint, request: Request<Full<Bytes>>) -> Result<String> {
+    let response = send_request(connect(endpoint).await?, request).await?;
 
     let status = response.status();
     let body = response.into_body().collect().await?.to_bytes();

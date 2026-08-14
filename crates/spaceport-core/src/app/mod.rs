@@ -19,6 +19,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use anyhow::{Result, bail};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Longest an app id may be, matching a single DNS label.
 const MAX_ID_LEN: usize = 63;
@@ -64,6 +65,22 @@ impl FromStr for AppId {
 impl fmt::Display for AppId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+impl Serialize for AppId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+/// An id off the wire is as untrusted as one off the command line, so it is
+/// held to the same rules rather than being taken as read.
+impl<'de> Deserialize<'de> for AppId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let id = String::deserialize(deserializer)?;
+
+        id.parse().map_err(serde::de::Error::custom)
     }
 }
 

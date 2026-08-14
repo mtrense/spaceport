@@ -14,7 +14,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use http::uri::{Authority, PathAndQuery, Scheme as UriScheme};
@@ -104,6 +104,12 @@ pub async fn handle(
     };
 
     let upstream = app.upstream;
+    // Kept for the event at the end, which is written after the request has
+    // been rewritten into something addressed to the upstream instead.
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+    let started = Instant::now();
+
     *req.uri_mut() = upstream_uri(req.uri(), upstream);
     // Upstreams are spoken to over HTTP/1.1 whatever the client used, so an
     // HTTP/2 request must not carry its version into the pool.
@@ -114,6 +120,21 @@ pub async fn handle(
         Ok(response) => {
             let (mut parts, body) = response.into_parts();
             strip_hop_by_hop(&mut parts.headers);
+
+            // At debug, because one line per request is more than a service's
+            // log wants and exactly what `spaceport stream` is for. It costs
+            // nothing while nobody is watching: the event is not built unless
+            // something is subscribed to it.
+            debug!(
+                app = %app.id,
+                host = name,
+                %method,
+                path,
+                status = parts.status.as_u16(),
+                ms = started.elapsed().as_millis(),
+                "proxied",
+            );
+
             Ok(Response::from_parts(parts, Body::new(body)))
         }
         Err(error) => {

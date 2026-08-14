@@ -27,10 +27,14 @@ futures-util = { version = "0.3", default-features = false }
 # The state store. `bundled` so the build does not depend on a system sqlite,
 # and so every host runs the version this was tested against.
 rusqlite = { version = "0.40", features = ["bundled"] }
-# Only for stamping records with the time they were written.
+# Stamping records with the time they were written, and events with the time
+# they happened — which is why it parses as well as formats: an event is read
+# back at the other end of the stream.
 time = { version = "0.3", default-features = false, features = [
   "std",
   "formatting",
+  "parsing",
+  "serde",
 ] }
 # Only for `flock` on the state directory's lock file.
 libc = "0.2"

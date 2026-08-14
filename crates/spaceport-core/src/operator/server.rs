@@ -6,23 +6,29 @@
 //! files themselves, verbatim; responses are plain text meant to be read by a
 //! person, because that is who is running the command.
 
+use std::convert::Infallible;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::Router;
-use axum::extract::{Path as UrlPath, Query, State};
+use axum::body::Body;
+use axum::extract::{FromRef, Path as UrlPath, Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
+use bytes::Bytes;
+use futures_util::StreamExt;
 use http::StatusCode;
 use serde::Deserialize;
 use tokio::net::{TcpListener, UnixListener};
+use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::OperatorEndpoint;
 use crate::app::apply::{Applier, ApplyError, DestroyError};
 use crate::app::{App, AppId, AppManifest, Pattern, health};
+use crate::events::{Event, EventBus, EventFilter, Level};
 
 /// Only the owner may talk to the socket: reaching it is the right to start
 /// containers on this host.
@@ -33,9 +39,10 @@ const SOCKET_MODE: u32 = 0o600;
 pub async fn serve(
     endpoint: &OperatorEndpoint,
     applier: Arc<Applier>,
+    events: Arc<EventBus>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let router = router(applier);
+    let router = router(applier, events);
 
     match endpoint {
         OperatorEndpoint::Tcp(addr) => {
@@ -106,11 +113,132 @@ where
     Ok(())
 }
 
-fn router(applier: Arc<Applier>) -> Router {
+fn router(applier: Arc<Applier>, events: Arc<EventBus>) -> Router {
     Router::new()
         .route("/apps", get(list))
         .route("/apps/{id}", put(apply).delete(destroy))
-        .with_state(applier)
+        .route("/events", get(events_stream))
+        .with_state(Operator { applier, events })
+}
+
+/// What the handlers work from. Each of them extracts the one half it needs,
+/// so adding the event bus did not change what an app handler asks for.
+#[derive(Clone)]
+struct Operator {
+    applier: Arc<Applier>,
+    events: Arc<EventBus>,
+}
+
+impl FromRef<Operator> for Arc<Applier> {
+    fn from_ref(operator: &Operator) -> Self {
+        operator.applier.clone()
+    }
+}
+
+impl FromRef<Operator> for Arc<EventBus> {
+    fn from_ref(operator: &Operator) -> Self {
+        operator.events.clone()
+    }
+}
+
+/// `GET /events?app=&category=&level=&history=`: what spaceport is doing, as
+/// it does it.
+///
+/// One JSON object per line, and the response never ends on its own — a
+/// watcher stays connected until it or spaceport goes away. Filtering happens
+/// here rather than at the far end so that watching one app does not mean
+/// shipping every event to a client that will discard nearly all of them.
+async fn events_stream(
+    State(events): State<Arc<EventBus>>,
+    Query(query): Query<EventQuery>,
+) -> Response {
+    let filter = match query.filter() {
+        Ok(filter) => filter,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    let (past, receiver) = events.watch(query.history.unwrap_or(0), &filter);
+
+    let history = futures_util::stream::iter(
+        past.into_iter()
+            .map(|event| Ok::<Bytes, Infallible>(line(&event))),
+    );
+    let live = futures_util::stream::unfold((receiver, filter), |(mut receiver, filter)| async {
+        loop {
+            match receiver.recv().await {
+                Ok(event) if filter.matches(&event) => {
+                    return Some((Ok(line(&event)), (receiver, filter)));
+                }
+                // Not for this watcher; wait for one that is.
+                Ok(_) => {}
+                // A watcher too slow to keep up is told so in the stream
+                // itself, which is the only place it would notice.
+                Err(RecvError::Lagged(missed)) => {
+                    let event = Event::now(
+                        Level::Warn,
+                        "stream",
+                        format!("dropped {missed} events this client could not keep up with"),
+                    );
+
+                    return Some((Ok(line(&event)), (receiver, filter)));
+                }
+                Err(RecvError::Closed) => return None,
+            }
+        }
+    });
+
+    Response::builder()
+        .header(http::header::CONTENT_TYPE, "application/x-ndjson")
+        // Nothing between here and the client should be holding lines back
+        // waiting for a buffer to fill.
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .body(Body::from_stream(history.chain(live)))
+        .expect("a response with a valid content type")
+}
+
+/// One event as a line of NDJSON.
+fn line(event: &Event) -> Bytes {
+    // An event that will not serialise is a bug in the event, not a reason to
+    // break the stream carrying it.
+    let mut line = serde_json::to_string(event)
+        .unwrap_or_else(|error| format!(r#"{{"message":"unserialisable event: {error}"}}"#));
+    line.push('\n');
+
+    Bytes::from(line)
+}
+
+#[derive(Debug, Deserialize)]
+struct EventQuery {
+    app: Option<String>,
+    category: Option<String>,
+    level: Option<String>,
+    /// How many events from before the watcher arrived to send first.
+    history: Option<usize>,
+}
+
+impl EventQuery {
+    fn filter(&self) -> Result<EventFilter> {
+        Ok(EventFilter {
+            app: self
+                .app
+                .as_deref()
+                .map(str::parse::<Pattern>)
+                .transpose()
+                .context("the `app` filter")?,
+            category: self
+                .category
+                .as_deref()
+                .map(str::parse::<crate::events::Category>)
+                .transpose()
+                .context("the `category` filter")?,
+            level: self
+                .level
+                .as_deref()
+                .map(str::parse::<Level>)
+                .transpose()
+                .context("the `level` filter")?,
+        })
+    }
 }
 
 /// `GET /apps?pattern=…`: what is running, as a table.
@@ -308,6 +436,7 @@ fn refuse(status: StatusCode, message: &str) -> Response {
 mod tests {
     use super::*;
     use crate::app::{App, AppRepository, AppStore};
+    use crate::events::Level;
     use crate::runtime::{Container, ContainerId, ContainerRuntime, Managed};
     use crate::state::Db;
     use async_trait::async_trait;
@@ -372,11 +501,61 @@ container:
     }
 
     fn store_and_router_on(runtime: OneContainer) -> (Arc<AppStore>, Router) {
+        let (store, router, _) = store_router_and_events_on(runtime);
+
+        (store, router)
+    }
+
+    fn router_and_events() -> (Router, Arc<EventBus>) {
+        let (_, router, events) = store_router_and_events_on(OneContainer::default());
+
+        (router, events)
+    }
+
+    fn store_router_and_events_on(runtime: OneContainer) -> (Arc<AppStore>, Router, Arc<EventBus>) {
         let store = Arc::new(AppStore::new());
         let repository = AppRepository::new(Db::in_memory().unwrap());
         let applier = Applier::new(store.clone(), Arc::new(runtime), repository);
+        let events = Arc::new(EventBus::new());
 
-        (store, router(Arc::new(applier)))
+        (store, router(Arc::new(applier), events.clone()), events)
+    }
+
+    /// An event as a call site would have produced it.
+    fn event(level: Level, app: Option<&str>, message: &str) -> Event {
+        Event {
+            app: app.map(|app| app.parse().unwrap()),
+            ..Event::now(level, "app.apply", message)
+        }
+    }
+
+    /// The next line of a stream, which is a response that never completes —
+    /// so it is read a frame at a time rather than collected.
+    async fn next_line(body: &mut axum::body::BodyDataStream) -> Event {
+        let bytes = body
+            .next()
+            .await
+            .expect("the stream had a line")
+            .expect("the line arrived intact");
+        let line = String::from_utf8(bytes.to_vec()).unwrap();
+
+        serde_json::from_str(line.trim_end()).expect("a line of the stream is an event")
+    }
+
+    async fn watch(router: &Router, query: &str) -> axum::body::BodyDataStream {
+        let request = Request::builder()
+            .uri(format!("/events{query}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[http::header::CONTENT_TYPE],
+            "application/x-ndjson"
+        );
+
+        response.into_body().into_data_stream()
     }
 
     async fn put_app(router: &Router, id: &str, manifest: &str) -> (StatusCode, String) {
@@ -645,6 +824,78 @@ container:
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("lowercase"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn streams_events_as_they_are_emitted() {
+        let (router, events) = router_and_events();
+        let mut stream = watch(&router, "").await;
+
+        events.emit(event(Level::Info, Some("web-api"), "app is ready"));
+
+        let event = next_line(&mut stream).await;
+        assert_eq!(event.message, "app is ready");
+        assert_eq!(event.app.unwrap().as_str(), "web-api");
+        assert_eq!(event.category.as_str(), "app.apply");
+    }
+
+    #[tokio::test]
+    async fn streams_only_the_app_that_was_asked_for() {
+        let (router, events) = router_and_events();
+        let mut stream = watch(&router, "?app=web-*").await;
+
+        events.emit(event(Level::Info, Some("worker"), "not this one"));
+        events.emit(event(Level::Info, Some("web-api"), "this one"));
+
+        assert_eq!(next_line(&mut stream).await.message, "this one");
+    }
+
+    #[tokio::test]
+    async fn streams_only_the_category_that_was_asked_for() {
+        let (router, events) = router_and_events();
+        let mut stream = watch(&router, "?category=acme").await;
+
+        events.emit(event(Level::Info, None, "not this one"));
+        events.emit(Event::now(Level::Info, "acme", "got a certificate"));
+
+        assert_eq!(next_line(&mut stream).await.message, "got a certificate");
+    }
+
+    /// The whole point of the history: the interesting thing has already
+    /// happened by the time anyone thinks to watch.
+    #[tokio::test]
+    async fn sends_what_happened_before_the_watcher_arrived() {
+        let (router, events) = router_and_events();
+        events.emit(event(Level::Warn, Some("web-api"), "apply failed"));
+
+        let mut stream = watch(&router, "?history=10").await;
+
+        assert_eq!(next_line(&mut stream).await.message, "apply failed");
+    }
+
+    #[tokio::test]
+    async fn a_watcher_that_asked_for_no_history_starts_from_now() {
+        let (router, events) = router_and_events();
+        events.emit(event(Level::Info, None, "before"));
+
+        let mut stream = watch(&router, "").await;
+        events.emit(event(Level::Info, None, "after"));
+
+        assert_eq!(next_line(&mut stream).await.message, "after");
+    }
+
+    #[tokio::test]
+    async fn refuses_a_filter_it_cannot_parse() {
+        let (router, _) = router_and_events();
+
+        let request = Request::builder()
+            .uri("/events?level=shout")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(&router, request).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("level"), "{body}");
     }
 
     #[tokio::test]

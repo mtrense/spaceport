@@ -17,6 +17,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{Result, bail};
 use tokio::sync::watch;
+use tracing::info;
 
 use super::AppId;
 use super::manifest::{AppManifest, Host};
@@ -129,8 +130,19 @@ impl AppStore {
 
         inner.apps.insert(app.id.clone(), app.clone());
         inner.rebuild_routes();
+        let routes = inner.routes.len();
         drop(inner);
         self.announce();
+
+        // What the edge will do differently from now on, which is the part an
+        // apply is ultimately about and the only place it is known exactly.
+        info!(
+            app = %app.id,
+            hosts = %hosts(app.hosts()),
+            upstream = %app.upstream,
+            routes,
+            "routes now send these hosts to this app",
+        );
 
         Ok(app)
     }
@@ -165,8 +177,16 @@ impl AppStore {
         let mut inner = self.write();
         let removed = inner.apps.remove(id)?;
         inner.rebuild_routes();
+        let routes = inner.routes.len();
         drop(inner);
         self.announce();
+
+        info!(
+            app = %id,
+            hosts = %hosts(removed.hosts()),
+            routes,
+            "routes no longer serve these hosts",
+        );
 
         Some(removed)
     }
@@ -190,6 +210,15 @@ impl AppStore {
     fn write(&self) -> std::sync::RwLockWriteGuard<'_, Inner> {
         self.inner.write().expect("app store lock poisoned")
     }
+}
+
+/// The hosts as one field, because an event carries values rather than lists.
+fn hosts(hosts: &[Host]) -> String {
+    hosts
+        .iter()
+        .map(Host::as_str)
+        .collect::<Vec<&str>>()
+        .join(", ")
 }
 
 /// Which of `hosts` is already taken by an app other than `id`.
