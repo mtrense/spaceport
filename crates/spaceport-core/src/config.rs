@@ -49,6 +49,11 @@ state:
   # certificates it has been issued. Created if it is not there, and readable
   # only by the user spaceport runs as.
   directory: /var/lib/spaceport
+data:
+  # Where apps' own volumes live, one directory per app. Kept out of the state
+  # directory: this is the data an app writes and an operator backs up, not
+  # spaceport's own, and the two are not readable by the same people.
+  directory: /var/lib/spaceport/apps
 ";
 
 /// A parsed and validated spaceport configuration.
@@ -68,6 +73,12 @@ pub struct Config {
     /// `/var/lib/spaceport` never has to say so.
     #[serde(default)]
     pub state: State,
+
+    /// Where apps keep what *they* must not forget. Defaulted for the same
+    /// reason `state` is: a config written before volumes existed has to go on
+    /// working untouched.
+    #[serde(default)]
+    pub data: Data,
 }
 
 /// Where spaceport's durable state lives.
@@ -90,6 +101,32 @@ impl Default for State {
 
 fn default_state_dir() -> PathBuf {
     PathBuf::from(crate::state::DEFAULT_STATE_DIR)
+}
+
+/// Where apps' volumes live.
+///
+/// Separate from [`State`] on purpose. The state directory is owner-only
+/// because it holds spaceport's keys; app data is the operator's to back up,
+/// restore and hand to somebody else, and a directory cannot be both.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Data {
+    /// The directory holding one subdirectory per app. Created at startup if
+    /// it is not there.
+    #[serde(default = "default_data_dir")]
+    pub directory: PathBuf,
+}
+
+impl Default for Data {
+    fn default() -> Self {
+        Self {
+            directory: default_data_dir(),
+        }
+    }
+}
+
+fn default_data_dir() -> PathBuf {
+    PathBuf::from(crate::app::data::DEFAULT_DATA_DIR)
 }
 
 /// A schema version this build accepts.
@@ -465,6 +502,39 @@ edge:
             Config::parse(&format!("{MINIMAL}state:\n  directory: /srv/spaceport\n")).unwrap();
 
         assert_eq!(config.state.directory, PathBuf::from("/srv/spaceport"));
+    }
+
+    /// A config written before apps could ask for a volume has to go on
+    /// working untouched, and that is what the default is for.
+    #[test]
+    fn defaults_the_data_directory() {
+        let config = Config::parse(MINIMAL).unwrap();
+
+        assert_eq!(
+            config.data.directory,
+            PathBuf::from("/var/lib/spaceport/apps")
+        );
+    }
+
+    #[test]
+    fn takes_the_data_directory_the_config_names() {
+        let config = Config::parse(&format!("{MINIMAL}data:\n  directory: /srv/apps\n")).unwrap();
+
+        assert_eq!(config.data.directory, PathBuf::from("/srv/apps"));
+    }
+
+    /// They default to one inside the other, but they are separate settings:
+    /// app data is what an operator backs up and hands around, and spaceport's
+    /// keys are not.
+    #[test]
+    fn keeps_the_data_directory_independent_of_the_state_directory() {
+        let config =
+            Config::parse(&format!("{MINIMAL}state:\n  directory: /srv/spaceport\n")).unwrap();
+
+        assert_eq!(
+            config.data.directory,
+            PathBuf::from("/var/lib/spaceport/apps")
+        );
     }
 
     #[test]

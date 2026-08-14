@@ -9,7 +9,9 @@ use clap::{Args, Parser, Subcommand};
 use render::Colour;
 use spaceport_core::acme::account::{AcmeCa, Transport};
 use spaceport_core::acme::{CertificateRepository, Certificates, Challenges};
-use spaceport_core::app::{AppId, AppRepository, AppStore, Applier, Pattern, reconcile, supervise};
+use spaceport_core::app::{
+    AppId, AppRepository, AppStore, Applier, DataDir, Pattern, reconcile, supervise,
+};
 use spaceport_core::config::TlsProvider;
 use spaceport_core::events::{self, Category, Event, EventBus, Level};
 use spaceport_core::operator::client::Watch;
@@ -111,6 +113,8 @@ enum AppsCommand {
     Apply(ApplyArgs),
     /// List the apps spaceport is running.
     List(ListArgs),
+    /// Report everything spaceport knows about one app.
+    Show(ShowArgs),
     /// Stop serving an app, keeping everything about it.
     Suspend(SuspendArgs),
     /// Serve a suspended app again.
@@ -169,6 +173,22 @@ struct ResumeArgs {
 struct ListArgs {
     /// Only list apps whose name matches, where `*` stands for any characters.
     pattern: Option<Pattern>,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
+struct ShowArgs {
+    /// The app to report on.
+    app_id: AppId,
+
+    /// Print the manifest it was applied with, verbatim and on its own.
+    ///
+    /// What comes out is what went in, so it can be written to a file and
+    /// applied again.
+    #[arg(long)]
+    manifest: bool,
 
     #[command(flatten)]
     server: ServerArgs,
@@ -268,6 +288,7 @@ async fn main() -> Result<()> {
         Command::Apps { command } => match command {
             AppsCommand::Apply(args) => apply(args).await,
             AppsCommand::List(args) => list(args).await,
+            AppsCommand::Show(args) => show(args).await,
             AppsCommand::Suspend(args) => suspend(args).await,
             AppsCommand::Resume(args) => resume(args).await,
             AppsCommand::Destroy(args) => destroy(args).await,
@@ -333,7 +354,11 @@ async fn run(args: RunArgs) -> Result<()> {
     // Checked at startup rather than at the first apply: an unreachable
     // container engine is a broken host, and finding out about it while
     // starting is a great deal cheaper than finding out about it later.
-    let runtime = Arc::new(DockerRuntime::connect()?);
+    let data = DataDir::new(config.data.directory.clone());
+    data.create()?;
+    info!(path = %data.root().display(), "opened the app data directory");
+
+    let runtime = Arc::new(DockerRuntime::connect(data)?);
     runtime.ping().await?;
 
     let apps = Arc::new(AppStore::new());
@@ -482,6 +507,15 @@ async fn list(args: ListArgs) -> Result<()> {
     Ok(())
 }
 
+async fn show(args: ShowArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::show(&args.server.server, &args.app_id, args.manifest).await?
+    );
+
+    Ok(())
+}
+
 async fn suspend(args: SuspendArgs) -> Result<()> {
     print!(
         "{}",
@@ -596,6 +630,14 @@ fn check_config(args: ConfigArgs) -> Result<()> {
         }
         _ => println!("  edge serves a self-signed certificate, trusted by nothing"),
     }
+    println!("  state lives in {}", config.state.directory.display());
+    // Named even when nothing uses one yet: it is where an operator's backups
+    // have to point, and finding that out after the first volume is written is
+    // too late.
+    println!(
+        "  apps keep their volumes in {}",
+        config.data.directory.display()
+    );
 
     Ok(())
 }

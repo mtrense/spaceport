@@ -43,11 +43,23 @@ container:
                                 # long a slow one is given to start.
       success_threshold: 1      # default: `1`
   volumes:                      # volumes are kept when an app is deleted
-    - name: data                # host path is calculated as <data-dir>/app-id/<volume-name>
-      mount: /var/lib/my-app/data
-      read_only: false
-  secrets:
-    - DB_PASSWORD               # Sanitation is the job of the user
+    - name: data                # host path is calculated as <data-dir>/app-id/<volume-name>;
+                                # letters, digits, hyphens and underscores only
+      mount: /var/lib/my-app/data   # must be absolute, and not `/`
+      read_only: false          # default: `false`
+                                # The directory is created owned by the image's
+                                # `USER` when that is a number. A `USER` given
+                                # as a name cannot be resolved from outside the
+                                # image, so the volume stays owned by root and
+                                # spaceport says so at launch.
+  secrets:                      # Not supported yet: this parses and is checked
+                                # against `env` below, but applying an app that
+                                # declares one is refused — there is nowhere to
+                                # put the value. Sanitation is the job of the
+                                # user.
+    - DB_PASSWORD               # every declared secret must be interpolated by
+                                # some `env` value, and every `{{...}}` must
+                                # name a declared secret
   env:
     DATABASE_URL: postgres://user:{{DB_PASSWORD}}@db:5432/my-app
     ENVIRONMENT: production

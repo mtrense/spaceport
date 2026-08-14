@@ -514,6 +514,19 @@ impl Applier {
         suspend: bool,
     ) -> Result<Applied, ApplyError> {
         let _settling = self.settling(&id);
+
+        // Refused here rather than while parsing, so that a manifest written
+        // against a spaceport that has secrets still reads on one that does
+        // not — and so that what is refused is running the app, not describing
+        // it. An app started with `{{DB_PASSWORD}}` in its connection string
+        // would come up and fail at whatever it does first, which is a far
+        // worse way to find this out.
+        if let Some(secret) = manifest.container.secrets.first() {
+            return Err(ApplyError::Failed(anyhow!(
+                "app `{id}` needs the secret `{secret}`, and secrets are not supported yet"
+            )));
+        }
+
         let recorded = manifest.source_text().to_owned();
         let held = self.store.suspended(&id);
         let suspend = suspend || held.is_some();
@@ -953,6 +966,43 @@ container:
         assert_eq!(store.routes().serving("alpha.test").unwrap().id, app.id);
         assert_eq!(store.routes().serving("beta.test").unwrap().id, app.id);
         assert_eq!(runtime.launched.lock().unwrap().len(), 1);
+    }
+
+    /// A manifest may say it needs a secret — that is how an operator writes
+    /// down what the app will want — but nothing can supply one yet, and an
+    /// app started with `{{DB_PASSWORD}}` in its connection string would come
+    /// up and fail at whatever it does first.
+    #[tokio::test]
+    async fn refuses_to_run_an_app_that_needs_a_secret() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+
+        let manifest = AppManifest::parse(
+            "schema_version: 1
+source:
+  type: image
+  image: strm/helloworld-http:latest
+routing:
+  hosts: [alpha.test]
+container:
+  secrets: [DB_PASSWORD]
+  env:
+    DATABASE_URL: \"postgres://user:{{DB_PASSWORD}}@db/app\"
+",
+        )
+        .unwrap();
+
+        let error = applier
+            .apply("hello".parse().unwrap(), manifest, false)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("DB_PASSWORD"), "{error}");
+        assert!(error.to_string().contains("not supported yet"), "{error}");
+        // And it stopped before doing anything: no container, no route, and
+        // nothing recorded to bring back at the next start.
+        assert!(runtime.launched.lock().unwrap().is_empty());
+        assert!(store.routes().serving("alpha.test").is_none());
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{FromRef, Path as UrlPath, Query, State};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{get, post};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http::StatusCode;
@@ -27,8 +27,9 @@ use tracing::{info, warn};
 
 use super::OperatorEndpoint;
 use crate::app::apply::{Applied, Applier, ApplyError, DestroyError, ResumeError, SuspendError};
-use crate::app::{App, AppId, AppManifest, Pattern, health};
+use crate::app::{App, AppId, AppManifest, AppRepository, DataDir, Pattern, health};
 use crate::events::{Event, EventBus, EventFilter, Level};
+use crate::runtime::Adopted;
 use crate::status::Instance;
 
 /// Only the owner may talk to the socket: reaching it is the right to start
@@ -117,7 +118,7 @@ where
 fn router(instance: Arc<Instance>, events: Arc<EventBus>, shutdown: CancellationToken) -> Router {
     Router::new()
         .route("/apps", get(list))
-        .route("/apps/{id}", put(apply).delete(destroy))
+        .route("/apps/{id}", get(show).put(apply).delete(destroy))
         .route("/apps/{id}/suspend", post(suspend))
         .route("/apps/{id}/resume", post(resume))
         .route("/events", get(events_stream))
@@ -335,6 +336,283 @@ async fn list(State(applier): State<Arc<Applier>>, Query(query): Query<ListQuery
     rows.sort_by(|a, b| a.id.cmp(&b.id));
 
     (StatusCode::OK, table(&rows)).into_response()
+}
+
+/// `GET /apps/{id}?manifest=`: everything spaceport knows about one app.
+///
+/// The report is what an operator reads; `?manifest=true` is the document they
+/// applied, byte for byte and on its own, so that
+/// `spaceport apps show x --manifest > x.yaml` gives back a file
+/// `spaceport apps apply` takes.
+///
+/// Answers for an app that is recorded but not in the routing table at all —
+/// the one spaceport failed to bring back at startup — because that is exactly
+/// the app somebody is asking about.
+async fn show(
+    State(instance): State<Arc<Instance>>,
+    UrlPath(id): UrlPath<String>,
+    Query(query): Query<ShowQuery>,
+) -> Response {
+    let id: AppId = match id.parse() {
+        Ok(id) => id,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    let store = instance.applier.store();
+    let held = if let Some(app) = store.get(&id) {
+        Held::Running(app)
+    } else if let Some(suspended) = store.suspended(&id) {
+        Held::Suspended(suspended)
+    } else if let Some(downed) = store.downed(&id) {
+        Held::Down(downed)
+    } else {
+        match AppRepository::new(instance.db.clone()).recorded(&id).await {
+            Ok(Some(record)) => match AppManifest::parse(&record.manifest) {
+                Ok(manifest) => Held::Recorded(manifest),
+                // Recorded by a build that understood something this one does
+                // not. The document is still the operator's, so it is handed
+                // over rather than withheld — but nothing can be said about it.
+                Err(error) => {
+                    if query.manifest {
+                        return manifest_response(&record.manifest);
+                    }
+
+                    return refuse(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!(
+                            "app `{id}` is recorded, but this spaceport cannot read its manifest: {error:#}\nask for it with `--manifest` to see it as it was applied"
+                        ),
+                    );
+                }
+            },
+            Ok(None) => {
+                return refuse(StatusCode::NOT_FOUND, &format!("no app named `{id}`"));
+            }
+            Err(error) => {
+                return refuse(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("could not read what is recorded for `{id}`: {error:#}"),
+                );
+            }
+        }
+    };
+
+    if query.manifest {
+        return manifest_response(held.manifest().source_text());
+    }
+
+    // Only for the timestamp: everything else is already in hand, and an app
+    // that is running is worth reporting on even if the state store has since
+    // become unreadable.
+    let applied_at = AppRepository::new(instance.db.clone())
+        .recorded(&id)
+        .await
+        .ok()
+        .flatten()
+        .map(|record| record.applied_at);
+
+    let status = match &held {
+        Held::Running(app) => statuses(std::slice::from_ref(app)).await[0].to_owned(),
+        Held::Suspended(_) => "suspended".to_owned(),
+        Held::Down(downed) => format!("down ({})", downed.reason),
+        Held::Recorded(_) => "not running".to_owned(),
+    };
+
+    let data = DataDir::new(instance.config.data.directory.clone());
+
+    (
+        StatusCode::OK,
+        report(&id, &held, &status, applied_at.as_deref(), &data),
+    )
+        .into_response()
+}
+
+/// The manifest verbatim, as the document it is.
+fn manifest_response(manifest: &str) -> Response {
+    (
+        StatusCode::OK,
+        [(http::header::CONTENT_TYPE, "application/yaml")],
+        manifest.to_owned(),
+    )
+        .into_response()
+}
+
+/// Where `show` found the app, which is also what there is to say about it.
+enum Held {
+    Running(Arc<App>),
+    Suspended(crate::app::Suspended),
+    Down(crate::app::Downed),
+    /// Recorded, and not in the routing table at all.
+    Recorded(AppManifest),
+}
+
+impl Held {
+    fn manifest(&self) -> &AppManifest {
+        match self {
+            Self::Running(app) => &app.manifest,
+            Self::Suspended(suspended) => &suspended.manifest,
+            Self::Down(downed) => &downed.manifest,
+            Self::Recorded(manifest) => manifest,
+        }
+    }
+
+    /// The container serving it, when there is one to name.
+    fn container(&self) -> Option<String> {
+        match self {
+            Self::Running(app) => Some(app.container.to_string()),
+            Self::Suspended(suspended) => match suspended.container.as_ref()? {
+                Adopted::Running(container) => Some(container.id.to_string()),
+                Adopted::Stopped(id) => Some(format!("{id} (stopped)")),
+            },
+            Self::Down(_) | Self::Recorded(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ShowQuery {
+    /// Send the manifest verbatim instead of a report.
+    #[serde(default)]
+    manifest: bool,
+}
+
+/// Everything known about one app, as labelled lines.
+///
+/// Laid out rather than tabulated: this is one app, and the fields it has are
+/// worth naming. Sections an app does not use are left out entirely — an app
+/// with no volumes should not have to read a line saying so.
+fn report(
+    id: &AppId,
+    held: &Held,
+    status: &str,
+    applied_at: Option<&str>,
+    data: &DataDir,
+) -> String {
+    let manifest = held.manifest();
+    let container = &manifest.container;
+    let mut out = Report::default();
+
+    out.field("app", id.to_string());
+    out.field("status", status.to_owned());
+    out.field("source", manifest.source.to_string());
+    let hosts: Vec<&str> = manifest
+        .routing
+        .hosts
+        .iter()
+        .map(|host| host.as_str())
+        .collect();
+    out.field("hosts", hosts.join(", "));
+
+    if let Held::Running(app) = held {
+        out.field("upstream", app.upstream.to_string());
+    }
+    if let Some(container) = held.container() {
+        out.field("container", container);
+    }
+    if let Some(applied_at) = applied_at {
+        out.field("applied", applied_at.to_owned());
+    }
+
+    // The port as the manifest settled it. What the image exposes is the
+    // engine's business, and an app that named no port is better described as
+    // having named none than as having named whatever was found.
+    match container.port {
+        Some(port) => out.field("port", port.to_string()),
+        None => out.field("port", "from the image".to_owned()),
+    }
+
+    out.field("readiness", probe(&container.health.readiness));
+    out.field(
+        "liveness",
+        match &container.health.liveness {
+            Some(liveness) => probe(liveness),
+            None => "none — spaceport never restarts it for being unwell".to_owned(),
+        },
+    );
+
+    for (index, volume) in container.volumes.iter().enumerate() {
+        out.field(
+            if index == 0 { "volumes" } else { "" },
+            format!(
+                "{} at {} ({}), kept in {}",
+                volume.name,
+                volume.mount.display(),
+                if volume.read_only {
+                    "read-only"
+                } else {
+                    "writable"
+                },
+                data.volume(id, &volume.name).display(),
+            ),
+        );
+    }
+
+    // Verbatim, placeholders and all: an env value is not resolved until the
+    // container is created, and showing a resolved one would be showing
+    // something that is not what was applied.
+    for (index, (name, value)) in container.env.iter().enumerate() {
+        out.field(
+            if index == 0 { "env" } else { "" },
+            format!("{name}={value}"),
+        );
+    }
+
+    for (index, secret) in container.secrets.iter().enumerate() {
+        out.field(
+            if index == 0 { "secrets" } else { "" },
+            format!("{secret} (not supported yet)"),
+        );
+    }
+
+    out.render()
+}
+
+/// One probe in a line.
+fn probe(probe: &crate::app::manifest::Probe) -> String {
+    use crate::app::manifest::Check;
+
+    let what = match probe.kind {
+        Check::None => return "none".to_owned(),
+        Check::Tcp => "tcp connect".to_owned(),
+        Check::Http => format!("http {}", probe.path.as_deref().unwrap_or("/")),
+    };
+
+    format!(
+        "{what} every {:?}, {} failures to give up, {:?} timeout",
+        probe.interval, probe.failure_threshold, probe.timeout
+    )
+}
+
+/// Label-and-value lines, with the labels padded to line the values up.
+#[derive(Default)]
+struct Report {
+    fields: Vec<(String, String)>,
+}
+
+impl Report {
+    fn field(&mut self, label: &str, value: String) {
+        self.fields.push((label.to_owned(), value));
+    }
+
+    fn render(&self) -> String {
+        let width = self
+            .fields
+            .iter()
+            .map(|(label, _)| label.len())
+            .max()
+            .unwrap_or(0);
+
+        let mut out = String::new();
+        for (label, value) in &self.fields {
+            out.push_str(label);
+            out.push_str(&" ".repeat(width - label.len()));
+            out.push_str("  ");
+            out.push_str(value);
+            out.push('\n');
+        }
+
+        out
+    }
 }
 
 /// One line of what `spaceport apps list` prints.
@@ -811,6 +1089,182 @@ container:
             .unwrap();
 
         call(router, request).await
+    }
+
+    async fn show_app(router: &Router, id: &str, query: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .uri(format!("/apps/{id}{query}"))
+            .body(Body::empty())
+            .unwrap();
+
+        call(router, request).await
+    }
+
+    /// A manifest that uses every part of a container an app can configure.
+    ///
+    /// Readiness is `none` for the same reason `MANIFEST`'s is: nothing is
+    /// listening at the fake runtime's address, so any real check would spend
+    /// its whole budget failing before the app was ever applied.
+    const CONFIGURED: &str = "# an app with everything on
+schema_version: 1
+source:
+  type: image
+  image: strm/helloworld-http:latest
+routing:
+  hosts: [alpha.test, beta.test]
+container:
+  port: 8080
+  health:
+    readiness:
+      type: none
+  volumes:
+    - name: data
+      mount: /var/lib/my-app/data
+  env:
+    ENVIRONMENT: production
+";
+
+    #[tokio::test]
+    async fn shows_a_running_app() {
+        let (_, router) = store_and_router();
+        put_app(&router, "web-api", CONFIGURED).await;
+
+        let (status, body) = show_app(&router, "web-api", "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("app        web-api"), "{body}");
+        assert!(body.contains("image strm/helloworld-http:latest"), "{body}");
+        assert!(body.contains("alpha.test, beta.test"), "{body}");
+        assert!(body.contains("127.0.0.1:9000"), "{body}");
+        // Short, the way the engine's own tools print one.
+        assert!(body.contains("web-api01234"), "{body}");
+        assert!(body.contains("8080"), "{body}");
+    }
+
+    /// How an app is watched is the answer to "why is this not being
+    /// restarted?", and it is nowhere else in the operator interface.
+    ///
+    /// Applied suspended so that nothing tries to run the checks: this is
+    /// about how they are reported, not whether they pass.
+    #[tokio::test]
+    async fn shows_the_checks_an_app_is_watched_with() {
+        let (_, router) = store_and_router();
+        let manifest = "schema_version: 1
+source:
+  type: image
+  image: strm/helloworld-http:latest
+routing:
+  hosts: [alpha.test]
+container:
+  health:
+    readiness:
+      type: http
+      path: /healthz
+    liveness:
+      type: tcp
+      interval: 10s
+      failure_threshold: 3
+";
+        put_app_suspended(&router, "web-api", manifest).await;
+
+        let (_, body) = show_app(&router, "web-api", "").await;
+
+        assert!(body.contains("http /healthz"), "{body}");
+        assert!(body.contains("tcp connect"), "{body}");
+        assert!(body.contains("3 failures"), "{body}");
+    }
+
+    /// An app that named no port is described as having named none. What the
+    /// image exposes is the engine's business, and reporting the resolved port
+    /// as though the manifest had said it would be putting words in it.
+    #[tokio::test]
+    async fn says_when_a_port_comes_from_the_image() {
+        let (_, router) = store_and_router();
+        put_app(&router, "web-api", MANIFEST).await;
+
+        let (_, body) = show_app(&router, "web-api", "").await;
+
+        assert!(body.contains("from the image"), "{body}");
+    }
+
+    /// The point of the command: what an app was given is nowhere else in the
+    /// operator interface, and `apps list` has no room for it.
+    #[tokio::test]
+    async fn shows_the_configuration_an_app_was_given() {
+        let (_, router) = store_and_router();
+        put_app(&router, "web-api", CONFIGURED).await;
+
+        let (_, body) = show_app(&router, "web-api", "").await;
+
+        assert!(body.contains("ENVIRONMENT=production"), "{body}");
+        // The volume, and where it actually is on the host — which the
+        // manifest never says, because spaceport is the one that decides it.
+        assert!(body.contains("data at /var/lib/my-app/data"), "{body}");
+        assert!(
+            body.contains("/var/lib/spaceport/apps/web-api/data"),
+            "{body}"
+        );
+    }
+
+    /// An app that never asked for a liveness check should be able to see that
+    /// it does not have one, since that is the answer to "why was this not
+    /// restarted?".
+    #[tokio::test]
+    async fn says_when_an_app_has_no_liveness_check() {
+        let (_, router) = store_and_router();
+        put_app(&router, "web-api", MANIFEST).await;
+
+        let (_, body) = show_app(&router, "web-api", "").await;
+
+        assert!(body.contains("liveness"), "{body}");
+        assert!(body.contains("none"), "{body}");
+    }
+
+    /// Byte for byte, so it can be written to a file and applied again.
+    #[tokio::test]
+    async fn shows_the_manifest_verbatim_when_asked_for_it() {
+        let (_, router) = store_and_router();
+        put_app(&router, "web-api", CONFIGURED).await;
+
+        let (status, body) = show_app(&router, "web-api", "?manifest=true").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, CONFIGURED);
+        // Including the comment, which is the part a re-serialisation would
+        // have quietly dropped.
+        assert!(body.starts_with("# an app with everything on"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn shows_a_suspended_app_as_suspended() {
+        let (_, router) = store_and_router();
+        put_app_suspended(&router, "web-api", MANIFEST).await;
+
+        let (status, body) = show_app(&router, "web-api", "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("suspended"), "{body}");
+        // It claims its hosts all the same, and that is why.
+        assert!(body.contains("alpha.test"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn refuses_to_show_an_app_nobody_applied() {
+        let (_, router) = store_and_router();
+
+        let (status, body) = show_app(&router, "web-api", "").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("no app named `web-api`"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn refuses_an_app_id_that_is_not_one() {
+        let (_, router) = store_and_router();
+
+        let (status, _) = show_app(&router, "Web_API", "").await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     async fn delete_app(router: &Router, id: &str) -> (StatusCode, String) {

@@ -38,6 +38,11 @@ time = { version = "0.3", default-features = false, features = [
 ] }
 # Only for `flock` on the state directory's lock file.
 libc = "0.2"
+# Only for fingerprinting a container's configuration. Already in the tree
+# under rustls and rcgen, so this costs nothing but the direct dependency —
+# and a hash that decides whether an app is restarted wants to be one whose
+# output does not move between releases.
+ring = "0.17"
 
 axum = "0.8"
 bytes = "1"

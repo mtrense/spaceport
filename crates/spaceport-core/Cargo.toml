@@ -19,6 +19,7 @@ hyper-util.workspace = true
 instant-acme.workspace = true
 libc.workspace = true
 rcgen.workspace = true
+ring.workspace = true
 rusqlite.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true

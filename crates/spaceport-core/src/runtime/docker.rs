@@ -19,7 +19,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use bollard::Docker;
 use bollard::errors::Error as DockerError;
-use bollard::models::{ContainerCreateBody, EventMessage, HostConfig, PortBinding, PortMap};
+use bollard::models::{
+    ContainerCreateBody, EventMessage, HostConfig, Mount, MountType, PortBinding, PortMap,
+};
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptionsBuilder, EventsOptionsBuilder,
     InspectContainerOptions, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
@@ -30,6 +32,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::{Adopted, Container, ContainerId, ContainerRuntime, Events, Managed, RuntimeEvent};
+use crate::app::data::{DataDir, Owner};
 use crate::app::manifest::Source;
 use crate::app::{AppId, AppManifest};
 
@@ -37,12 +40,21 @@ use crate::app::{AppId, AppManifest};
 const MANAGED_LABEL: &str = "spaceport.managed";
 const APP_LABEL: &str = "spaceport.app";
 
+/// Records what the container was created from, so a manifest that has changed
+/// in a way the engine cannot be asked about — an environment variable, a
+/// volume — is noticed the next time the container is looked at.
+const SPEC_LABEL: &str = "spaceport.spec";
+
 /// How long the engine waits for a container to exit before killing it.
 const STOP_TIMEOUT: i32 = 10;
 
 /// The docker daemon.
 pub struct DockerRuntime {
     docker: Docker,
+
+    /// Where the volumes an app asks for are made. Held here because it is
+    /// the runtime that has to have them on disk before a container starts.
+    data: DataDir,
 }
 
 impl DockerRuntime {
@@ -52,10 +64,10 @@ impl DockerRuntime {
     /// request — so this succeeding does not mean there is a daemon there.
     /// Use [`DockerRuntime::ping`] to find that out at startup rather than at
     /// the first apply.
-    pub fn connect() -> Result<Self> {
+    pub fn connect(data: DataDir) -> Result<Self> {
         let docker = Docker::connect_with_defaults().context("connecting to the docker daemon")?;
 
-        Ok(Self { docker })
+        Ok(Self { docker, data })
     }
 
     /// Check that the daemon is actually there and talking.
@@ -75,14 +87,14 @@ impl DockerRuntime {
         Ok(())
     }
 
-    /// The ports `image` declares, pulling the image if the daemon does not
-    /// have it yet.
+    /// What `image` says about itself, pulling it if the daemon does not have
+    /// it yet.
     ///
     /// The pull is not optional even when the manifest names a port: the
     /// engine will not fetch an image on its own when a container is created
     /// from it, so an image that is not here yet has to be fetched here.
-    async fn exposed_ports(&self, image: &str) -> Result<Vec<String>> {
-        let exposed = match self.docker.inspect_image(image).await {
+    async fn image_config(&self, image: &str) -> Result<ImageConfig> {
+        let config = match self.docker.inspect_image(image).await {
             Ok(inspect) => inspect,
             Err(error) if is_not_found(&error) => {
                 info!(image, "pulling image");
@@ -97,10 +109,12 @@ impl DockerRuntime {
             }
         }
         .config
-        .and_then(|config| config.exposed_ports)
         .unwrap_or_default();
 
-        Ok(exposed)
+        Ok(ImageConfig {
+            exposed: config.exposed_ports.unwrap_or_default(),
+            user: config.user.unwrap_or_default(),
+        })
     }
 
     async fn pull(&self, image: &str) -> Result<()> {
@@ -154,9 +168,11 @@ impl ContainerRuntime for DockerRuntime {
             }
         };
 
-        let exposed = self.exposed_ports(image).await?;
-        let port = container_port(manifest.container.port, image, &exposed)?;
+        let config = self.image_config(image).await?;
+        let port = container_port(manifest.container.port, image, &config.exposed)?;
         let name = container_name(app);
+
+        let mounts = self.provision(app, manifest, &config.user).await?;
 
         // Re-applying an app replaces it, so whatever is running under this
         // name is on its way out either way.
@@ -166,12 +182,18 @@ impl ContainerRuntime for DockerRuntime {
 
         let body = ContainerCreateBody {
             image: Some(image.to_owned()),
+            env: Some(environment(manifest)),
             labels: Some(HashMap::from([
                 (MANAGED_LABEL.to_owned(), "true".to_owned()),
                 (APP_LABEL.to_owned(), app.to_string()),
+                (
+                    SPEC_LABEL.to_owned(),
+                    self.fingerprint(app, image, manifest),
+                ),
             ])),
             host_config: Some(HostConfig {
                 port_bindings: Some(loopback_binding(port)),
+                mounts: Some(mounts),
                 ..Default::default()
             }),
             ..Default::default()
@@ -258,6 +280,30 @@ impl ContainerRuntime for DockerRuntime {
             return Ok(None);
         }
 
+        // The image is only half the question. Everything else a manifest
+        // decides about a container — its environment, its volumes — is fixed
+        // at creation and cannot be changed on a container that already
+        // exists, so a manifest that has moved on since means this container
+        // has to be replaced rather than adopted.
+        let labels = config.labels.unwrap_or_default();
+        match labels.get(SPEC_LABEL) {
+            Some(spec) if spec == &self.fingerprint(app, image, manifest) => {}
+            Some(_) => {
+                debug!(app = %app, container = %id, "the container from before was created from an older manifest");
+                return Ok(None);
+            }
+            // Created by a spaceport that had no configuration to record. Such
+            // a container has no environment and no volumes, so it still
+            // matches any manifest that asks for none — and an upgrade that
+            // restarted every app on the host to relabel it would be a far
+            // worse answer than leaving the ones that still fit alone.
+            None if manifest.container.env.is_empty() && manifest.container.volumes.is_empty() => {}
+            None => {
+                debug!(app = %app, container = %id, "the container from before predates app configuration");
+                return Ok(None);
+            }
+        }
+
         // This far, the container is the one this manifest describes. Whether
         // it happens to be up is a separate question, and one a suspended app
         // has already answered on purpose.
@@ -318,11 +364,28 @@ impl ContainerRuntime for DockerRuntime {
             Source::Image { image } => image.as_str(),
             Source::Build { .. } => bail!("that container's app builds its own image"),
         };
-        let exposed = inspect
-            .config
-            .and_then(|config| config.exposed_ports)
-            .unwrap_or_default();
+        let config = inspect.config.unwrap_or_default();
+        let exposed = config.exposed_ports.clone().unwrap_or_default();
         let port = container_port(manifest.container.port, image, &exposed)?;
+
+        // The container's binds were fixed when it was created, but the
+        // directories they point at are on the host and may not have survived
+        // whatever stopped it. Docker would make the missing ones itself, as
+        // root, which is how an app that ran fine yesterday comes back unable
+        // to write to its own volume.
+        //
+        // Asked of the container rather than the image for the same reason as
+        // the ports above: the engine copied the image's user in at creation,
+        // so there is no image to inspect and no registry to depend on.
+        if let Some(app) = config
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(APP_LABEL))
+            .and_then(|app| app.parse::<AppId>().ok())
+        {
+            let user = config.user.clone().unwrap_or_default();
+            self.provision(&app, manifest, &user).await?;
+        }
 
         let upstream = self
             .run(id.as_str(), port)
@@ -536,6 +599,131 @@ impl DockerRuntime {
 
         self.published_upstream(id, port).await
     }
+
+    /// Make sure every volume the manifest asks for exists on the host, and
+    /// describe them the way the engine wants them.
+    ///
+    /// Blocking file work, on the runtime's own thread: creating a handful of
+    /// directories is not worth a `spawn_blocking`, and it happens once per
+    /// launch rather than once per request.
+    async fn provision(
+        &self,
+        app: &AppId,
+        manifest: &AppManifest,
+        user: &str,
+    ) -> Result<Vec<Mount>> {
+        let volumes = &manifest.container.volumes;
+        if volumes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // An empty `User` means the container runs as root, which owns the
+        // directories anyway. It is the user the image named and spaceport
+        // could not resolve that is worth saying something about.
+        let owner = Owner::parse(user);
+        if owner.is_none() && !user.trim().is_empty() {
+            self.data.warn_unresolved_owner(app, volumes, user.trim());
+        }
+
+        self.data.create()?;
+
+        let mut mounts = Vec::with_capacity(volumes.len());
+        for volume in volumes {
+            let source = self.data.provision(app, volume, owner)?;
+
+            mounts.push(Mount {
+                typ: Some(MountType::BIND),
+                source: Some(source.to_string_lossy().into_owned()),
+                target: Some(volume.mount.to_string_lossy().into_owned()),
+                read_only: Some(volume.read_only),
+                ..Default::default()
+            });
+        }
+
+        Ok(mounts)
+    }
+
+    fn fingerprint(&self, app: &AppId, image: &str, manifest: &AppManifest) -> String {
+        fingerprint(&self.data, app, image, manifest)
+    }
+}
+
+/// What this manifest says the container should be, in 32 hex characters.
+///
+/// Covers what is decided when a container is created and cannot be changed
+/// afterwards. The host paths go in as well as the volume names: moving the
+/// data directory in the config moves the app's data, and a container still
+/// bound to the old path is not the container the config now describes.
+///
+/// What it deliberately leaves out is the manifest's text. Two documents that
+/// describe the same container have to fingerprint the same however they were
+/// written, or an app would be restarted for having a comment added to it.
+fn fingerprint(data: &DataDir, app: &AppId, image: &str, manifest: &AppManifest) -> String {
+    let container = &manifest.container;
+
+    let mut spec = String::new();
+    field(&mut spec, image);
+    field(
+        &mut spec,
+        &container
+            .port
+            .map_or(String::new(), |port| port.to_string()),
+    );
+
+    // Already ordered: `env` is a `BTreeMap`, and the volumes are sorted by
+    // the name that decides their host path.
+    for (name, value) in &container.env {
+        field(&mut spec, name.as_str());
+        field(&mut spec, value);
+    }
+
+    let mut volumes: Vec<_> = container.volumes.iter().collect();
+    volumes.sort_by(|a, b| a.name.cmp(&b.name));
+    for volume in volumes {
+        field(&mut spec, volume.name.as_str());
+        field(&mut spec, &data.volume(app, &volume.name).to_string_lossy());
+        field(&mut spec, &volume.mount.to_string_lossy());
+        field(&mut spec, if volume.read_only { "ro" } else { "rw" });
+    }
+
+    let digest = ring::digest::digest(&ring::digest::SHA256, spec.as_bytes());
+    digest.as_ref()[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// What an image says about itself that spaceport has to know before it can
+/// create a container from it.
+#[derive(Debug, Default)]
+struct ImageConfig {
+    /// The ports the image declares.
+    exposed: Vec<String>,
+
+    /// Who the image runs as, verbatim — see [`Owner::parse`].
+    user: String,
+}
+
+/// Append one length-prefixed field to a fingerprint.
+///
+/// Length-prefixed rather than separated by some character, because an
+/// environment value may contain any character at all, newlines and separators
+/// included. Two different specs that render to one string would mean an app
+/// whose configuration changed and was never restarted.
+fn field(spec: &mut String, value: &str) {
+    spec.push_str(&value.len().to_string());
+    spec.push(':');
+    spec.push_str(value);
+}
+
+/// The environment to give a container, as the engine wants it.
+fn environment(manifest: &AppManifest) -> Vec<String> {
+    manifest
+        .container
+        .env
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect()
 }
 
 /// The container name spaceport gives an app. Prefixed, so a container that is
@@ -768,15 +956,139 @@ mod tests {
         assert!(err.contains("no host port"), "{err}");
     }
 
+    /// A manifest built from `MINIMAL` plus an indented container section.
+    fn manifest(container: &str) -> AppManifest {
+        let container: String = container
+            .lines()
+            .map(|line| format!("  {line}\n"))
+            .collect();
+
+        AppManifest::parse(&format!(
+            "schema_version: 1
+source:
+  type: image
+  image: traefik/whoami:latest
+routing:
+  hosts: [alpha.test]
+container:
+{container}"
+        ))
+        .unwrap()
+    }
+
+    fn spec(manifest: &AppManifest) -> String {
+        let data = DataDir::new(std::path::PathBuf::from("/var/lib/spaceport/apps"));
+
+        fingerprint(
+            &data,
+            &"my-app".parse().unwrap(),
+            "traefik/whoami:latest",
+            manifest,
+        )
+    }
+
+    #[test]
+    fn gives_the_container_its_environment_in_order() {
+        let manifest = manifest("env:\n  ZULU: last\n  ALPHA: first");
+
+        assert_eq!(environment(&manifest), ["ALPHA=first", "ZULU=last"]);
+    }
+
+    #[test]
+    fn gives_a_container_with_no_environment_an_empty_one() {
+        assert!(environment(&manifest("port: 80")).is_empty());
+    }
+
+    /// The whole point of the label: neither of these can be asked of a
+    /// running container, so a fingerprint that missed them would leave an app
+    /// running with the configuration it was applied with a week ago.
+    #[test]
+    fn fingerprints_a_changed_environment_or_volume_differently() {
+        let base = manifest("env:\n  MODE: production");
+
+        for changed in [
+            "env:\n  MODE: staging",
+            "env:\n  MODE: production\n  DEBUG: \"1\"",
+            "env:\n  mode: production",
+            "env:\n  MODE: production\nvolumes:\n  - name: data\n    mount: /data",
+            "port: 8080\nenv:\n  MODE: production",
+        ] {
+            assert_ne!(spec(&base), spec(&manifest(changed)), "for `{changed}`");
+        }
+    }
+
+    #[test]
+    fn fingerprints_a_changed_volume_differently() {
+        let base = manifest("volumes:\n  - name: data\n    mount: /data");
+
+        for changed in [
+            "volumes:\n  - name: cache\n    mount: /data",
+            "volumes:\n  - name: data\n    mount: /var/data",
+            "volumes:\n  - name: data\n    mount: /data\n    read_only: true",
+        ] {
+            assert_ne!(spec(&base), spec(&manifest(changed)), "for `{changed}`");
+        }
+    }
+
+    /// An app that restarted because somebody reordered its manifest, or
+    /// documented it, would teach an operator not to touch the file.
+    #[test]
+    fn fingerprints_the_same_container_the_same_however_it_was_written() {
+        let one = manifest(
+            "env:
+  ALPHA: first
+  ZULU: last
+volumes:
+  - name: data
+    mount: /data
+  - name: cache
+    mount: /cache",
+        );
+        let other = manifest(
+            "# the same app, said differently
+volumes:
+  - name: cache
+    mount: /cache
+  - name: data
+    mount: /data
+env:
+  ZULU: last
+  ALPHA: first",
+        );
+
+        assert_eq!(spec(&one), spec(&other));
+    }
+
+    /// Length-prefixing is what makes this work: `A=1, B=2` and `A=1B, =2`
+    /// would otherwise render to the same bytes.
+    #[test]
+    fn fingerprints_values_that_run_into_each_other_differently() {
+        let one = manifest("env:\n  A: \"1\"\n  B: \"2\"");
+        let other = manifest("env:\n  A: \"1B\"\n  B: \"\"");
+
+        assert_ne!(spec(&one), spec(&other));
+    }
+
     /// The daemon-backed tests below are skipped rather than failed where
     /// there is no daemon: they are the only way to check the parts that are
     /// nothing but daemon, so they should run wherever one exists, but a
     /// checkout with no docker installed is not a broken checkout.
     async fn daemon() -> Option<DockerRuntime> {
-        let runtime = DockerRuntime::connect().ok()?;
+        let runtime = DockerRuntime::connect(DataDir::new(temp_dir())).ok()?;
         runtime.ping().await.ok()?;
 
         Some(runtime)
+    }
+
+    /// A data directory of this test's own, so a test that makes volumes can
+    /// look at what it made without seeing another test's.
+    fn temp_dir() -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        std::env::temp_dir().join(format!("spaceport-runtime-{unique}"))
     }
 
     /// Wait for an app to start listening. `launch` returns as soon as the
@@ -867,6 +1179,159 @@ routing:
 
     /// What a restart is now able to skip: the container the previous spaceport
     /// started is found by name, at the port it was published on.
+    #[tokio::test]
+    async fn gives_a_launched_app_its_environment() {
+        let Some(runtime) = daemon().await else {
+            eprintln!("skipping: no docker daemon");
+            return;
+        };
+        let app: AppId = "spaceport-selftest-env".parse().unwrap();
+        let manifest = manifest("port: 80\nenv:\n  MODE: production\n  GREETING: hello world");
+
+        let container = runtime.launch(&app, &manifest).await.unwrap();
+
+        let inspect = runtime
+            .docker
+            .inspect_container(container.id.as_str(), None::<InspectContainerOptions>)
+            .await
+            .unwrap();
+        let env = inspect.config.unwrap().env.unwrap();
+
+        assert!(env.contains(&"MODE=production".to_owned()), "{env:?}");
+        // Spaces and all: the value is whatever the manifest said, and nothing
+        // between here and the container gets to re-quote it.
+        assert!(env.contains(&"GREETING=hello world".to_owned()), "{env:?}");
+
+        runtime.remove(&container.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn makes_a_volume_on_the_host_and_binds_it_into_the_container() {
+        let Some(runtime) = daemon().await else {
+            eprintln!("skipping: no docker daemon");
+            return;
+        };
+        let app: AppId = "spaceport-selftest-volume".parse().unwrap();
+        let manifest = manifest(
+            "port: 80
+volumes:
+  - name: data
+    mount: /var/lib/whoami",
+        );
+
+        let container = runtime.launch(&app, &manifest).await.unwrap();
+
+        let expected = runtime.data.volume(&app, &"data".parse().unwrap());
+        assert!(expected.is_dir(), "{} was not created", expected.display());
+
+        let inspect = runtime
+            .docker
+            .inspect_container(container.id.as_str(), None::<InspectContainerOptions>)
+            .await
+            .unwrap();
+        let mounts = inspect.mounts.unwrap();
+
+        assert_eq!(mounts.len(), 1, "{mounts:?}");
+        assert_eq!(mounts[0].source.as_deref(), expected.to_str());
+        assert_eq!(mounts[0].destination.as_deref(), Some("/var/lib/whoami"));
+        assert_eq!(mounts[0].rw, Some(true));
+
+        runtime.remove(&container.id).await.unwrap();
+        // The container is gone; the data it was keeping is not.
+        assert!(expected.is_dir(), "removing the container took the volume");
+
+        let _ = std::fs::remove_dir_all(runtime.data.root());
+    }
+
+    /// The gap this closes: neither environment nor volumes can be changed on
+    /// a container that exists, so a spaceport that adopted one on the
+    /// strength of its image alone would go on running last week's
+    /// configuration and report the app as healthy.
+    #[tokio::test]
+    async fn refuses_to_adopt_a_container_whose_configuration_has_moved_on() {
+        let Some(runtime) = daemon().await else {
+            eprintln!("skipping: no docker daemon");
+            return;
+        };
+        let app: AppId = "spaceport-selftest-respec".parse().unwrap();
+        let applied = manifest("port: 80\nenv:\n  MODE: production");
+
+        let container = runtime.launch(&app, &applied).await.unwrap();
+
+        // The same manifest still describes this container.
+        assert_eq!(
+            runtime.adopt(&app, &applied).await.unwrap(),
+            Some(Adopted::Running(container.clone()))
+        );
+
+        for changed in [
+            "port: 80\nenv:\n  MODE: staging",
+            "port: 80",
+            "port: 80\nenv:\n  MODE: production\nvolumes:\n  - name: data\n    mount: /data",
+        ] {
+            assert_eq!(
+                runtime.adopt(&app, &manifest(changed)).await.unwrap(),
+                None,
+                "adopted the old container for `{changed}`"
+            );
+        }
+
+        runtime.remove(&container.id).await.unwrap();
+        let _ = std::fs::remove_dir_all(runtime.data.root());
+    }
+
+    /// The upgrade path. A container created before spaceport recorded what it
+    /// was created from has no spec label, and restarting every app on the
+    /// host to give it one would be a worse answer than leaving the ones that
+    /// still fit their manifest alone.
+    #[tokio::test]
+    async fn adopts_a_container_from_before_spaceport_recorded_its_spec() {
+        let Some(runtime) = daemon().await else {
+            eprintln!("skipping: no docker daemon");
+            return;
+        };
+        let app: AppId = "spaceport-selftest-unlabelled".parse().unwrap();
+        let name = container_name(&app);
+        let _ = runtime.remove_container(&name).await;
+
+        // What an older spaceport would have created: managed and named, with
+        // nothing said about its configuration.
+        let body = ContainerCreateBody {
+            image: Some("traefik/whoami:latest".to_owned()),
+            labels: Some(HashMap::from([
+                (MANAGED_LABEL.to_owned(), "true".to_owned()),
+                (APP_LABEL.to_owned(), app.to_string()),
+            ])),
+            host_config: Some(HostConfig {
+                port_bindings: Some(loopback_binding(80)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let created = runtime
+            .docker
+            .create_container(
+                Some(CreateContainerOptionsBuilder::new().name(&name).build()),
+                body,
+            )
+            .await
+            .unwrap();
+        runtime.run(&created.id, 80).await.unwrap();
+
+        // A manifest that asks for no configuration is still satisfied by it.
+        let plain = manifest("port: 80");
+        assert!(matches!(
+            runtime.adopt(&app, &plain).await.unwrap(),
+            Some(Adopted::Running(_))
+        ));
+
+        // One that asks for some is not: this container cannot have it.
+        let configured = manifest("port: 80\nenv:\n  MODE: production");
+        assert_eq!(runtime.adopt(&app, &configured).await.unwrap(), None);
+
+        runtime.remove(&ContainerId::new(created.id)).await.unwrap();
+    }
+
     #[tokio::test]
     async fn adopts_the_container_it_left_running() {
         let Some(runtime) = daemon().await else {

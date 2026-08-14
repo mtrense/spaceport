@@ -1,6 +1,7 @@
 //! Apps: what spaceport runs and routes traffic to.
 
 pub mod apply;
+pub mod data;
 pub mod health;
 pub mod manifest;
 pub mod pattern;
@@ -10,6 +11,7 @@ pub mod store;
 pub mod supervisor;
 
 pub use apply::{Applied, Applier, Restored};
+pub use data::DataDir;
 pub use manifest::AppManifest;
 pub use pattern::Pattern;
 pub use reconcile::reconcile;

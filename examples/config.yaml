@@ -28,3 +28,9 @@ state:
   # only by the user spaceport runs as.
   # directory: /var/lib/spaceport
   directory: ./tmp-spaceport-data
+data:
+  # Where apps' own volumes live, one directory per app. Kept out of the state
+  # directory: this is the data an app writes and an operator backs up, not
+  # spaceport's own, and the two are not readable by the same people.
+  # directory: /var/lib/spaceport/apps
+  directory: ./tmp-spaceport-apps

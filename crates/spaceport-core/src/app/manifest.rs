@@ -5,7 +5,7 @@
 //! applied under two ids without editing.
 
 use std::borrow::Borrow;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -20,6 +20,10 @@ use crate::duration;
 /// Longest a routing host may be, and its individual labels, per RFC 1035.
 const MAX_HOST_LEN: usize = 253;
 const MAX_LABEL_LEN: usize = 63;
+
+/// Longest a volume name may be. It becomes one path segment on the host, and
+/// 63 is the shortest limit any filesystem spaceport might run on imposes.
+const MAX_VOLUME_NAME_LEN: usize = 63;
 
 /// A parsed and validated app manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -111,6 +115,243 @@ pub struct Container {
     /// How spaceport decides the app is working.
     #[serde(default)]
     pub health: Health,
+
+    /// Directories the app keeps across restarts, redeploys and its own
+    /// deletion.
+    #[serde(default)]
+    pub volumes: Vec<Volume>,
+
+    /// Secrets the app's `env` may interpolate. Parses and validates, but
+    /// nothing supplies a value yet, so applying a manifest that declares one
+    /// is refused — see `apply`.
+    ///
+    /// Declared as a list of bare names rather than name-and-value: the whole
+    /// point is that the value is not in the document.
+    #[serde(default)]
+    pub secrets: Vec<VarName>,
+
+    /// The environment the app runs with.
+    ///
+    /// A `BTreeMap`, so the environment a manifest describes has exactly one
+    /// order. Docker takes it as a list, and a list that reshuffled between two
+    /// reads of the same document would make an unchanged app look changed.
+    #[serde(default)]
+    pub env: BTreeMap<VarName, String>,
+}
+
+/// A directory the app keeps.
+///
+/// The host path is not in here: it is spaceport's to choose, from the
+/// configured data directory and the id the operator applied the app under.
+/// A manifest that could name a host path could name any host path.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Volume {
+    /// Names the volume within the app, and nothing else — it is the last
+    /// segment of the host path, so it is kept to what is safe to put there.
+    pub name: VolumeName,
+
+    /// Where the app sees it, inside the container.
+    pub mount: PathBuf,
+
+    /// Whether the app may write to it. Off by default: a volume exists to be
+    /// written to, and the read-only case is the one worth spelling out.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// The name of a volume, safe to use as one path segment.
+///
+/// Kept to letters, digits, hyphens and underscores, which is what makes it
+/// safe: no separator, no `..`, no leading dot, nothing a shell or a path
+/// walker reads as anything but a name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct VolumeName(String);
+
+impl VolumeName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for VolumeName {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        if s.is_empty() {
+            bail!("a volume name must not be empty");
+        }
+        if s.len() > MAX_VOLUME_NAME_LEN {
+            bail!("volume name `{s}` is longer than {MAX_VOLUME_NAME_LEN} characters");
+        }
+        if !s
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            bail!("volume name `{s}` may only contain letters, digits, hyphens and underscores");
+        }
+
+        Ok(Self(s.to_owned()))
+    }
+}
+
+impl<'de> Deserialize<'de> for VolumeName {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
+    }
+}
+
+impl fmt::Display for VolumeName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The name of an environment variable, and so also of a secret: a secret is
+/// only ever delivered by being interpolated into one.
+///
+/// The C rules, because that is what the shell in the container will enforce
+/// anyway — a name it cannot export is a name the app cannot read.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct VarName(String);
+
+impl VarName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for VarName {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        if s.is_empty() {
+            bail!("an environment variable name must not be empty");
+        }
+        let mut bytes = s.bytes();
+        let first = bytes.next().expect("checked non-empty");
+        if !(first.is_ascii_alphabetic() || first == b'_') {
+            bail!("`{s}` must start with a letter or an underscore to be an environment variable");
+        }
+        if !bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            bail!("`{s}` may only contain letters, digits and underscores");
+        }
+
+        Ok(Self(s.to_owned()))
+    }
+}
+
+impl<'de> Deserialize<'de> for VarName {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
+    }
+}
+
+impl fmt::Display for VarName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Lets a map keyed by `VarName` be looked up with a plain `&str`.
+impl Borrow<str> for VarName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The secrets an env value interpolates, in the order they appear.
+///
+/// `{{` always opens a reference and there is no way to escape it. A literal
+/// `{{` in an environment value is rare enough to wait for someone to want
+/// one; inventing an escape now would be guessing at a syntax nobody has had
+/// to write yet, and the guess would be permanent.
+fn placeholders(value: &str) -> Result<Vec<&str>> {
+    let mut found = Vec::new();
+    let mut rest = value;
+
+    while let Some(open) = rest.find("{{") {
+        let after = &rest[open + 2..];
+        let Some(close) = after.find("}}") else {
+            bail!("`{value}` opens a `{{{{` that is never closed");
+        };
+        found.push(after[..close].trim());
+        rest = &after[close + 2..];
+    }
+
+    Ok(found)
+}
+
+impl Container {
+    /// What serde cannot express about a container: the rules that span more
+    /// than one field.
+    fn validate(&self) -> Result<()> {
+        if self.port == Some(0) {
+            bail!("container.port must be a port an app can listen on, not 0");
+        }
+
+        let mut names = HashSet::with_capacity(self.volumes.len());
+        let mut mounts = HashSet::with_capacity(self.volumes.len());
+        for volume in &self.volumes {
+            // Two volumes of one name would be one directory on the host, and
+            // whichever mount won would depend on the order docker read them.
+            if !names.insert(&volume.name) {
+                bail!("container.volumes names `{}` twice", volume.name);
+            }
+            if !volume.mount.is_absolute() {
+                bail!(
+                    "volume `{}` must be mounted at an absolute path, not `{}`",
+                    volume.name,
+                    volume.mount.display()
+                );
+            }
+            if volume.mount == Path::new("/") {
+                bail!("volume `{}` must not be mounted over `/`", volume.name);
+            }
+            if !mounts.insert(&volume.mount) {
+                bail!(
+                    "container.volumes mounts two volumes at `{}`",
+                    volume.mount.display()
+                );
+            }
+        }
+
+        let mut declared = HashSet::with_capacity(self.secrets.len());
+        for secret in &self.secrets {
+            if !declared.insert(secret) {
+                bail!("container.secrets names `{secret}` twice");
+            }
+        }
+
+        let mut used = HashSet::new();
+        for (name, value) in &self.env {
+            for reference in placeholders(value)? {
+                let secret: VarName = reference
+                    .parse()
+                    .with_context(|| format!("`{name}` interpolates `{{{{{reference}}}}}`"))?;
+                if !declared.contains(&secret) {
+                    bail!(
+                        "`{name}` interpolates `{secret}`, which container.secrets does not declare"
+                    );
+                }
+                used.insert(secret);
+            }
+        }
+
+        // A secret nothing reads is a typo on one side or the other, and both
+        // ways round the app would come up missing something it was promised.
+        for secret in &self.secrets {
+            if !used.contains(secret) {
+                bail!("container.secrets declares `{secret}`, which no env value interpolates");
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// How spaceport decides an app is working.
@@ -422,9 +663,7 @@ impl AppManifest {
             }
         }
 
-        if self.container.port == Some(0) {
-            bail!("container.port must be a port an app can listen on, not 0");
-        }
+        self.container.validate()?;
 
         self.container.health.readiness.validate("readiness")?;
         // Nothing cross-checks the two: liveness starts only once readiness has
@@ -456,14 +695,20 @@ routing:
         manifest.routing.hosts.iter().map(Host::as_str).collect()
     }
 
-    /// The example is documentation, and documentation that does not parse is
-    /// worse than none.
+    /// The examples are documentation, and documentation that does not parse
+    /// is worse than none. `app-manifest.yaml` is the one that matters most
+    /// here: it is where every field spaceport understands is written down.
     #[test]
-    fn the_shipped_example_is_valid() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/hello-app.yaml");
-        let raw = std::fs::read_to_string(&path).unwrap();
+    fn the_shipped_examples_are_valid() {
+        let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
 
-        AppManifest::parse(&raw).unwrap();
+        for name in ["hello-app.yaml", "echo.yaml", "app-manifest.yaml"] {
+            let raw = std::fs::read_to_string(examples.join(name)).unwrap();
+
+            if let Err(err) = AppManifest::parse(&raw) {
+                panic!("examples/{name}: {err:#}");
+            }
+        }
     }
 
     /// The state store keeps this text and nothing else, so a manifest that
@@ -546,6 +791,17 @@ routing:
 
     #[test]
     fn rejects_unknown_fields() {
+        let err = AppManifest::parse(&format!("{MINIMAL}replicas: 3\n"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("replicas"), "{err}");
+    }
+
+    /// `secrets` is a container field, so at the root it is still a mistake —
+    /// and one an operator who read the example half-way is likely to make.
+    #[test]
+    fn rejects_a_container_field_at_the_root() {
         let err = AppManifest::parse(&format!("{MINIMAL}secrets: [DB_PASSWORD]\n"))
             .unwrap_err()
             .to_string();
@@ -584,6 +840,199 @@ routing:
         let err = AppManifest::parse(&raw).unwrap_err().to_string();
 
         assert!(err.contains("ports"), "{err}");
+    }
+
+    /// `MINIMAL` with a container section, indented into place.
+    fn with_container(fields: &str) -> String {
+        let fields: String = fields.lines().map(|line| format!("  {line}\n")).collect();
+
+        format!("{MINIMAL}container:\n{fields}")
+    }
+
+    #[test]
+    fn runs_with_no_environment_and_no_volumes_by_default() {
+        let container = AppManifest::parse(MINIMAL).unwrap().container;
+
+        assert!(container.env.is_empty());
+        assert!(container.volumes.is_empty());
+        assert!(container.secrets.is_empty());
+    }
+
+    #[test]
+    fn parses_an_environment() {
+        let raw = with_container("env:\n  ENVIRONMENT: production\n  LOG_LEVEL: debug");
+        let env = AppManifest::parse(&raw).unwrap().container.env;
+
+        assert_eq!(env.len(), 2);
+        assert_eq!(env["ENVIRONMENT"], "production");
+        assert_eq!(env["LOG_LEVEL"], "debug");
+    }
+
+    #[test]
+    fn rejects_an_environment_name_a_shell_could_not_export() {
+        for name in ["1ST", "WITH-HYPHEN", "with space", ""] {
+            let raw = with_container(&format!("env:\n  \"{name}\": x"));
+            assert!(AppManifest::parse(&raw).is_err(), "accepted `{name}`");
+        }
+    }
+
+    #[test]
+    fn parses_a_volume() {
+        let raw = with_container(
+            "volumes:
+  - name: data
+    mount: /var/lib/my-app/data
+  - name: cache
+    mount: /var/cache/my-app
+    read_only: true",
+        );
+
+        let volumes = AppManifest::parse(&raw).unwrap().container.volumes;
+
+        assert_eq!(volumes.len(), 2);
+        assert_eq!(volumes[0].name.as_str(), "data");
+        assert_eq!(volumes[0].mount, Path::new("/var/lib/my-app/data"));
+        // Off unless asked for: a volume exists to be written to.
+        assert!(!volumes[0].read_only);
+        assert!(volumes[1].read_only);
+    }
+
+    /// The name becomes one segment of a host path, so anything that could
+    /// climb out of the app's own directory has to be refused here, before it
+    /// is ever joined to one.
+    #[test]
+    fn rejects_a_volume_name_that_is_not_one_path_segment() {
+        for name in ["..", "a/b", ".hidden", "", "with space", "\"a\\\\b\""] {
+            let raw = with_container(&format!("volumes:\n  - name: {name}\n    mount: /data"));
+            assert!(AppManifest::parse(&raw).is_err(), "accepted `{name}`");
+        }
+    }
+
+    #[test]
+    fn rejects_an_overlong_volume_name() {
+        let name = "a".repeat(64);
+        let raw = with_container(&format!("volumes:\n  - name: {name}\n    mount: /data"));
+        let err = AppManifest::parse(&raw).unwrap_err().to_string();
+
+        assert!(err.contains("longer than 63"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_relative_mount() {
+        let raw = with_container("volumes:\n  - name: data\n    mount: var/lib/data");
+        let err = AppManifest::parse(&raw).unwrap_err().to_string();
+
+        assert!(err.contains("absolute path"), "{err}");
+    }
+
+    /// Mounting a volume over `/` would replace the image's whole filesystem
+    /// with an empty directory.
+    #[test]
+    fn rejects_a_mount_over_the_root() {
+        let raw = with_container("volumes:\n  - name: data\n    mount: /");
+        let err = AppManifest::parse(&raw).unwrap_err().to_string();
+
+        assert!(err.contains("over `/`"), "{err}");
+    }
+
+    /// Two volumes of one name are one host directory, and which mount won
+    /// would come down to the order docker happened to read them in.
+    #[test]
+    fn rejects_two_volumes_of_the_same_name() {
+        let raw = with_container(
+            "volumes:
+  - name: data
+    mount: /one
+  - name: data
+    mount: /two",
+        );
+        let err = AppManifest::parse(&raw).unwrap_err().to_string();
+
+        assert!(err.contains("twice"), "{err}");
+    }
+
+    #[test]
+    fn rejects_two_volumes_at_the_same_mount() {
+        let raw = with_container(
+            "volumes:
+  - name: one
+    mount: /data
+  - name: two
+    mount: /data",
+        );
+        let err = AppManifest::parse(&raw).unwrap_err().to_string();
+
+        assert!(err.contains("/data"), "{err}");
+    }
+
+    #[test]
+    fn parses_a_secret_interpolated_into_the_environment() {
+        let raw = with_container(
+            "secrets:
+  - DB_PASSWORD
+env:
+  DATABASE_URL: postgres://user:{{DB_PASSWORD}}@db:5432/my-app",
+        );
+
+        let container = AppManifest::parse(&raw).unwrap().container;
+
+        assert_eq!(container.secrets[0].as_str(), "DB_PASSWORD");
+        // Kept unresolved: the manifest is stored as written, and there is
+        // nothing to resolve it with yet.
+        assert_eq!(
+            container.env["DATABASE_URL"],
+            "postgres://user:{{DB_PASSWORD}}@db:5432/my-app"
+        );
+    }
+
+    /// The typo that would otherwise reach the app as a literal `{{...}}` in
+    /// a connection string, and be diagnosed as a database problem.
+    #[test]
+    fn rejects_a_reference_to_a_secret_nobody_declared() {
+        let raw = with_container("env:\n  DATABASE_URL: \"pw={{DB_PASSWORD}}\"");
+        let err = AppManifest::parse(&raw).unwrap_err().to_string();
+
+        assert!(err.contains("DB_PASSWORD"), "{err}");
+        assert!(err.contains("does not declare"), "{err}");
+    }
+
+    /// The same typo from the other side: the secret is declared, and it is
+    /// the reference that is misspelt, so nothing would ever read it.
+    #[test]
+    fn rejects_a_declared_secret_nothing_interpolates() {
+        let raw = with_container("secrets: [DB_PASSWORD]\nenv:\n  A: b");
+        let err = AppManifest::parse(&raw).unwrap_err().to_string();
+
+        assert!(err.contains("no env value interpolates"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_repeated_secret() {
+        let raw =
+            with_container("secrets: [DB_PASSWORD, DB_PASSWORD]\nenv:\n  A: \"{{DB_PASSWORD}}\"");
+        let err = AppManifest::parse(&raw).unwrap_err().to_string();
+
+        assert!(err.contains("twice"), "{err}");
+    }
+
+    #[test]
+    fn rejects_an_unclosed_placeholder() {
+        let raw = with_container("secrets: [DB_PASSWORD]\nenv:\n  A: \"{{DB_PASSWORD\"");
+        let err = AppManifest::parse(&raw).unwrap_err().to_string();
+
+        assert!(err.contains("never closed"), "{err}");
+    }
+
+    #[test]
+    fn reads_a_secret_into_more_than_one_variable() {
+        let raw = with_container(
+            "secrets: [PW]
+env:
+  A: \"{{PW}}\"
+  B: \"user:{{PW}}@host and again {{PW}}\"",
+        );
+
+        assert!(AppManifest::parse(&raw).is_ok());
     }
 
     /// `MINIMAL` with a readiness section, indented into place.

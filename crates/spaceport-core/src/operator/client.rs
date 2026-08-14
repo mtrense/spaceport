@@ -81,6 +81,19 @@ pub async fn list(endpoint: &OperatorEndpoint, pattern: Option<&Pattern>) -> Res
     send_to(endpoint, builder("GET", &uri).body(Full::default())?).await
 }
 
+/// Ask for everything it knows about the app named `id`.
+///
+/// With `manifest`, the document that was applied comes back verbatim and on
+/// its own, rather than a report about it.
+pub async fn show(endpoint: &OperatorEndpoint, id: &AppId, manifest: bool) -> Result<String> {
+    let uri = match manifest {
+        true => format!("/apps/{id}?manifest=true"),
+        false => format!("/apps/{id}"),
+    };
+
+    send_to(endpoint, builder("GET", &uri).body(Full::default())?).await
+}
+
 /// Ask what this spaceport is and how it is doing.
 ///
 /// The one call that comes back as data rather than as prose: what a status
