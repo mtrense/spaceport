@@ -27,6 +27,7 @@ use tracing::{debug, warn};
 
 use super::EdgeState;
 use super::service::{self, ConnInfo};
+use crate::app::store::Route;
 
 /// Headers that describe one hop and must not be passed on to the next.
 ///
@@ -91,16 +92,35 @@ pub async fn handle(
     };
     let name = service::host_name(&authority).unwrap_or(&authority);
 
-    let Some(app) = state.apps.routes().lookup(name).cloned() else {
-        debug!(
-            host = name,
-            path = req.uri().path(),
-            "no app serves this host"
-        );
-        return Ok(refuse(
-            StatusCode::NOT_FOUND,
-            format!("spaceport has no app for {name}\n"),
-        ));
+    let app = match state.apps.routes().lookup(name).cloned() {
+        Some(Route::Live(app)) => app,
+        // The host is spoken for, by an app an operator has taken out of
+        // service on purpose. Saying so — rather than 404, which would mean
+        // spaceport has never heard of this name — is the difference between a
+        // caller that retries later and one that gives up on the address.
+        Some(Route::Suspended(app)) => {
+            debug!(
+                app = %app,
+                host = name,
+                path = req.uri().path(),
+                "the app serving this host is suspended"
+            );
+            return Ok(refuse(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("the app serving {name} is suspended\n"),
+            ));
+        }
+        None => {
+            debug!(
+                host = name,
+                path = req.uri().path(),
+                "no app serves this host"
+            );
+            return Ok(refuse(
+                StatusCode::NOT_FOUND,
+                format!("spaceport has no app for {name}\n"),
+            ));
+        }
     };
 
     let upstream = app.upstream;
@@ -425,6 +445,23 @@ mod tests {
 
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(body.contains("no app for nope.test"), "{body}");
+    }
+
+    /// The host is spoken for by an app somebody took out of service. A 404
+    /// would say spaceport has never heard of the name, which is what makes a
+    /// caller give up on the address rather than come back later.
+    #[tokio::test]
+    async fn answers_for_a_suspended_app_instead_of_forwarding() {
+        let apps = Arc::new(AppStore::new());
+        apps.insert(app("hello", "alpha.test", upstream().await))
+            .unwrap();
+        apps.suspend(&"hello".parse().unwrap(), None).unwrap();
+        let edge = edge(apps).await;
+
+        let (status, body) = get(edge, "alpha.test", "/").await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("serving alpha.test is suspended"), "{body}");
     }
 
     #[tokio::test]

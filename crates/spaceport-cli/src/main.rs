@@ -111,6 +111,10 @@ enum AppsCommand {
     Apply(ApplyArgs),
     /// List the apps spaceport is running.
     List(ListArgs),
+    /// Stop serving an app, keeping everything about it.
+    Suspend(SuspendArgs),
+    /// Serve a suspended app again.
+    Resume(ResumeArgs),
     /// Stop an app and remove it.
     Destroy(DestroyArgs),
 }
@@ -122,6 +126,40 @@ struct ApplyArgs {
 
     /// Path to the app manifest.
     manifest: PathBuf,
+
+    /// Record the app and claim its hosts without starting it.
+    ///
+    /// Certificates for its hosts are acquired and renewed all the same, so
+    /// `spaceport apps resume` starts serving immediately. Applying to an app
+    /// that is already suspended leaves it suspended whether or not this is
+    /// given.
+    #[arg(long)]
+    suspended: bool,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
+struct SuspendArgs {
+    /// The app to stop serving.
+    app_id: AppId,
+
+    /// Stop its container too, and keep it.
+    ///
+    /// Without this the container is left running and only stops receiving
+    /// traffic, which is what makes resuming instant.
+    #[arg(long)]
+    stop_container: bool,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
+struct ResumeArgs {
+    /// The app to serve again.
+    app_id: AppId,
 
     #[command(flatten)]
     server: ServerArgs,
@@ -230,6 +268,8 @@ async fn main() -> Result<()> {
         Command::Apps { command } => match command {
             AppsCommand::Apply(args) => apply(args).await,
             AppsCommand::List(args) => list(args).await,
+            AppsCommand::Suspend(args) => suspend(args).await,
+            AppsCommand::Resume(args) => resume(args).await,
             AppsCommand::Destroy(args) => destroy(args).await,
         },
         Command::Stream(args) => stream(args).await,
@@ -422,7 +462,7 @@ async fn apply(args: ApplyArgs) -> Result<()> {
 
     print!(
         "{}",
-        client::apply(&args.server.server, &args.app_id, manifest).await?
+        client::apply(&args.server.server, &args.app_id, manifest, args.suspended).await?
     );
 
     Ok(())
@@ -432,6 +472,24 @@ async fn list(args: ListArgs) -> Result<()> {
     print!(
         "{}",
         client::list(&args.server.server, args.pattern.as_ref()).await?
+    );
+
+    Ok(())
+}
+
+async fn suspend(args: SuspendArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::suspend(&args.server.server, &args.app_id, args.stop_container).await?
+    );
+
+    Ok(())
+}
+
+async fn resume(args: ResumeArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::resume(&args.server.server, &args.app_id).await?
     );
 
     Ok(())

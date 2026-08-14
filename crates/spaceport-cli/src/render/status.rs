@@ -141,8 +141,18 @@ fn apps(apps: &Apps, colour: Colour) -> Vec<String> {
     }
 
     lines.push(format!(
-        "{} recorded{}",
+        "{} recorded{}{}",
         apps.recorded,
+        // Uncoloured, and named: a suspended app is doing what it was told to,
+        // so it is worth listing and not worth warning about.
+        match apps.suspended.is_empty() {
+            true => String::new(),
+            false => format!(
+                ", {} suspended ({})",
+                apps.suspended.len(),
+                names(apps.suspended.iter().map(|id| id.to_string())),
+            ),
+        },
         match apps.down.is_empty() {
             true => String::new(),
             false => format!(
@@ -293,6 +303,7 @@ mod tests {
                 ready: 4,
                 unreachable: vec!["worker-2".parse().unwrap()],
                 recorded: 6,
+                suspended: vec!["staging".parse().unwrap()],
                 down: vec![Down {
                     id: "batch".parse().unwrap(),
                     reason: Some("no image `x:1`".to_owned()),
@@ -354,7 +365,10 @@ mod tests {
             block.contains("5 running, 4 ready, 1 unreachable (worker-2)"),
             "{block}"
         );
-        assert!(block.contains("6 recorded, 1 not running"), "{block}");
+        assert!(
+            block.contains("6 recorded, 1 suspended (staging), 1 not running"),
+            "{block}"
+        );
         assert!(block.contains("batch: no image `x:1`"), "{block}");
         assert!(
             block.contains("no certificate yet for staging.example.com"),

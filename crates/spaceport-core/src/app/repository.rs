@@ -28,6 +28,11 @@ pub struct AppRecord {
     pub manifest: String,
     /// When it was applied, RFC 3339.
     pub applied_at: String,
+    /// Whether spaceport has been told not to run it for now.
+    ///
+    /// Still intent, and still this app's: a suspended record says the operator
+    /// wants this manifest under this id and does not want it served yet.
+    pub suspended: bool,
 }
 
 /// SQLite integers are signed, so a schema version goes in as an `i64`.
@@ -54,11 +59,12 @@ impl AppRepository {
         Self { db }
     }
 
-    /// Remember that `manifest` is what the app named `id` should be running.
+    /// Remember that `manifest` is what the app named `id` should be running,
+    /// and whether it should be running it yet.
     ///
     /// Replaces whatever was recorded under that id — an apply is a `PUT`, and
     /// so is this.
-    pub async fn record_applied(&self, id: &AppId, manifest: &str) -> Result<()> {
+    pub async fn record_applied(&self, id: &AppId, manifest: &str, suspended: bool) -> Result<()> {
         let id = id.to_string();
         let manifest = manifest.to_owned();
         let applied_at = crate::state::now();
@@ -67,17 +73,50 @@ impl AppRepository {
             .call(move |connection| {
                 connection
                     .execute(
-                        "INSERT INTO apps (id, schema_version, manifest, applied_at)
-                         VALUES (?1, ?2, ?3, ?4)
+                        "INSERT INTO apps (id, schema_version, manifest, applied_at, suspended)
+                         VALUES (?1, ?2, ?3, ?4, ?5)
                          ON CONFLICT(id) DO UPDATE SET
                              schema_version = excluded.schema_version,
                              manifest       = excluded.manifest,
-                             applied_at     = excluded.applied_at",
-                        rusqlite::params![id, stored(SCHEMA_VERSION), manifest, applied_at],
+                             applied_at     = excluded.applied_at,
+                             suspended      = excluded.suspended",
+                        rusqlite::params![
+                            id,
+                            stored(SCHEMA_VERSION),
+                            manifest,
+                            applied_at,
+                            suspended
+                        ],
                     )
                     .context("recording an applied app")?;
 
                 Ok(())
+            })
+            .await
+    }
+
+    /// Remember that the app named `id` is, or is no longer, suspended.
+    ///
+    /// Only the flag: the manifest and `applied_at` are left as they were,
+    /// because suspending an app is not applying one. An operator who suspends
+    /// and resumes should find the same record afterwards, still saying when
+    /// they last applied it.
+    ///
+    /// Says whether there was a record to change, so suspending an app nothing
+    /// was ever recorded for can be told from suspending one that was.
+    pub async fn set_suspended(&self, id: &AppId, suspended: bool) -> Result<bool> {
+        let id = id.to_string();
+
+        self.db
+            .call(move |connection| {
+                let changed = connection
+                    .execute(
+                        "UPDATE apps SET suspended = ?2 WHERE id = ?1",
+                        rusqlite::params![id, suspended],
+                    )
+                    .context("recording an app's suspension")?;
+
+                Ok(changed > 0)
             })
             .await
     }
@@ -105,26 +144,30 @@ impl AppRepository {
         let wanted = id.clone();
         let id = id.to_string();
 
-        let row: Option<(i64, String, String)> = self
+        let row: Option<(i64, String, String, bool)> = self
             .db
             .call(move |connection| {
                 connection
                     .query_row(
-                        "SELECT schema_version, manifest, applied_at FROM apps WHERE id = ?1",
+                        "SELECT schema_version, manifest, applied_at, suspended
+                         FROM apps WHERE id = ?1",
                         [id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                     )
                     .optional()
                     .context("reading a recorded app")
             })
             .await?;
 
-        Ok(row.map(|(schema_version, manifest, applied_at)| AppRecord {
-            id: wanted,
-            schema_version: read(schema_version),
-            manifest,
-            applied_at,
-        }))
+        Ok(row.map(
+            |(schema_version, manifest, applied_at, suspended)| AppRecord {
+                id: wanted,
+                schema_version: read(schema_version),
+                manifest,
+                applied_at,
+                suspended,
+            },
+        ))
     }
 
     /// Everything spaceport should be running, by id.
@@ -136,18 +179,25 @@ impl AppRepository {
     /// failing the read: one unreadable record must not cost every other app
     /// its restart.
     pub async fn desired(&self) -> Result<Vec<AppRecord>> {
-        let rows: Vec<(String, i64, String, String)> = self
+        let rows: Vec<(String, i64, String, String, bool)> = self
             .db
             .call(|connection| {
                 let mut statement = connection
                     .prepare(
-                        "SELECT id, schema_version, manifest, applied_at FROM apps ORDER BY id",
+                        "SELECT id, schema_version, manifest, applied_at, suspended
+                         FROM apps ORDER BY id",
                     )
                     .context("preparing the desired-apps query")?;
 
                 let rows = statement
                     .query_map([], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
                     })
                     .context("reading the desired apps")?
                     .collect::<rusqlite::Result<Vec<_>>>()
@@ -159,20 +209,21 @@ impl AppRepository {
 
         Ok(rows
             .into_iter()
-            .filter_map(
-                |(id, schema_version, manifest, applied_at)| match id.parse::<AppId>() {
+            .filter_map(|(id, schema_version, manifest, applied_at, suspended)| {
+                match id.parse::<AppId>() {
                     Ok(id) => Some(AppRecord {
                         id,
                         schema_version: read(schema_version),
                         manifest,
                         applied_at,
+                        suspended,
                     }),
                     Err(error) => {
                         warn!(app = id, %error, "skipping a recorded app whose id is not valid");
                         None
                     }
-                },
-            )
+                }
+            })
             .collect())
     }
 }
@@ -206,7 +257,7 @@ routing:
     async fn records_a_manifest_verbatim() {
         let repository = repository();
         repository
-            .record_applied(&id("hello"), MANIFEST)
+            .record_applied(&id("hello"), MANIFEST, false)
             .await
             .unwrap();
 
@@ -223,12 +274,12 @@ routing:
     async fn re_recording_replaces_the_manifest() {
         let repository = repository();
         repository
-            .record_applied(&id("hello"), MANIFEST)
+            .record_applied(&id("hello"), MANIFEST, false)
             .await
             .unwrap();
         let changed = MANIFEST.replace("alpha.test", "beta.test");
         repository
-            .record_applied(&id("hello"), &changed)
+            .record_applied(&id("hello"), &changed, false)
             .await
             .unwrap();
 
@@ -241,7 +292,7 @@ routing:
     async fn forgets_an_app() {
         let repository = repository();
         repository
-            .record_applied(&id("hello"), MANIFEST)
+            .record_applied(&id("hello"), MANIFEST, false)
             .await
             .unwrap();
 
@@ -258,7 +309,7 @@ routing:
     async fn reads_back_one_app() {
         let repository = repository();
         repository
-            .record_applied(&id("hello"), MANIFEST)
+            .record_applied(&id("hello"), MANIFEST, false)
             .await
             .unwrap();
 
@@ -271,7 +322,10 @@ routing:
     async fn lists_the_desired_apps_in_a_stable_order() {
         let repository = repository();
         for app in ["zulu", "alpha", "mike"] {
-            repository.record_applied(&id(app), MANIFEST).await.unwrap();
+            repository
+                .record_applied(&id(app), MANIFEST, false)
+                .await
+                .unwrap();
         }
 
         let ids: Vec<String> = repository
@@ -284,13 +338,86 @@ routing:
         assert_eq!(ids, ["alpha", "mike", "zulu"]);
     }
 
+    #[tokio::test]
+    async fn records_an_app_as_running_by_default() {
+        let repository = repository();
+        repository
+            .record_applied(&id("hello"), MANIFEST, false)
+            .await
+            .unwrap();
+
+        assert!(!repository.desired().await.unwrap()[0].suspended);
+    }
+
+    #[tokio::test]
+    async fn records_an_app_that_was_applied_suspended() {
+        let repository = repository();
+        repository
+            .record_applied(&id("hello"), MANIFEST, true)
+            .await
+            .unwrap();
+
+        assert!(repository.desired().await.unwrap()[0].suspended);
+        assert!(
+            repository
+                .recorded(&id("hello"))
+                .await
+                .unwrap()
+                .unwrap()
+                .suspended
+        );
+    }
+
+    #[tokio::test]
+    async fn suspends_and_resumes_a_recorded_app() {
+        let repository = repository();
+        repository
+            .record_applied(&id("hello"), MANIFEST, false)
+            .await
+            .unwrap();
+
+        assert!(repository.set_suspended(&id("hello"), true).await.unwrap());
+        assert!(repository.desired().await.unwrap()[0].suspended);
+
+        assert!(repository.set_suspended(&id("hello"), false).await.unwrap());
+        assert!(!repository.desired().await.unwrap()[0].suspended);
+    }
+
+    /// Suspending is not applying: the manifest and the day the operator
+    /// applied it are still theirs, and come back unchanged.
+    #[tokio::test]
+    async fn suspending_leaves_the_manifest_and_applied_at_alone() {
+        let repository = repository();
+        repository
+            .record_applied(&id("hello"), MANIFEST, false)
+            .await
+            .unwrap();
+        let before = repository.recorded(&id("hello")).await.unwrap().unwrap();
+
+        repository.set_suspended(&id("hello"), true).await.unwrap();
+
+        let after = repository.recorded(&id("hello")).await.unwrap().unwrap();
+        assert_eq!(after.manifest, before.manifest);
+        assert_eq!(after.applied_at, before.applied_at);
+    }
+
+    #[tokio::test]
+    async fn suspending_an_unrecorded_app_says_there_was_none() {
+        assert!(
+            !repository()
+                .set_suspended(&id("ghost"), true)
+                .await
+                .unwrap()
+        );
+    }
+
     /// A record written by some other tool, or by a future spaceport with
     /// looser ids, must not take the rest of the apps down with it.
     #[tokio::test]
     async fn skips_a_record_whose_id_is_not_valid() {
         let repository = repository();
         repository
-            .record_applied(&id("hello"), MANIFEST)
+            .record_applied(&id("hello"), MANIFEST, false)
             .await
             .unwrap();
         repository

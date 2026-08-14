@@ -26,10 +26,45 @@ use crate::status::Status;
 ///
 /// Returns what the server said, which is text meant for whoever ran the
 /// command.
-pub async fn apply(endpoint: &OperatorEndpoint, id: &AppId, manifest: String) -> Result<String> {
-    let request = builder("PUT", &format!("/apps/{id}"))
+/// With `suspended`, the app is recorded and claims its hosts without being
+/// started.
+pub async fn apply(
+    endpoint: &OperatorEndpoint,
+    id: &AppId,
+    manifest: String,
+    suspended: bool,
+) -> Result<String> {
+    let uri = match suspended {
+        true => format!("/apps/{id}?suspended=true"),
+        false => format!("/apps/{id}"),
+    };
+    let request = builder("PUT", &uri)
         .header(http::header::CONTENT_TYPE, "application/yaml")
         .body(Full::new(Bytes::from(manifest)))?;
+
+    send_to(endpoint, request).await
+}
+
+/// Ask it to stop serving the app named `id`, keeping everything about it.
+///
+/// With `stop_container`, its container is stopped and kept rather than left
+/// running.
+pub async fn suspend(
+    endpoint: &OperatorEndpoint,
+    id: &AppId,
+    stop_container: bool,
+) -> Result<String> {
+    let uri = match stop_container {
+        true => format!("/apps/{id}/suspend?stop_container=true"),
+        false => format!("/apps/{id}/suspend"),
+    };
+
+    send_to(endpoint, builder("POST", &uri).body(Full::default())?).await
+}
+
+/// Ask it to serve the app named `id` again.
+pub async fn resume(endpoint: &OperatorEndpoint, id: &AppId) -> Result<String> {
+    let request = builder("POST", &format!("/apps/{id}/resume")).body(Full::default())?;
 
     send_to(endpoint, request).await
 }

@@ -31,6 +31,9 @@ pub struct Report {
     /// How many of them never had to be restarted, because their container was
     /// still running and was taken over as it was.
     pub adopted: usize,
+    /// Apps that were recorded as suspended, and so were claimed rather than
+    /// started.
+    pub suspended: Vec<AppId>,
     /// Apps that were recorded but could not be brought back, and why.
     pub failed: Vec<(AppId, String)>,
     /// Containers left over from a previous spaceport that no record claims.
@@ -41,7 +44,10 @@ impl Report {
     /// Whether anything at all had to be done. A first start on a clean host
     /// reconciles to nothing, and should say nothing.
     pub fn is_empty(&self) -> bool {
-        self.restored.is_empty() && self.failed.is_empty() && self.swept == 0
+        self.restored.is_empty()
+            && self.suspended.is_empty()
+            && self.failed.is_empty()
+            && self.swept == 0
     }
 }
 
@@ -68,9 +74,16 @@ pub async fn reconcile(applier: &Arc<Applier>) -> Result<Report> {
             }
         };
 
-        match applier.restore(record.id.clone(), manifest).await {
+        match applier
+            .restore(record.id.clone(), manifest, record.suspended)
+            .await
+        {
+            Ok(restored) if restored.was_suspended() => {
+                info!(app = %record.id, "app is suspended, claiming its hosts without starting it");
+                report.suspended.push(record.id.clone());
+            }
             Ok(restored) => {
-                let app = restored.app();
+                let Some(app) = restored.app() else { continue };
                 if restored.was_adopted() {
                     report.adopted += 1;
                 }
@@ -96,17 +109,17 @@ pub async fn reconcile(applier: &Arc<Applier>) -> Result<Report> {
 /// These are containers of apps that were destroyed while spaceport was down,
 /// or that a crash left behind mid-apply. Only ever spaceport's own: the list
 /// comes from the managed label, so nothing else on the host is in scope.
+///
+/// A suspended app's container is owned as much as a running one's — a stopped
+/// container is precisely what suspending with `--stop-container` leaves behind,
+/// and sweeping it would turn every restart into the relaunch that keeping it
+/// was meant to avoid.
 async fn sweep(applier: &Arc<Applier>) -> Result<usize> {
-    let running: Vec<_> = applier
-        .store()
-        .apps()
-        .iter()
-        .map(|app| app.container.clone())
-        .collect();
+    let claimed = applier.store().containers();
 
     let mut swept = 0;
     for container in applier.runtime().managed().await? {
-        if running.contains(&container.id) {
+        if claimed.contains(&container.id) {
             continue;
         }
 
@@ -131,7 +144,7 @@ mod tests {
     use super::*;
     use crate::app::AppStore;
     use crate::app::repository::AppRepository;
-    use crate::runtime::{Container, ContainerId, ContainerRuntime, Managed};
+    use crate::runtime::{Adopted, Container, ContainerId, ContainerRuntime, Managed};
     use crate::state::Db;
     use anyhow::bail;
     use async_trait::async_trait;
@@ -147,6 +160,10 @@ mod tests {
         /// Where each container it started was published, so a restart can find
         /// its way back to one.
         upstreams: Mutex<HashMap<ContainerId, SocketAddr>>,
+        /// The containers it has been asked to stop and keep. They are still in
+        /// `containers` — that is the whole point of stopping rather than
+        /// removing — but they have no address until they start again.
+        stopped: Mutex<Vec<ContainerId>>,
         launches: Mutex<usize>,
         refuse: Vec<String>,
     }
@@ -175,9 +192,9 @@ mod tests {
             Ok(Container { id, upstream })
         }
 
-        /// Whatever this runtime is still running under that app's name — which
-        /// is what a second `Applier` over the same runtime finds.
-        async fn adopt(&self, app: &AppId, _manifest: &AppManifest) -> Result<Option<Container>> {
+        /// Whatever this runtime still has under that app's name — which is
+        /// what a second `Applier` over the same runtime finds.
+        async fn adopt(&self, app: &AppId, _manifest: &AppManifest) -> Result<Option<Adopted>> {
             let containers = self.containers.lock().unwrap();
             let Some(found) = containers
                 .iter()
@@ -186,15 +203,43 @@ mod tests {
                 return Ok(None);
             };
 
+            if self.stopped.lock().unwrap().contains(&found.id) {
+                return Ok(Some(Adopted::Stopped(found.id.clone())));
+            }
+
             Ok(self
                 .upstreams
                 .lock()
                 .unwrap()
                 .get(&found.id)
-                .map(|upstream| Container {
-                    id: found.id.clone(),
-                    upstream: *upstream,
+                .map(|upstream| {
+                    Adopted::Running(Container {
+                        id: found.id.clone(),
+                        upstream: *upstream,
+                    })
                 }))
+        }
+
+        async fn stop(&self, id: &ContainerId) -> Result<()> {
+            self.stopped.lock().unwrap().push(id.clone());
+            // A stopped container is published nowhere.
+            self.upstreams.lock().unwrap().remove(id);
+
+            Ok(())
+        }
+
+        async fn start(&self, id: &ContainerId, _manifest: &AppManifest) -> Result<Container> {
+            self.stopped.lock().unwrap().retain(|stopped| stopped != id);
+
+            // A port of its own, so that a resume that trusted the address it
+            // had before this stopped would be caught.
+            let upstream = SocketAddr::from(([127, 0, 0, 1], 7000));
+            self.upstreams.lock().unwrap().insert(id.clone(), upstream);
+
+            Ok(Container {
+                id: id.clone(),
+                upstream,
+            })
         }
 
         async fn remove(&self, id: &ContainerId) -> Result<()> {
@@ -259,11 +304,11 @@ container:
         let runtime = Arc::new(FakeRuntime::default());
         let (applier, store, repository) = restarted(runtime, Db::in_memory().unwrap());
         repository
-            .record_applied(&id("hello"), &manifest("alpha.test"))
+            .record_applied(&id("hello"), &manifest("alpha.test"), false)
             .await
             .unwrap();
         repository
-            .record_applied(&id("other"), &manifest("beta.test"))
+            .record_applied(&id("other"), &manifest("beta.test"), false)
             .await
             .unwrap();
 
@@ -271,8 +316,8 @@ container:
 
         assert_eq!(report.restored, [id("hello"), id("other")]);
         assert!(report.failed.is_empty());
-        assert!(store.routes().lookup("alpha.test").is_some());
-        assert!(store.routes().lookup("beta.test").is_some());
+        assert!(store.routes().serving("alpha.test").is_some());
+        assert!(store.routes().serving("beta.test").is_some());
     }
 
     /// One app that cannot come back is one app down, not a spaceport that
@@ -285,11 +330,11 @@ container:
         });
         let (applier, store, repository) = restarted(runtime, Db::in_memory().unwrap());
         repository
-            .record_applied(&id("broken"), &manifest("alpha.test"))
+            .record_applied(&id("broken"), &manifest("alpha.test"), false)
             .await
             .unwrap();
         repository
-            .record_applied(&id("healthy"), &manifest("beta.test"))
+            .record_applied(&id("healthy"), &manifest("beta.test"), false)
             .await
             .unwrap();
 
@@ -298,7 +343,7 @@ container:
         assert_eq!(report.restored, [id("healthy")]);
         assert_eq!(report.failed.len(), 1);
         assert_eq!(report.failed[0].0, id("broken"));
-        assert!(store.routes().lookup("beta.test").is_some());
+        assert!(store.routes().serving("beta.test").is_some());
         // And the app that failed is still recorded, so fixing the host and
         // restarting is enough to bring it back.
         assert_eq!(repository.desired().await.unwrap().len(), 2);
@@ -309,7 +354,7 @@ container:
         let runtime = Arc::new(FakeRuntime::default());
         let (applier, store, repository) = restarted(runtime, Db::in_memory().unwrap());
         repository
-            .record_applied(&id("future"), "schema_version: 99\n")
+            .record_applied(&id("future"), "schema_version: 99\n", false)
             .await
             .unwrap();
 
@@ -333,7 +378,7 @@ container:
         });
         let (applier, _, repository) = restarted(runtime.clone(), Db::in_memory().unwrap());
         repository
-            .record_applied(&id("hello"), &manifest("alpha.test"))
+            .record_applied(&id("hello"), &manifest("alpha.test"), false)
             .await
             .unwrap();
 
@@ -371,13 +416,15 @@ container:
         let db = Db::in_memory().unwrap();
         let runtime = Arc::new(FakeRuntime::default());
         let (applier, _, _) = restarted(runtime.clone(), db.clone());
-        let before = applier
+        let applied = applier
             .apply(
                 id("hello"),
                 AppManifest::parse(&manifest("alpha.test")).unwrap(),
+                false,
             )
             .await
             .unwrap();
+        let before = applied.running().unwrap();
 
         // A new spaceport over the same database and the same engine.
         let (restarted_applier, store, _) = restarted(runtime.clone(), db);
@@ -386,7 +433,7 @@ container:
         assert_eq!(report.restored, [id("hello")]);
         assert_eq!(report.adopted, 1);
         assert_eq!(report.swept, 0);
-        let after = store.routes().lookup("alpha.test").unwrap().clone();
+        let after = store.routes().serving("alpha.test").unwrap().clone();
         assert_eq!(after.container, before.container);
         assert_eq!(after.upstream, before.upstream);
         // Nothing was started to get there: the app never went down.
@@ -400,13 +447,15 @@ container:
         let db = Db::in_memory().unwrap();
         let runtime = Arc::new(FakeRuntime::default());
         let (applier, _, _) = restarted(runtime.clone(), db.clone());
-        let before = applier
+        let applied = applier
             .apply(
                 id("hello"),
                 AppManifest::parse(&manifest("alpha.test")).unwrap(),
+                false,
             )
             .await
             .unwrap();
+        let before = applied.running().unwrap();
         runtime.remove(&before.container).await.unwrap();
 
         let (restarted_applier, store, _) = restarted(runtime.clone(), db);
@@ -416,8 +465,118 @@ container:
         assert_eq!(report.adopted, 0);
         assert_eq!(*runtime.launches.lock().unwrap(), 2);
         assert_ne!(
-            store.routes().lookup("alpha.test").unwrap().container,
+            store.routes().serving("alpha.test").unwrap().container,
             before.container
         );
+    }
+
+    /// Suspension is intent, and a restart of spaceport is not a reason to
+    /// overrule it: the app comes back claiming its hosts and not serving.
+    #[tokio::test]
+    async fn a_suspended_app_comes_back_suspended() {
+        let db = Db::in_memory().unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _, _) = restarted(runtime.clone(), db.clone());
+        applier
+            .apply(
+                id("hello"),
+                AppManifest::parse(&manifest("alpha.test")).unwrap(),
+                false,
+            )
+            .await
+            .unwrap();
+        applier.suspend(&id("hello"), true).await.unwrap();
+
+        let (restarted_applier, store, _) = restarted(runtime.clone(), db);
+        let report = reconcile(&restarted_applier).await.unwrap();
+
+        assert_eq!(report.suspended, [id("hello")]);
+        assert!(report.restored.is_empty());
+        assert!(store.routes().serving("alpha.test").is_none());
+        assert!(store.routes().lookup("alpha.test").is_some());
+        // Nothing was started to bring it back, and nothing was swept.
+        assert_eq!(*runtime.launches.lock().unwrap(), 1);
+        assert_eq!(report.swept, 0);
+    }
+
+    /// The container a suspend stopped is spoken for. Sweeping it would turn
+    /// every restart into the relaunch that keeping it was meant to avoid.
+    #[tokio::test]
+    async fn a_sweep_spares_the_container_a_suspended_app_kept() {
+        let db = Db::in_memory().unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _, _) = restarted(runtime.clone(), db.clone());
+        let applied = applier
+            .apply(
+                id("hello"),
+                AppManifest::parse(&manifest("alpha.test")).unwrap(),
+                false,
+            )
+            .await
+            .unwrap();
+        let before = applied.running().unwrap().container.clone();
+        applier.suspend(&id("hello"), true).await.unwrap();
+
+        let (restarted_applier, _, _) = restarted(runtime.clone(), db);
+        let report = reconcile(&restarted_applier).await.unwrap();
+
+        assert_eq!(report.swept, 0);
+        let left = runtime.containers.lock().unwrap().clone();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, before);
+    }
+
+    /// And it is still the container it kept that comes back when the app is
+    /// resumed after the restart.
+    #[tokio::test]
+    async fn resuming_after_a_restart_starts_the_container_it_kept() {
+        let db = Db::in_memory().unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _, _) = restarted(runtime.clone(), db.clone());
+        let applied = applier
+            .apply(
+                id("hello"),
+                AppManifest::parse(&manifest("alpha.test")).unwrap(),
+                false,
+            )
+            .await
+            .unwrap();
+        let before = applied.running().unwrap().container.clone();
+        applier.suspend(&id("hello"), true).await.unwrap();
+
+        let (restarted_applier, store, _) = restarted(runtime.clone(), db);
+        reconcile(&restarted_applier).await.unwrap();
+        let after = restarted_applier.resume(&id("hello")).await.unwrap();
+
+        assert_eq!(after.container, before);
+        // No relaunch: the container outlived both the suspend and the restart.
+        assert_eq!(*runtime.launches.lock().unwrap(), 1);
+        assert!(store.routes().serving("alpha.test").is_some());
+    }
+
+    /// An app applied straight into suspension has no container at all, and a
+    /// restart must bring back the claim without inventing one.
+    #[tokio::test]
+    async fn an_app_applied_suspended_survives_a_restart() {
+        let db = Db::in_memory().unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _, _) = restarted(runtime.clone(), db.clone());
+        applier
+            .apply(
+                id("hello"),
+                AppManifest::parse(&manifest("alpha.test")).unwrap(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let (restarted_applier, store, _) = restarted(runtime.clone(), db);
+        let report = reconcile(&restarted_applier).await.unwrap();
+
+        assert_eq!(report.suspended, [id("hello")]);
+        assert_eq!(*runtime.launches.lock().unwrap(), 0);
+        assert!(store.routes().lookup("alpha.test").is_some());
+        // And certificate acquisition still hears about the host.
+        assert!(store.routes().hosts().contains("alpha.test"));
     }
 }

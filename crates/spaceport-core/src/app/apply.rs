@@ -6,17 +6,25 @@
 //! because the alternative is starting a container for an app that was never
 //! going to be reachable, having already torn down the one it replaced on the
 //! way in.
+//!
+//! Suspending is the fourth verb, and the only one that leaves an app halfway:
+//! recorded, claiming its hosts, not served. Everything it does happens in the
+//! same order a destroy does — the routes go first, so nothing is forwarded to
+//! a container that is about to stop — and the difference is only in how far it
+//! goes. A destroy forgets the app and deletes its container; a suspend
+//! remembers both.
 
 use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::anyhow;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::repository::AppRepository;
+use super::store::{Removed, Suspended};
 use super::{App, AppId, AppManifest, AppStore, health};
-use crate::runtime::{Container, ContainerRuntime};
+use crate::runtime::{Adopted, Container, ContainerRuntime};
 
 /// Why an apply did not happen. The distinction is worth keeping because the
 /// operator interface answers differently: a conflict is the operator's to fix,
@@ -58,28 +66,127 @@ impl fmt::Display for DestroyError {
 
 impl std::error::Error for DestroyError {}
 
+/// Why an app could not be suspended.
+#[derive(Debug)]
+pub enum SuspendError {
+    /// Nothing is recorded under that id.
+    Unknown(anyhow::Error),
+    /// Its container would not stop.
+    Failed(anyhow::Error),
+}
+
+impl fmt::Display for SuspendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown(error) | Self::Failed(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
+impl std::error::Error for SuspendError {}
+
+/// Why an app could not be resumed.
+#[derive(Debug)]
+pub enum ResumeError {
+    /// Nothing is recorded under that id.
+    Unknown(anyhow::Error),
+    /// Another app claimed one of its hosts. Only reachable for an app that was
+    /// suspended by a spaceport that did not hold its hosts for it.
+    Conflict(anyhow::Error),
+    /// It could not be started.
+    Failed(anyhow::Error),
+}
+
+impl fmt::Display for ResumeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown(error) | Self::Conflict(error) | Self::Failed(error) => {
+                write!(f, "{error:#}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ResumeError {}
+
+impl From<ApplyError> for ResumeError {
+    fn from(error: ApplyError) -> Self {
+        match error {
+            ApplyError::Conflict(error) => Self::Conflict(error),
+            ApplyError::Failed(error) => Self::Failed(error),
+        }
+    }
+}
+
+/// What an apply left behind.
+///
+/// The suspended side is boxed: a running app is behind an `Arc` and a
+/// suspended one carries its whole manifest, and there is no reason for the
+/// common case to pay for the size of the other.
+#[derive(Debug, Clone)]
+pub enum Applied {
+    /// Started and serving.
+    Running(Arc<App>),
+    /// Recorded and claiming its hosts, deliberately not started.
+    Suspended(Box<Suspended>),
+}
+
+impl Applied {
+    pub fn id(&self) -> &AppId {
+        match self {
+            Self::Running(app) => &app.id,
+            Self::Suspended(app) => &app.id,
+        }
+    }
+
+    /// The app if it is running, which a suspended one is not.
+    pub fn running(&self) -> Option<&Arc<App>> {
+        match self {
+            Self::Running(app) => Some(app),
+            Self::Suspended(_) => None,
+        }
+    }
+}
+
 /// How an app came back at a restart.
 ///
-/// Both mean the app is running and routed; they differ in what it cost. The
-/// distinction is worth reporting, because "adopted" is the answer that says a
-/// restart of spaceport did not interrupt anybody's traffic.
+/// The first two mean the app is running and routed; they differ in what it
+/// cost. The distinction is worth reporting, because "adopted" is the answer
+/// that says a restart of spaceport did not interrupt anybody's traffic.
 #[derive(Debug)]
 pub enum Restored {
     /// Its container was still running and was taken over untouched.
     Adopted(Arc<App>),
     /// There was nothing to take over, so it was started again.
     Relaunched(Arc<App>),
+    /// It was recorded as suspended, and was put back the way it was left
+    /// rather than started. Suspension is intent, and a restart of spaceport is
+    /// not a reason to overrule it.
+    Suspended(AppId),
 }
 
 impl Restored {
-    pub fn app(&self) -> &Arc<App> {
+    pub fn id(&self) -> &AppId {
         match self {
-            Self::Adopted(app) | Self::Relaunched(app) => app,
+            Self::Adopted(app) | Self::Relaunched(app) => &app.id,
+            Self::Suspended(id) => id,
+        }
+    }
+
+    /// The app if it is running again, which a suspended one is not.
+    pub fn app(&self) -> Option<&Arc<App>> {
+        match self {
+            Self::Adopted(app) | Self::Relaunched(app) => Some(app),
+            Self::Suspended(_) => None,
         }
     }
 
     pub fn was_adopted(&self) -> bool {
         matches!(self, Self::Adopted(_))
+    }
+
+    pub fn was_suspended(&self) -> bool {
+        matches!(self, Self::Suspended(_))
     }
 }
 
@@ -125,7 +232,7 @@ impl Applier {
     /// from the store and nothing will ever route to that container again —
     /// the error names it, because by then it is a container only the operator
     /// can clean up.
-    pub async fn destroy(&self, id: &AppId) -> Result<Arc<App>, DestroyError> {
+    pub async fn destroy(&self, id: &AppId) -> Result<Removed, DestroyError> {
         let app = self
             .store
             .remove(id)
@@ -138,15 +245,153 @@ impl Applier {
             warn!(app = %id, %error, "could not forget the app, it will come back on restart");
         }
 
-        self.runtime.remove(&app.container).await.map_err(|error| {
-            DestroyError::Failed(error.context(format!(
-                "app `{id}` is no longer routed, but its container {} is still there",
-                app.container
-            )))
-        })?;
-        info!(app = %id, container = %app.container, "app destroyed");
+        // A suspended app that was applied and never started has no container,
+        // and destroying it is only the record and the claim on its hosts.
+        if let Some(container) = app.container() {
+            self.runtime.remove(container).await.map_err(|error| {
+                DestroyError::Failed(error.context(format!(
+                    "app `{id}` is no longer routed, but its container {container} is still there"
+                )))
+            })?;
+            info!(app = %id, container = %container, "app destroyed");
+        } else {
+            info!(app = %id, "app destroyed, it had no container");
+        }
 
         Ok(app)
+    }
+
+    /// Stop serving the app named `id`, keeping everything about it.
+    ///
+    /// The routes go first, as in a destroy: from the moment this returns, no
+    /// request reaches the app. What it does *not* do is give up its hosts —
+    /// they stay claimed, so no other app can take them and so its certificates
+    /// go on being renewed while it is down.
+    ///
+    /// With `stop_container`, its container is stopped too, and kept. Without,
+    /// the container is left running and only stops receiving traffic, which
+    /// makes suspending and resuming cost nothing.
+    ///
+    /// Suspending an app that is already suspended is not an error: it is asked
+    /// for the same state it is in. It will still stop the container if that is
+    /// now being asked for and it is still running.
+    pub async fn suspend(&self, id: &AppId, stop_container: bool) -> Result<(), SuspendError> {
+        let held = match self.store.get(id) {
+            // Unroute first, holding on to where its container was: until the
+            // engine says otherwise, it is running and reachable there.
+            Some(app) => {
+                let container = Adopted::Running(Container {
+                    id: app.container.clone(),
+                    upstream: app.upstream,
+                });
+                self.store.suspend(id, Some(container.clone()));
+                info!(app = %id, container = %app.container, "app suspended");
+
+                Some(container)
+            }
+            None => match self.store.suspended(id) {
+                Some(app) => app.container,
+                None => {
+                    return Err(SuspendError::Unknown(anyhow!(
+                        "no app named `{id}` is running or suspended"
+                    )));
+                }
+            },
+        };
+
+        if stop_container && let Some(Adopted::Running(container)) = held {
+            self.runtime.stop(&container.id).await.map_err(|error| {
+                SuspendError::Failed(error.context(format!(
+                    "app `{id}` is suspended, but its container {} would not stop",
+                    container.id
+                )))
+            })?;
+            self.store.stopped(id);
+            info!(app = %id, container = %container.id, "the suspended app's container was stopped");
+        }
+
+        if let Err(error) = self.repository.set_suspended(id, true).await {
+            warn!(app = %id, %error, "the app is suspended but that was not recorded, so it will come back running");
+        }
+
+        Ok(())
+    }
+
+    /// Serve the app named `id` again.
+    ///
+    /// Where its container survived — stopped by a suspend, or left running by
+    /// one — that container is what comes back, started again if it needs to be
+    /// and checked before any traffic reaches it. An app whose container is
+    /// gone, or no longer matches its manifest, is started fresh, which is what
+    /// resuming used to cost every app.
+    ///
+    /// Resuming an app that is already running is not an error, for the same
+    /// reason suspending a suspended one is not.
+    pub async fn resume(&self, id: &AppId) -> Result<Arc<App>, ResumeError> {
+        if let Some(app) = self.store.get(id) {
+            return Ok(app);
+        }
+
+        let suspended = self.store.suspended(id).ok_or_else(|| {
+            ResumeError::Unknown(anyhow!("no app named `{id}` is running or suspended"))
+        })?;
+        let manifest = suspended.manifest;
+
+        // Asked of the engine rather than taken from the store: what spaceport
+        // last saw is not what is true after somebody has used `docker` by
+        // hand, and this is the moment it costs something to be wrong.
+        let app = match self.reclaim(id, &manifest).await {
+            Some(app) => app,
+            None => self.start(id.clone(), manifest).await?,
+        };
+
+        if let Err(error) = self.repository.set_suspended(id, false).await {
+            warn!(app = %id, %error, "the app is running but is still recorded as suspended, so it will not come back at a restart");
+        }
+        info!(app = %id, container = %app.container, upstream = %app.upstream, "app resumed");
+
+        Ok(app)
+    }
+
+    /// Bring back the container a suspended app was left holding, if it still
+    /// has one worth bringing back.
+    ///
+    /// Every way this can fail is a way of saying "start a fresh one instead",
+    /// so it answers with an app or with nothing and never with an error.
+    async fn reclaim(&self, id: &AppId, manifest: &AppManifest) -> Option<Arc<App>> {
+        let held = match self.runtime.adopt(id, manifest).await {
+            Ok(Some(held)) => held,
+            Ok(None) => return None,
+            Err(error) => {
+                warn!(app = %id, %error, "could not tell what container the suspended app was left with");
+                return None;
+            }
+        };
+
+        let container = match held {
+            Adopted::Running(container) => {
+                info!(app = %id, container = %container.id, "the suspended app's container never stopped");
+                container
+            }
+            Adopted::Stopped(container) => match self.runtime.start(&container, manifest).await {
+                Ok(container) => container,
+                Err(error) => {
+                    warn!(app = %id, container = %container, %error, "the container the suspended app kept would not start, starting a new one");
+                    return None;
+                }
+            },
+        };
+
+        match self.route(id.clone(), manifest.clone(), container).await {
+            Ok(app) => Some(app),
+            // `route` has already taken it back down. Whatever is wrong with
+            // it, a container started fresh from the same manifest is the best
+            // answer spaceport has — the same call a restart makes.
+            Err(error) => {
+                warn!(app = %id, %error, "the container the suspended app kept is not serving, starting a new one");
+                None
+            }
+        }
     }
 
     /// Start `manifest` as the app named `id` and route traffic to it,
@@ -156,19 +401,82 @@ impl Applier {
     /// gone before the new one is up, so an apply that fails halfway leaves the
     /// app down. What it does guarantee is that it leaves nothing behind — a
     /// container that ends up unroutable is removed rather than left running.
-    pub async fn apply(&self, id: AppId, manifest: AppManifest) -> Result<Arc<App>, ApplyError> {
+    /// Applying a suspended app records it and claims its hosts without ever
+    /// starting it. So does applying to an app that is *already* suspended,
+    /// whatever `suspend` says: an apply changes what an app would run, not
+    /// whether it is being run. Only [`Applier::resume`] does that, and it is
+    /// the deliberate step that makes staging a new manifest and cutting over
+    /// to it two decisions rather than one.
+    pub async fn apply(
+        &self,
+        id: AppId,
+        manifest: AppManifest,
+        suspend: bool,
+    ) -> Result<Applied, ApplyError> {
         let recorded = manifest.source_text().to_owned();
-        let app = self.start(id, manifest).await?;
+        let held = self.store.suspended(&id);
+        let suspend = suspend || held.is_some();
+
+        let applied = if suspend {
+            self.stage(id, manifest, held).await?
+        } else {
+            Applied::Running(self.start(id, manifest).await?)
+        };
 
         // Recorded last, and only on success: a manifest that never ran is not
         // something to bring back at the next start. The cost is a window —
         // from here to the commit — in which a successful apply can be lost to
         // a crash, and the answer to that is to apply it again.
-        if let Err(error) = self.repository.record_applied(&app.id, &recorded).await {
-            warn!(app = %app.id, %error, "the app is running but was not recorded, so it will not survive a restart");
+        if let Err(error) = self
+            .repository
+            .record_applied(applied.id(), &recorded, suspend)
+            .await
+        {
+            warn!(app = %applied.id(), %error, "the app was not recorded, so it will not survive a restart");
         }
 
-        Ok(app)
+        Ok(applied)
+    }
+
+    /// Claim an app's hosts for a manifest without starting it.
+    ///
+    /// Whatever container the app had goes, because it was built from the
+    /// manifest this one replaces. Keeping it would mean a resume that quietly
+    /// brought back the old image, which is the one thing an operator staging a
+    /// new manifest is entitled to assume cannot happen.
+    async fn stage(
+        &self,
+        id: AppId,
+        manifest: AppManifest,
+        held: Option<Suspended>,
+    ) -> Result<Applied, ApplyError> {
+        self.free_of_conflict(&id, &manifest)?;
+
+        // Either the container of the app it is replacing while it runs, or the
+        // one a previous suspended manifest was left holding.
+        let previous = held
+            .and_then(|app| app.container)
+            .map(|container| container.id().clone())
+            .or_else(|| self.store.get(&id).map(|app| app.container.clone()));
+
+        let suspended = Suspended {
+            id: id.clone(),
+            manifest,
+            container: None,
+        };
+        self.store
+            .insert_suspended(suspended.clone())
+            .map_err(ApplyError::Conflict)?;
+
+        if let Some(container) = previous {
+            // Worth saying, not worth failing for: the app is staged either
+            // way, and a container nothing routes to is the next sweep's.
+            if let Err(error) = self.runtime.remove(&container).await {
+                warn!(app = %id, container = %container, %error, "could not remove the container of the manifest this one replaces");
+            }
+        }
+
+        Ok(Applied::Suspended(Box::new(suspended)))
     }
 
     /// Bring back an app that is *already* recorded, without recording it again.
@@ -182,11 +490,20 @@ impl Applier {
     /// has to be found, checked and routed to. Everything that is not that —
     /// no container, the wrong container, or one that has stopped answering —
     /// is a relaunch, which is what a restart used to cost every app.
-    pub async fn restore(&self, id: AppId, manifest: AppManifest) -> Result<Restored, ApplyError> {
+    pub async fn restore(
+        &self,
+        id: AppId,
+        manifest: AppManifest,
+        suspended: bool,
+    ) -> Result<Restored, ApplyError> {
         self.free_of_conflict(&id, &manifest)?;
 
+        if suspended {
+            return self.restore_suspended(id, manifest).await;
+        }
+
         match self.runtime.adopt(&id, &manifest).await {
-            Ok(Some(container)) => {
+            Ok(Some(Adopted::Running(container))) => {
                 info!(app = %id, container = %container.id, upstream = %container.upstream, "the container from before is still running");
 
                 match self.route(id.clone(), manifest.clone(), container).await {
@@ -200,6 +517,12 @@ impl Applier {
                     }
                 }
             }
+            // A container that exited while spaceport was down has nothing
+            // behind it. Starting it again is what `launch` is for, and it is
+            // the same work as starting a new one.
+            Ok(Some(Adopted::Stopped(container))) => {
+                debug!(app = %id, container = %container, "the container from before is not running");
+            }
             Ok(None) => {}
             // Adoption is an optimisation, and a failed one costs a relaunch
             // rather than an app.
@@ -209,6 +532,43 @@ impl Applier {
         }
 
         self.start(id, manifest).await.map(Restored::Relaunched)
+    }
+
+    /// Put a suspended app back the way it was left: claiming its hosts, still
+    /// holding whatever container it had, and not served.
+    ///
+    /// Nothing is started and nothing is stopped. A container left running by a
+    /// suspend without `--stop-container` is still running after a restart of
+    /// spaceport, which is the same promise adoption makes to every other app.
+    async fn restore_suspended(
+        &self,
+        id: AppId,
+        manifest: AppManifest,
+    ) -> Result<Restored, ApplyError> {
+        // Only a container this manifest would have produced: `adopt` checks
+        // spaceport's label and the image, so a suspended app does not come
+        // back holding on to somebody else's container.
+        let container = match self.runtime.adopt(&id, &manifest).await {
+            Ok(container) => container,
+            Err(error) => {
+                warn!(app = %id, %error, "could not tell what container the suspended app was left with");
+                None
+            }
+        };
+
+        if let Some(container) = &container {
+            debug!(app = %id, container = %container.id(), "the suspended app is still holding its container");
+        }
+
+        self.store
+            .insert_suspended(Suspended {
+                id: id.clone(),
+                manifest,
+                container,
+            })
+            .map_err(ApplyError::Conflict)?;
+
+        Ok(Restored::Suspended(id))
     }
 
     /// Everything an apply does except remember it.
@@ -229,7 +589,7 @@ impl Applier {
     fn free_of_conflict(&self, id: &AppId, manifest: &AppManifest) -> Result<(), ApplyError> {
         match self.store.conflict(id, &manifest.routing.hosts) {
             Some((host, owner)) => Err(ApplyError::Conflict(anyhow!(
-                "host `{host}` is already served by app `{owner}`"
+                "host `{host}` is already claimed by app `{owner}`"
             ))),
             None => Ok(()),
         }
@@ -294,6 +654,7 @@ mod tests {
     use crate::state::Db;
     use anyhow::{Result, bail};
     use async_trait::async_trait;
+    use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::Mutex;
 
@@ -303,17 +664,67 @@ mod tests {
     struct FakeRuntime {
         launched: Mutex<Vec<AppId>>,
         removed: Mutex<Vec<ContainerId>>,
+        /// Containers this runtime has been asked to stop and keep, and the
+        /// ones it has been asked to start again.
+        stopped: Mutex<Vec<ContainerId>>,
+        started: Mutex<Vec<ContainerId>>,
+        /// The container it is running for each app, so that a resume has
+        /// something to find its way back to.
+        running: Mutex<HashMap<AppId, Container>>,
         refuse: bool,
         refuse_removal: bool,
+        refuse_stop: bool,
         /// What the spaceport before this one is pretending to have left
-        /// running, for every app.
+        /// running, for every app. Overrides `running` where it is set.
         survivor: Option<Container>,
+    }
+
+    impl FakeRuntime {
+        /// Where a container it started again is published. Deliberately not
+        /// the port it had, so that a resume which trusted the old address
+        /// rather than asking the engine would be caught.
+        const RESTARTED_PORT: u16 = 7777;
     }
 
     #[async_trait]
     impl ContainerRuntime for FakeRuntime {
-        async fn adopt(&self, _app: &AppId, _manifest: &AppManifest) -> Result<Option<Container>> {
-            Ok(self.survivor.clone())
+        async fn adopt(&self, app: &AppId, _manifest: &AppManifest) -> Result<Option<Adopted>> {
+            let found = match self.survivor.clone() {
+                Some(survivor) => survivor,
+                None => match self.running.lock().unwrap().get(app).cloned() {
+                    Some(container) => container,
+                    None => return Ok(None),
+                },
+            };
+            if self.removed.lock().unwrap().contains(&found.id) {
+                return Ok(None);
+            }
+
+            Ok(Some(
+                match self.stopped.lock().unwrap().contains(&found.id) {
+                    true => Adopted::Stopped(found.id),
+                    false => Adopted::Running(found),
+                },
+            ))
+        }
+
+        async fn stop(&self, id: &ContainerId) -> Result<()> {
+            if self.refuse_stop {
+                bail!("that container is staying up");
+            }
+            self.stopped.lock().unwrap().push(id.clone());
+
+            Ok(())
+        }
+
+        async fn start(&self, id: &ContainerId, _manifest: &AppManifest) -> Result<Container> {
+            self.stopped.lock().unwrap().retain(|stopped| stopped != id);
+            self.started.lock().unwrap().push(id.clone());
+
+            Ok(Container {
+                id: id.clone(),
+                upstream: SocketAddr::from(([127, 0, 0, 1], Self::RESTARTED_PORT)),
+            })
         }
 
         async fn launch(&self, app: &AppId, _manifest: &AppManifest) -> Result<Container> {
@@ -325,10 +736,16 @@ mod tests {
 
             // A different port per launch, so a replacement is visible.
             let port = 9000 + u16::try_from(launched.len()).unwrap();
-            Ok(Container {
+            let container = Container {
                 id: ContainerId::new(format!("{app}-{port}")),
                 upstream: SocketAddr::from(([127, 0, 0, 1], port)),
-            })
+            };
+            self.running
+                .lock()
+                .unwrap()
+                .insert(app.clone(), container.clone());
+
+            Ok(container)
         }
 
         async fn remove(&self, id: &ContainerId) -> Result<()> {
@@ -376,6 +793,14 @@ container:
         .unwrap()
     }
 
+    /// The app an apply started, for the tests that are not about suspension.
+    fn started(applied: Applied) -> Arc<App> {
+        match applied {
+            Applied::Running(app) => app,
+            Applied::Suspended(app) => panic!("app `{}` was suspended, not started", app.id),
+        }
+    }
+
     fn applier(runtime: Arc<FakeRuntime>) -> (Applier, Arc<AppStore>) {
         let store = Arc::new(AppStore::new());
         let repository = AppRepository::new(Db::in_memory().unwrap());
@@ -388,14 +813,20 @@ container:
         let runtime = Arc::new(FakeRuntime::default());
         let (applier, store) = applier(runtime.clone());
 
-        let app = applier
-            .apply("hello".parse().unwrap(), manifest("alpha.test, beta.test"))
-            .await
-            .unwrap();
+        let app = started(
+            applier
+                .apply(
+                    "hello".parse().unwrap(),
+                    manifest("alpha.test, beta.test"),
+                    false,
+                )
+                .await
+                .unwrap(),
+        );
 
         assert_eq!(app.upstream.port(), 9001);
-        assert_eq!(store.routes().lookup("alpha.test").unwrap().id, app.id);
-        assert_eq!(store.routes().lookup("beta.test").unwrap().id, app.id);
+        assert_eq!(store.routes().serving("alpha.test").unwrap().id, app.id);
+        assert_eq!(store.routes().serving("beta.test").unwrap().id, app.id);
         assert_eq!(runtime.launched.lock().unwrap().len(), 1);
     }
 
@@ -405,17 +836,22 @@ container:
         let (applier, store) = applier(runtime.clone());
 
         applier
-            .apply("hello".parse().unwrap(), manifest("alpha.test"))
+            .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
             .await
             .unwrap();
         applier
-            .apply("hello".parse().unwrap(), manifest("alpha.test"))
+            .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
             .await
             .unwrap();
 
         assert_eq!(store.apps().len(), 1);
         assert_eq!(
-            store.routes().lookup("alpha.test").unwrap().upstream.port(),
+            store
+                .routes()
+                .serving("alpha.test")
+                .unwrap()
+                .upstream
+                .port(),
             9002
         );
     }
@@ -425,17 +861,17 @@ container:
         let runtime = Arc::new(FakeRuntime::default());
         let (applier, store) = applier(runtime.clone());
         applier
-            .apply("hello".parse().unwrap(), manifest("alpha.test"))
+            .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
             .await
             .unwrap();
 
         let error = applier
-            .apply("other".parse().unwrap(), manifest("alpha.test"))
+            .apply("other".parse().unwrap(), manifest("alpha.test"), false)
             .await
             .unwrap_err();
 
         assert!(matches!(error, ApplyError::Conflict(_)));
-        assert!(error.to_string().contains("already served by app `hello`"));
+        assert!(error.to_string().contains("already claimed by app `hello`"));
         // The point of checking first: no container was started for it.
         assert_eq!(runtime.launched.lock().unwrap().len(), 1);
         assert_eq!(store.apps().len(), 1);
@@ -471,13 +907,14 @@ container:
             .apply(
                 "hello".parse().unwrap(),
                 manifest_awaiting_readiness("alpha.test"),
+                false,
             )
             .await
             .unwrap_err();
 
         assert!(matches!(error, ApplyError::Failed(_)));
         assert!(error.to_string().contains("never became ready"), "{error}");
-        assert!(store.routes().lookup("alpha.test").is_none());
+        assert!(store.routes().serving("alpha.test").is_none());
         assert!(store.apps().is_empty());
         // And the container it started is not left behind.
         assert_eq!(runtime.removed.lock().unwrap().len(), 1);
@@ -488,7 +925,7 @@ container:
         let runtime = Arc::new(FakeRuntime::default());
         let (applier, store) = applier(runtime.clone());
         applier
-            .apply("hello".parse().unwrap(), manifest("alpha.test"))
+            .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
             .await
             .unwrap();
 
@@ -496,6 +933,7 @@ container:
             .apply(
                 "hello".parse().unwrap(),
                 manifest_awaiting_readiness("alpha.test"),
+                false,
             )
             .await
             .unwrap_err();
@@ -503,7 +941,12 @@ container:
         // The route still points at the old container, which the runtime has
         // in fact already replaced — see the note on `apply`.
         assert_eq!(
-            store.routes().lookup("alpha.test").unwrap().upstream.port(),
+            store
+                .routes()
+                .serving("alpha.test")
+                .unwrap()
+                .upstream
+                .port(),
             9001
         );
     }
@@ -512,16 +955,18 @@ container:
     async fn destroying_an_app_stops_it_and_drops_its_routes() {
         let runtime = Arc::new(FakeRuntime::default());
         let (applier, store) = applier(runtime.clone());
-        let app = applier
-            .apply("hello".parse().unwrap(), manifest("alpha.test"))
-            .await
-            .unwrap();
+        let app = started(
+            applier
+                .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
+                .await
+                .unwrap(),
+        );
 
         let destroyed = applier.destroy(&"hello".parse().unwrap()).await.unwrap();
 
-        assert_eq!(destroyed.id, app.id);
+        assert_eq!(*destroyed.id(), app.id);
         assert!(store.apps().is_empty());
-        assert!(store.routes().lookup("alpha.test").is_none());
+        assert!(store.routes().serving("alpha.test").is_none());
         assert_eq!(
             *runtime.removed.lock().unwrap(),
             std::slice::from_ref(&app.container)
@@ -550,7 +995,7 @@ container:
         let runtime = Arc::new(FakeRuntime::default());
         let (applier, store) = applier(runtime.clone());
         applier
-            .apply("hello".parse().unwrap(), manifest("alpha.test"))
+            .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
             .await
             .unwrap();
         let runtime = Arc::new(FakeRuntime {
@@ -571,7 +1016,7 @@ container:
         assert!(matches!(error, DestroyError::Failed(_)));
         assert!(error.to_string().contains("is still there"), "{error}");
         assert!(store.apps().is_empty());
-        assert!(store.routes().lookup("alpha.test").is_none());
+        assert!(store.routes().serving("alpha.test").is_none());
     }
 
     #[tokio::test]
@@ -581,7 +1026,7 @@ container:
         let manifest = manifest("alpha.test");
 
         applier
-            .apply("hello".parse().unwrap(), manifest.clone())
+            .apply("hello".parse().unwrap(), manifest.clone(), false)
             .await
             .unwrap();
 
@@ -602,7 +1047,7 @@ container:
         let (applier, _) = applier(runtime);
 
         applier
-            .apply("hello".parse().unwrap(), manifest("alpha.test"))
+            .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
             .await
             .unwrap_err();
 
@@ -614,7 +1059,7 @@ container:
         let runtime = Arc::new(FakeRuntime::default());
         let (applier, _) = applier(runtime);
         applier
-            .apply("hello".parse().unwrap(), manifest("alpha.test"))
+            .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
             .await
             .unwrap();
 
@@ -630,7 +1075,7 @@ container:
         let runtime = Arc::new(FakeRuntime::default());
         let (applier, store) = applier(runtime);
         applier
-            .apply("hello".parse().unwrap(), manifest("alpha.test"))
+            .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
             .await
             .unwrap();
         let applied_at = applier.repository().desired().await.unwrap()[0]
@@ -638,7 +1083,7 @@ container:
             .clone();
 
         applier
-            .restore("hello".parse().unwrap(), manifest("alpha.test"))
+            .restore("hello".parse().unwrap(), manifest("alpha.test"), false)
             .await
             .unwrap();
 
@@ -646,7 +1091,7 @@ container:
         assert_eq!(desired.len(), 1);
         assert_eq!(desired[0].applied_at, applied_at);
         // It is running all the same.
-        assert!(store.routes().lookup("alpha.test").is_some());
+        assert!(store.routes().serving("alpha.test").is_some());
     }
 
     /// The point of adoption: the app that was running before the restart is
@@ -664,14 +1109,14 @@ container:
         let (applier, store) = applier(runtime.clone());
 
         let restored = applier
-            .restore("hello".parse().unwrap(), manifest("alpha.test"))
+            .restore("hello".parse().unwrap(), manifest("alpha.test"), false)
             .await
             .unwrap();
 
         assert!(restored.was_adopted(), "{restored:?}");
-        assert_eq!(restored.app().container, survivor.id);
+        assert_eq!(restored.app().unwrap().container, survivor.id);
         assert_eq!(
-            store.routes().lookup("alpha.test").unwrap().upstream,
+            store.routes().serving("alpha.test").unwrap().upstream,
             survivor.upstream
         );
         // Nothing was started, and nothing was taken down, to get there.
@@ -685,13 +1130,13 @@ container:
         let (applier, store) = applier(runtime.clone());
 
         let restored = applier
-            .restore("hello".parse().unwrap(), manifest("alpha.test"))
+            .restore("hello".parse().unwrap(), manifest("alpha.test"), false)
             .await
             .unwrap();
 
         assert!(!restored.was_adopted(), "{restored:?}");
         assert_eq!(runtime.launched.lock().unwrap().len(), 1);
-        assert!(store.routes().lookup("alpha.test").is_some());
+        assert!(store.routes().serving("alpha.test").is_some());
     }
 
     /// A container that is up but no longer answering is not something to route
@@ -714,6 +1159,7 @@ container:
             .restore(
                 "hello".parse().unwrap(),
                 manifest_awaiting_readiness("alpha.test"),
+                false,
             )
             .await
             .unwrap_err();
@@ -739,12 +1185,427 @@ container:
         let (applier, store) = applier(runtime);
 
         let error = applier
-            .apply("hello".parse().unwrap(), manifest("alpha.test"))
+            .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
             .await
             .unwrap_err();
 
         assert!(matches!(error, ApplyError::Failed(_)));
         assert!(error.to_string().contains("no image for you"));
         assert!(store.apps().is_empty());
+    }
+
+    // Suspending and resuming.
+
+    /// Suspended by default is the cheap case: nothing is stopped, the app just
+    /// stops receiving traffic.
+    #[tokio::test]
+    async fn suspending_stops_serving_and_leaves_the_container_running() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+        applier
+            .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
+            .await
+            .unwrap();
+
+        applier
+            .suspend(&"hello".parse().unwrap(), false)
+            .await
+            .unwrap();
+
+        assert!(store.routes().serving("alpha.test").is_none());
+        assert!(store.routes().lookup("alpha.test").is_some());
+        assert_eq!(store.suspended_apps().len(), 1);
+        // Nothing was stopped and nothing was removed to get there.
+        assert!(runtime.stopped.lock().unwrap().is_empty());
+        assert!(runtime.removed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn suspending_with_stop_container_stops_it_and_keeps_it() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _) = applier(runtime.clone());
+        let app = started(
+            applier
+                .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
+                .await
+                .unwrap(),
+        );
+
+        applier
+            .suspend(&"hello".parse().unwrap(), true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *runtime.stopped.lock().unwrap(),
+            std::slice::from_ref(&app.container)
+        );
+        // Stopped, not deleted — that is the whole difference from a destroy.
+        assert!(runtime.removed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn suspending_records_it_and_resuming_clears_it() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _) = applier(runtime);
+        applier
+            .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
+            .await
+            .unwrap();
+
+        applier
+            .suspend(&"hello".parse().unwrap(), false)
+            .await
+            .unwrap();
+        assert!(applier.repository().desired().await.unwrap()[0].suspended);
+
+        applier.resume(&"hello".parse().unwrap()).await.unwrap();
+        assert!(!applier.repository().desired().await.unwrap()[0].suspended);
+    }
+
+    #[tokio::test]
+    async fn suspending_an_unknown_app_says_so() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _) = applier(runtime);
+
+        let error = applier
+            .suspend(&"ghost".parse().unwrap(), false)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SuspendError::Unknown(_)));
+        assert!(
+            error.to_string().contains("no app named `ghost`"),
+            "{error}"
+        );
+    }
+
+    /// A container that will not stop leaves the app suspended all the same —
+    /// it is already unrouted — but the operator has to hear that it is still
+    /// running.
+    #[tokio::test]
+    async fn reports_a_container_that_would_not_stop() {
+        let runtime = Arc::new(FakeRuntime {
+            refuse_stop: true,
+            ..Default::default()
+        });
+        let (applier, store) = applier(runtime);
+        applier
+            .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
+            .await
+            .unwrap();
+
+        let error = applier
+            .suspend(&"hello".parse().unwrap(), true)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SuspendError::Failed(_)));
+        assert!(error.to_string().contains("would not stop"), "{error}");
+        assert!(store.routes().serving("alpha.test").is_none());
+    }
+
+    /// The cheap round trip: nothing was stopped, so nothing has to be started.
+    #[tokio::test]
+    async fn resuming_routes_a_container_that_never_stopped() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+        let before = started(
+            applier
+                .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
+                .await
+                .unwrap(),
+        );
+        applier
+            .suspend(&"hello".parse().unwrap(), false)
+            .await
+            .unwrap();
+
+        let after = applier.resume(&"hello".parse().unwrap()).await.unwrap();
+
+        assert_eq!(after.container, before.container);
+        assert_eq!(after.upstream, before.upstream);
+        assert!(store.routes().serving("alpha.test").is_some());
+        // One launch in total: the one the apply did.
+        assert_eq!(runtime.launched.lock().unwrap().len(), 1);
+        assert!(runtime.started.lock().unwrap().is_empty());
+    }
+
+    /// The point of `--stop-container`: the container comes back, rather than
+    /// a new one being built from the image again.
+    #[tokio::test]
+    async fn resuming_starts_the_container_it_stopped() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+        let before = started(
+            applier
+                .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
+                .await
+                .unwrap(),
+        );
+        applier
+            .suspend(&"hello".parse().unwrap(), true)
+            .await
+            .unwrap();
+
+        let after = applier.resume(&"hello".parse().unwrap()).await.unwrap();
+
+        assert_eq!(after.container, before.container);
+        assert_eq!(
+            *runtime.started.lock().unwrap(),
+            std::slice::from_ref(&before.container)
+        );
+        // A port it did not have before: the old one belonged to the run, not
+        // to the container.
+        assert_eq!(after.upstream.port(), FakeRuntime::RESTARTED_PORT);
+        assert_eq!(
+            store.routes().serving("alpha.test").unwrap().upstream,
+            after.upstream
+        );
+        assert_eq!(runtime.launched.lock().unwrap().len(), 1);
+    }
+
+    /// A container removed by hand while the app was suspended costs a
+    /// relaunch, not the app.
+    #[tokio::test]
+    async fn resuming_starts_a_fresh_container_when_the_kept_one_is_gone() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+        let before = started(
+            applier
+                .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
+                .await
+                .unwrap(),
+        );
+        applier
+            .suspend(&"hello".parse().unwrap(), true)
+            .await
+            .unwrap();
+        runtime.remove(&before.container).await.unwrap();
+
+        let after = applier.resume(&"hello".parse().unwrap()).await.unwrap();
+
+        assert_ne!(after.container, before.container);
+        assert_eq!(runtime.launched.lock().unwrap().len(), 2);
+        assert!(store.routes().serving("alpha.test").is_some());
+    }
+
+    #[tokio::test]
+    async fn resuming_an_app_that_is_running_is_a_no_op() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _) = applier(runtime.clone());
+        let before = started(
+            applier
+                .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
+                .await
+                .unwrap(),
+        );
+
+        let after = applier.resume(&"hello".parse().unwrap()).await.unwrap();
+
+        assert_eq!(after.container, before.container);
+        assert_eq!(runtime.launched.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resuming_an_unknown_app_says_so() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _) = applier(runtime);
+
+        let error = applier.resume(&"ghost".parse().unwrap()).await.unwrap_err();
+
+        assert!(matches!(error, ResumeError::Unknown(_)));
+    }
+
+    // Applying into suspension.
+
+    #[tokio::test]
+    async fn applying_suspended_claims_the_hosts_without_starting_anything() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+
+        let applied = applier
+            .apply("hello".parse().unwrap(), manifest("alpha.test"), true)
+            .await
+            .unwrap();
+
+        assert!(matches!(applied, Applied::Suspended(_)));
+        assert!(runtime.launched.lock().unwrap().is_empty());
+        assert!(store.apps().is_empty());
+        // The host is claimed all the same — that is what makes it possible to
+        // certify it before the app ever runs.
+        assert!(store.routes().lookup("alpha.test").is_some());
+        assert!(store.routes().hosts().contains("alpha.test"));
+        let desired = applier.repository().desired().await.unwrap();
+        assert!(desired[0].suspended);
+    }
+
+    /// The whole point of applying suspended: the manifest is staged and the
+    /// cutover is a second, deliberate command.
+    #[tokio::test]
+    async fn an_app_applied_suspended_starts_when_it_is_resumed() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+        applier
+            .apply("hello".parse().unwrap(), manifest("alpha.test"), true)
+            .await
+            .unwrap();
+
+        let app = applier.resume(&"hello".parse().unwrap()).await.unwrap();
+
+        assert_eq!(runtime.launched.lock().unwrap().len(), 1);
+        assert_eq!(
+            store.routes().serving("alpha.test").unwrap().upstream,
+            app.upstream
+        );
+    }
+
+    /// An apply says what an app would run, not whether it is being run.
+    #[tokio::test]
+    async fn applying_to_a_suspended_app_leaves_it_suspended() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+        applier
+            .apply("hello".parse().unwrap(), manifest("alpha.test"), true)
+            .await
+            .unwrap();
+
+        // No `--suspended` this time, and it still does not start.
+        let applied = applier
+            .apply("hello".parse().unwrap(), manifest("beta.test"), false)
+            .await
+            .unwrap();
+
+        assert!(matches!(applied, Applied::Suspended(_)));
+        assert!(runtime.launched.lock().unwrap().is_empty());
+        assert!(applier.repository().desired().await.unwrap()[0].suspended);
+        // The new manifest is what it claims, and the old host is given up.
+        assert!(store.routes().lookup("beta.test").is_some());
+        assert!(store.routes().lookup("alpha.test").is_none());
+    }
+
+    /// Staging a new manifest must not leave a resume able to bring back the
+    /// image it replaced.
+    #[tokio::test]
+    async fn applying_to_a_suspended_app_removes_the_container_it_was_holding() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _) = applier(runtime.clone());
+        let before = started(
+            applier
+                .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
+                .await
+                .unwrap(),
+        );
+        applier
+            .suspend(&"hello".parse().unwrap(), true)
+            .await
+            .unwrap();
+
+        applier
+            .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *runtime.removed.lock().unwrap(),
+            std::slice::from_ref(&before.container)
+        );
+        // And resuming now builds a new one rather than the one it was holding.
+        let after = applier.resume(&"hello".parse().unwrap()).await.unwrap();
+        assert_ne!(after.container, before.container);
+    }
+
+    /// Applying `--suspended` over a running app takes it out of service.
+    #[tokio::test]
+    async fn applying_suspended_over_a_running_app_suspends_it() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+        let before = started(
+            applier
+                .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
+                .await
+                .unwrap(),
+        );
+
+        applier
+            .apply("hello".parse().unwrap(), manifest("alpha.test"), true)
+            .await
+            .unwrap();
+
+        assert!(store.routes().serving("alpha.test").is_none());
+        assert!(store.routes().lookup("alpha.test").is_some());
+        assert_eq!(
+            *runtime.removed.lock().unwrap(),
+            std::slice::from_ref(&before.container)
+        );
+    }
+
+    /// The reason hosts stay claimed, at the level that enforces it.
+    #[tokio::test]
+    async fn another_app_cannot_take_a_suspended_app_s_host() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _) = applier(runtime.clone());
+        applier
+            .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
+            .await
+            .unwrap();
+        applier
+            .suspend(&"hello".parse().unwrap(), false)
+            .await
+            .unwrap();
+
+        let error = applier
+            .apply("other".parse().unwrap(), manifest("alpha.test"), false)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ApplyError::Conflict(_)));
+        assert!(error.to_string().contains("already claimed by app `hello`"));
+        // No container was started for it, as for any other conflict.
+        assert_eq!(runtime.launched.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn destroying_a_suspended_app_removes_its_container_too() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+        let before = started(
+            applier
+                .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
+                .await
+                .unwrap(),
+        );
+        applier
+            .suspend(&"hello".parse().unwrap(), true)
+            .await
+            .unwrap();
+
+        applier.destroy(&"hello".parse().unwrap()).await.unwrap();
+
+        assert!(store.routes().is_empty());
+        assert!(store.suspended_apps().is_empty());
+        assert!(applier.repository().desired().await.unwrap().is_empty());
+        assert_eq!(
+            *runtime.removed.lock().unwrap(),
+            std::slice::from_ref(&before.container)
+        );
+    }
+
+    /// An app that was applied suspended and never ran has nothing to remove,
+    /// and destroying it must not fail looking for one.
+    #[tokio::test]
+    async fn destroying_an_app_that_never_ran_removes_nothing() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+        applier
+            .apply("hello".parse().unwrap(), manifest("alpha.test"), true)
+            .await
+            .unwrap();
+
+        let destroyed = applier.destroy(&"hello".parse().unwrap()).await.unwrap();
+
+        assert!(destroyed.container().is_none());
+        assert!(store.routes().is_empty());
+        assert!(runtime.removed.lock().unwrap().is_empty());
     }
 }

@@ -15,7 +15,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{FromRef, Path as UrlPath, Query, State};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http::StatusCode;
@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::OperatorEndpoint;
-use crate::app::apply::{Applier, ApplyError, DestroyError};
+use crate::app::apply::{Applied, Applier, ApplyError, DestroyError, ResumeError, SuspendError};
 use crate::app::{App, AppId, AppManifest, Pattern, health};
 use crate::events::{Event, EventBus, EventFilter, Level};
 use crate::status::Instance;
@@ -118,6 +118,8 @@ fn router(instance: Arc<Instance>, events: Arc<EventBus>, shutdown: Cancellation
     Router::new()
         .route("/apps", get(list))
         .route("/apps/{id}", put(apply).delete(destroy))
+        .route("/apps/{id}/suspend", post(suspend))
+        .route("/apps/{id}/resume", post(resume))
         .route("/events", get(events_stream))
         .route("/status", get(status))
         .with_state(Operator {
@@ -289,14 +291,20 @@ async fn list(State(applier): State<Arc<Applier>>, Query(query): Query<ListQuery
         Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
     };
 
-    let apps: Vec<_> = applier
-        .store()
+    let matches = |id: &AppId| pattern.as_ref().is_none_or(|p| p.matches(id));
+    let store = applier.store();
+    let running: Vec<_> = store
         .apps()
         .into_iter()
-        .filter(|app| pattern.as_ref().is_none_or(|p| p.matches(&app.id)))
+        .filter(|app| matches(&app.id))
+        .collect();
+    let suspended: Vec<_> = store
+        .suspended_apps()
+        .into_iter()
+        .filter(|app| matches(&app.id))
         .collect();
 
-    if apps.is_empty() {
+    if running.is_empty() && suspended.is_empty() {
         let body = match &pattern {
             Some(pattern) => format!("no app matches `{pattern}`\n"),
             None => "no apps are running\n".to_owned(),
@@ -305,7 +313,36 @@ async fn list(State(applier): State<Arc<Applier>>, Query(query): Query<ListQuery
         return (StatusCode::OK, body).into_response();
     }
 
-    (StatusCode::OK, table(&apps, &statuses(&apps).await)).into_response()
+    // Suspended apps are listed with the rest, in with them rather than after:
+    // an operator asking what spaceport has wants the whole answer, and the
+    // status column is where the difference belongs.
+    let mut rows: Vec<Listed> = running
+        .iter()
+        .zip(statuses(&running).await)
+        .map(|(app, status)| Listed {
+            id: app.id.clone(),
+            source: app.manifest.source.to_string(),
+            status,
+            hosts: app.hosts().to_vec(),
+        })
+        .chain(suspended.iter().map(|app| Listed {
+            id: app.id.clone(),
+            source: app.manifest.source.to_string(),
+            status: "suspended",
+            hosts: app.hosts().to_vec(),
+        }))
+        .collect();
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+
+    (StatusCode::OK, table(&rows)).into_response()
+}
+
+/// One line of what `spaceport apps list` prints.
+struct Listed {
+    id: AppId,
+    source: String,
+    status: &'static str,
+    hosts: Vec<crate::app::manifest::Host>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -351,17 +388,16 @@ async fn statuses(apps: &[Arc<App>]) -> Vec<&'static str> {
 }
 
 /// Render the apps as columns, wide enough for what is in them.
-fn table(apps: &[Arc<App>], statuses: &[&str]) -> String {
+fn table(apps: &[Listed]) -> String {
     let rows: Vec<[String; 4]> = apps
         .iter()
-        .zip(statuses)
-        .map(|(app, status)| {
-            let hosts: Vec<&str> = app.hosts().iter().map(|host| host.as_str()).collect();
+        .map(|app| {
+            let hosts: Vec<&str> = app.hosts.iter().map(|host| host.as_str()).collect();
 
             [
                 app.id.to_string(),
-                app.manifest.source.to_string(),
-                (*status).to_owned(),
+                app.source.clone(),
+                app.status.to_owned(),
                 hosts.join(", "),
             ]
         })
@@ -403,10 +439,12 @@ async fn destroy(State(applier): State<Arc<Applier>>, UrlPath(id): UrlPath<Strin
 
     match applier.destroy(&id).await {
         Ok(app) => {
-            let body = format!(
-                "app `{}` destroyed\n  container {}\n",
-                app.id, app.container
-            );
+            let body = match app.container() {
+                Some(container) => {
+                    format!("app `{}` destroyed\n  container {container}\n", app.id())
+                }
+                None => format!("app `{}` destroyed\n  it had no container\n", app.id()),
+            };
 
             (StatusCode::OK, body).into_response()
         }
@@ -424,13 +462,19 @@ async fn destroy(State(applier): State<Arc<Applier>>, UrlPath(id): UrlPath<Strin
     }
 }
 
-/// `PUT /apps/{id}` with a manifest as the body: run this, under this name.
+/// `PUT /apps/{id}?suspended=` with a manifest as the body: run this, under
+/// this name.
 ///
 /// A `PUT` because that is what it does — the app named `id` ends up as the
 /// body describes it, whether or not it was already running.
+///
+/// `suspended=true` records and claims without starting. So does applying to an
+/// app that is already suspended, whatever the query says: see
+/// [`Applier::apply`].
 async fn apply(
     State(applier): State<Arc<Applier>>,
     UrlPath(id): UrlPath<String>,
+    Query(query): Query<ApplyQuery>,
     body: String,
 ) -> Response {
     let id: AppId = match id.parse() {
@@ -443,8 +487,8 @@ async fn apply(
         Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
     };
 
-    match applier.apply(id, manifest).await {
-        Ok(app) => {
+    match applier.apply(id, manifest, query.suspended).await {
+        Ok(Applied::Running(app)) => {
             let hosts: Vec<&str> = app.hosts().iter().map(|host| host.as_str()).collect();
             let body = format!(
                 "app `{}` applied\n  container {}\n  upstream  {}\n  routes    {}\n",
@@ -456,11 +500,106 @@ async fn apply(
 
             (StatusCode::OK, body).into_response()
         }
+        Ok(Applied::Suspended(app)) => {
+            let hosts: Vec<&str> = app.hosts().iter().map(|host| host.as_str()).collect();
+            let body = format!(
+                "app `{}` applied, suspended\n  claims  {}\n  resume it with `spaceport apps resume {}`\n",
+                app.id,
+                hosts.join(", "),
+                app.id,
+            );
+
+            (StatusCode::OK, body).into_response()
+        }
         Err(error) => {
             warn!(%error, "apply failed");
             let status = match error {
                 ApplyError::Conflict(_) => StatusCode::CONFLICT,
                 ApplyError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+
+            refuse(status, &error.to_string())
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ApplyQuery {
+    #[serde(default)]
+    suspended: bool,
+}
+
+/// `POST /apps/{id}/suspend?stop_container=`: stop serving the app, keep
+/// everything about it.
+async fn suspend(
+    State(applier): State<Arc<Applier>>,
+    UrlPath(id): UrlPath<String>,
+    Query(query): Query<SuspendQuery>,
+) -> Response {
+    let id: AppId = match id.parse() {
+        Ok(id) => id,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    match applier.suspend(&id, query.stop_container).await {
+        Ok(()) => {
+            let container = if query.stop_container {
+                "  its container is stopped and kept\n"
+            } else {
+                "  its container is left running\n"
+            };
+            let body = format!(
+                "app `{id}` suspended\n{container}  it still claims its hosts, and still renews their certificates\n"
+            );
+
+            (StatusCode::OK, body).into_response()
+        }
+        Err(error) => {
+            let status = match error {
+                SuspendError::Unknown(_) => StatusCode::NOT_FOUND,
+                SuspendError::Failed(_) => {
+                    warn!(%error, "suspend failed");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            };
+
+            refuse(status, &error.to_string())
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SuspendQuery {
+    #[serde(default)]
+    stop_container: bool,
+}
+
+/// `POST /apps/{id}/resume`: serve the app again.
+async fn resume(State(applier): State<Arc<Applier>>, UrlPath(id): UrlPath<String>) -> Response {
+    let id: AppId = match id.parse() {
+        Ok(id) => id,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    match applier.resume(&id).await {
+        Ok(app) => {
+            let hosts: Vec<&str> = app.hosts().iter().map(|host| host.as_str()).collect();
+            let body = format!(
+                "app `{}` resumed\n  container {}\n  upstream  {}\n  routes    {}\n",
+                app.id,
+                app.container,
+                app.upstream,
+                hosts.join(", "),
+            );
+
+            (StatusCode::OK, body).into_response()
+        }
+        Err(error) => {
+            warn!(%error, "resume failed");
+            let status = match error {
+                ResumeError::Unknown(_) => StatusCode::NOT_FOUND,
+                ResumeError::Conflict(_) => StatusCode::CONFLICT,
+                ResumeError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };
 
             refuse(status, &error.to_string())
@@ -511,6 +650,17 @@ mod tests {
 
         async fn remove(&self, _id: &ContainerId) -> Result<()> {
             Ok(())
+        }
+
+        async fn stop(&self, _id: &ContainerId) -> Result<()> {
+            Ok(())
+        }
+
+        async fn start(&self, id: &ContainerId, _manifest: &AppManifest) -> Result<Container> {
+            Ok(Container {
+                id: id.clone(),
+                upstream: self.upstream,
+            })
         }
 
         /// Nothing here reconciles, so nothing here has leftovers.
@@ -673,6 +823,134 @@ container:
         call(router, request).await
     }
 
+    async fn put_app_suspended(router: &Router, id: &str, manifest: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/apps/{id}?suspended=true"))
+            .body(Body::from(manifest.to_owned()))
+            .unwrap();
+
+        call(router, request).await
+    }
+
+    async fn suspend_app(router: &Router, id: &str, stop: bool) -> (StatusCode, String) {
+        let uri = match stop {
+            true => format!("/apps/{id}/suspend?stop_container=true"),
+            false => format!("/apps/{id}/suspend"),
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+
+        call(router, request).await
+    }
+
+    async fn resume_app(router: &Router, id: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/apps/{id}/resume"))
+            .body(Body::empty())
+            .unwrap();
+
+        call(router, request).await
+    }
+
+    #[tokio::test]
+    async fn suspends_and_resumes_an_app() {
+        let (store, router) = store_and_router();
+        put_app(&router, "hello", MANIFEST).await;
+
+        let (status, body) = suspend_app(&router, "hello", false).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("app `hello` suspended"), "{body}");
+        assert!(body.contains("still claims its hosts"), "{body}");
+        assert!(store.routes().serving("alpha.test").is_none());
+
+        let (status, body) = resume_app(&router, "hello").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("app `hello` resumed"), "{body}");
+        assert!(store.routes().serving("alpha.test").is_some());
+    }
+
+    #[tokio::test]
+    async fn says_which_way_the_container_went() {
+        let (_, router) = store_and_router();
+        put_app(&router, "hello", MANIFEST).await;
+
+        let (_, kept) = suspend_app(&router, "hello", false).await;
+        assert!(kept.contains("left running"), "{kept}");
+
+        let (_, stopped) = suspend_app(&router, "hello", true).await;
+        assert!(stopped.contains("stopped and kept"), "{stopped}");
+    }
+
+    #[tokio::test]
+    async fn suspending_an_unknown_app_is_not_found() {
+        let (_, router) = store_and_router();
+
+        let (status, _) = suspend_app(&router, "ghost", false).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(resume_app(&router, "ghost").await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn applies_an_app_into_suspension() {
+        let (store, router) = store_and_router();
+
+        let (status, body) = put_app_suspended(&router, "hello", MANIFEST).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("applied, suspended"), "{body}");
+        assert!(body.contains("spaceport apps resume hello"), "{body}");
+        assert!(store.apps().is_empty());
+        // Claimed, so its certificates are ordered before it ever runs.
+        assert!(store.routes().hosts().contains("alpha.test"));
+    }
+
+    /// A suspended app is one of the apps spaceport has, and listing them
+    /// without it would have an operator think it was destroyed.
+    #[tokio::test]
+    async fn lists_a_suspended_app_with_the_rest() {
+        let (_, router) = store_and_router();
+        put_app(&router, "hello", MANIFEST).await;
+        suspend_app(&router, "hello", false).await;
+
+        let (status, body) = get_apps(&router, "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("hello"), "{body}");
+        assert!(body.contains("suspended"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_suspended_app_still_holds_its_host_against_another() {
+        let (_, router) = store_and_router();
+        put_app(&router, "hello", MANIFEST).await;
+        suspend_app(&router, "hello", false).await;
+
+        let (status, body) = put_app(&router, "other", MANIFEST).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.contains("already claimed by app `hello`"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn destroys_a_suspended_app() {
+        let (store, router) = store_and_router();
+        put_app_suspended(&router, "hello", MANIFEST).await;
+
+        let (status, body) = delete_app(&router, "hello").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("no container"), "{body}");
+        assert!(store.routes().is_empty());
+    }
+
     #[tokio::test]
     async fn applies_a_manifest() {
         let (store, router) = store_and_router();
@@ -683,7 +961,7 @@ container:
         assert!(body.contains("app `hello` applied"), "{body}");
         assert!(body.contains("127.0.0.1:9000"), "{body}");
         assert!(body.contains("alpha.test"), "{body}");
-        assert!(store.routes().lookup("alpha.test").is_some());
+        assert!(store.routes().serving("alpha.test").is_some());
     }
 
     #[tokio::test]
@@ -715,7 +993,7 @@ container:
         let (status, body) = put_app(&router, "other", MANIFEST).await;
 
         assert_eq!(status, StatusCode::CONFLICT);
-        assert!(body.contains("already served by app `hello`"), "{body}");
+        assert!(body.contains("already claimed by app `hello`"), "{body}");
         assert_eq!(store.apps().len(), 1);
     }
 
@@ -865,7 +1143,7 @@ container:
         assert!(body.contains("app `hello` destroyed"), "{body}");
         assert!(body.contains("container hello0123456"), "{body}");
         assert!(store.apps().is_empty());
-        assert!(store.routes().lookup("alpha.test").is_none());
+        assert!(store.routes().serving("alpha.test").is_none());
     }
 
     /// And the host it was serving is free for the next app to claim.
@@ -879,7 +1157,7 @@ container:
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            store.routes().lookup("alpha.test").unwrap().id.as_str(),
+            store.routes().serving("alpha.test").unwrap().id.as_str(),
             "other"
         );
     }
@@ -1019,6 +1297,6 @@ container:
         put_app(&router, "other", MANIFEST).await;
 
         let app: Arc<App> = store.get(&"hello".parse().unwrap()).unwrap();
-        assert_eq!(store.routes().lookup("alpha.test").unwrap().id, app.id);
+        assert_eq!(store.routes().serving("alpha.test").unwrap().id, app.id);
     }
 }

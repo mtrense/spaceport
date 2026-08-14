@@ -170,11 +170,22 @@ impl Instance {
             .map(|(id, reason)| (id, reason))
             .collect();
 
+        // Not running, and not a fault: an app is in here because somebody said
+        // so, and it must not be counted among the ones that failed.
+        let suspended: Vec<AppId> = self
+            .applier
+            .store()
+            .suspended_apps()
+            .into_iter()
+            .map(|app| app.id)
+            .collect();
+
         let (recorded, down, error) = match self.applier.repository().desired().await {
             Ok(records) => {
                 let down = records
                     .iter()
                     .filter(|record| !running.iter().any(|app| app.id == record.id))
+                    .filter(|record| !suspended.contains(&record.id))
                     .map(|record| Down {
                         id: record.id.clone(),
                         reason: reasons.get(&record.id).map(|reason| (*reason).clone()),
@@ -191,6 +202,7 @@ impl Instance {
             ready: ready.iter().filter(|ready| **ready).count(),
             unreachable,
             recorded,
+            suspended,
             down,
             error,
         }
@@ -327,6 +339,14 @@ pub struct Apps {
     pub unreachable: Vec<AppId>,
     /// How many apps are recorded as wanted, running or not.
     pub recorded: usize,
+    /// Apps that are deliberately not running.
+    ///
+    /// Reported apart from `down` because they are the opposite of it: an app
+    /// in here is doing exactly what it was told to, and a status that counted
+    /// it as down would have an operator looking for a fault that is a
+    /// decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suspended: Vec<AppId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub down: Vec<Down>,
     /// Why the records could not be read, if they could not.
@@ -407,6 +427,21 @@ mod tests {
 
         async fn remove(&self, _id: &ContainerId) -> Result<()> {
             Ok(())
+        }
+
+        async fn stop(&self, _id: &ContainerId) -> Result<()> {
+            Ok(())
+        }
+
+        async fn start(
+            &self,
+            id: &ContainerId,
+            _manifest: &crate::AppManifest,
+        ) -> Result<Container> {
+            Ok(Container {
+                id: id.clone(),
+                upstream: SocketAddr::from(([127, 0, 0, 1], 9000)),
+            })
         }
 
         async fn managed(&self) -> Result<Vec<Managed>> {
@@ -499,7 +534,7 @@ container:
         let (db, applier) = empty();
         applier
             .repository()
-            .record_applied(&"ghost".parse().unwrap(), MANIFEST)
+            .record_applied(&"ghost".parse().unwrap(), MANIFEST, false)
             .await
             .unwrap();
 
@@ -529,6 +564,7 @@ container:
             .apply(
                 "alpha".parse().unwrap(),
                 crate::AppManifest::parse(MANIFEST).unwrap(),
+                false,
             )
             .await
             .unwrap();
@@ -551,6 +587,7 @@ container:
             .apply(
                 "alpha".parse().unwrap(),
                 crate::AppManifest::parse(MANIFEST).unwrap(),
+                false,
             )
             .await
             .unwrap();

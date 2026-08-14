@@ -47,6 +47,19 @@ const MIGRATIONS: &[&str] = &[
         private_key TEXT NOT NULL,
         issued_at   TEXT NOT NULL
     ) STRICT;",
+    // 3 — whether an app is suspended: recorded, still claiming its hosts, but
+    // deliberately not served.
+    //
+    // A column on `apps` rather than a state machine, because that is what it
+    // is: an app is one manifest under one id either way, and suspension says
+    // only whether spaceport should be running it right now. Defaulting to 0
+    // makes every app an older build recorded a running one, which is what it
+    // was.
+    //
+    // Nothing here says whether the *container* was stopped. That is the
+    // engine's to answer, and asking it is the only way to get an answer that
+    // is still true after somebody used `docker` by hand.
+    "ALTER TABLE apps ADD COLUMN suspended INTEGER NOT NULL DEFAULT 0;",
 ];
 
 /// The schema version this build writes.
@@ -147,7 +160,13 @@ mod tests {
 
         assert_eq!(
             columns(&connection, "apps"),
-            ["id", "schema_version", "manifest", "applied_at"]
+            [
+                "id",
+                "schema_version",
+                "manifest",
+                "applied_at",
+                "suspended"
+            ]
         );
     }
 
@@ -188,5 +207,14 @@ mod tests {
             1
         );
         assert!(!columns(&connection, "certificates").is_empty());
+        // An app recorded before suspension existed was a running one.
+        assert_eq!(
+            connection
+                .query_row("SELECT suspended FROM apps WHERE id = 'hello'", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
     }
 }

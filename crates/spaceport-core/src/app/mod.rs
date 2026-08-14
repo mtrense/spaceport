@@ -8,12 +8,12 @@ pub mod reconcile;
 pub mod repository;
 pub mod store;
 
-pub use apply::{Applier, Restored};
+pub use apply::{Applied, Applier, Restored};
 pub use manifest::AppManifest;
 pub use pattern::Pattern;
 pub use reconcile::reconcile;
 pub use repository::{AppRecord, AppRepository};
-pub use store::{App, AppStore, Routes};
+pub use store::{App, AppStore, Removed, Route, Routes, Suspended};
 
 use std::fmt;
 use std::str::FromStr;

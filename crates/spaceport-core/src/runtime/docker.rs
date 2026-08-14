@@ -27,7 +27,7 @@ use bollard::query_parameters::{
 use futures_util::StreamExt;
 use tracing::{debug, info, warn};
 
-use super::{Container, ContainerId, ContainerRuntime, Managed};
+use super::{Adopted, Container, ContainerId, ContainerRuntime, Managed};
 use crate::app::manifest::Source;
 use crate::app::{AppId, AppManifest};
 
@@ -191,7 +191,7 @@ impl ContainerRuntime for DockerRuntime {
         // From here on the container exists, so any failure has to take it
         // back down rather than leave a stopped shell behind under a name the
         // next apply would silently reuse.
-        match self.start(&created.id, port).await {
+        match self.run(&created.id, port).await {
             Ok(upstream) => {
                 let id = ContainerId::new(created.id);
                 info!(app = %app, container = %id, %upstream, "app started");
@@ -205,7 +205,7 @@ impl ContainerRuntime for DockerRuntime {
         }
     }
 
-    async fn adopt(&self, app: &AppId, manifest: &AppManifest) -> Result<Option<Container>> {
+    async fn adopt(&self, app: &AppId, manifest: &AppManifest) -> Result<Option<Adopted>> {
         // Every question below is asked of the container the engine already
         // has, and of nothing else: no image is inspected, and nothing is
         // pulled. A restart of spaceport must not depend on a registry being
@@ -231,14 +231,7 @@ impl ContainerRuntime for DockerRuntime {
             return Ok(None);
         };
 
-        // A container that exited while spaceport was down has no published
-        // port and nothing behind it. Starting it again is what `launch` is
-        // for, and it is the same work as starting a new one.
-        if inspect.state.and_then(|state| state.running) != Some(true) {
-            debug!(app = %app, container = %id, "the container from before is not running");
-            return Ok(None);
-        }
-
+        let running = inspect.state.and_then(|state| state.running) == Some(true);
         let config = inspect.config.unwrap_or_default();
 
         // The name is spaceport's own, but the label is what says so. A
@@ -263,6 +256,14 @@ impl ContainerRuntime for DockerRuntime {
             return Ok(None);
         }
 
+        // This far, the container is the one this manifest describes. Whether
+        // it happens to be up is a separate question, and one a suspended app
+        // has already answered on purpose.
+        if !running {
+            debug!(app = %app, container = %id, "the container from before is not running");
+            return Ok(Some(Adopted::Stopped(id)));
+        }
+
         // Both of these can only fail for a container spaceport would refuse
         // to launch anyway, so they decline rather than report: whatever the
         // real problem is, `launch` is about to say it properly.
@@ -285,7 +286,52 @@ impl ContainerRuntime for DockerRuntime {
             }
         };
 
-        Ok(Some(Container { id, upstream }))
+        Ok(Some(Adopted::Running(Container { id, upstream })))
+    }
+
+    async fn stop(&self, id: &ContainerId) -> Result<()> {
+        let options = StopContainerOptionsBuilder::new().t(STOP_TIMEOUT).build();
+
+        match self.docker.stop_container(id.as_str(), Some(options)).await {
+            Ok(()) => Ok(()),
+            // Already gone, or already stopped. Either way the container is not
+            // running, which is all this was asked to arrange.
+            Err(error) if is_not_found(&error) || is_not_modified(&error) => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("stopping container {id}")),
+        }
+    }
+
+    async fn start(&self, id: &ContainerId, manifest: &AppManifest) -> Result<Container> {
+        // Asked of the container rather than of the image, for the same reason
+        // adoption is: resuming an app must not depend on a registry being
+        // reachable, and the ports this container has are the ones it was
+        // created with whatever the image says today.
+        let inspect = self
+            .docker
+            .inspect_container(id.as_str(), None::<InspectContainerOptions>)
+            .await
+            .with_context(|| format!("inspecting container {id}"))?;
+
+        let image = match &manifest.source {
+            Source::Image { image } => image.as_str(),
+            Source::Build { .. } => bail!("that container's app builds its own image"),
+        };
+        let exposed = inspect
+            .config
+            .and_then(|config| config.exposed_ports)
+            .unwrap_or_default();
+        let port = container_port(manifest.container.port, image, &exposed)?;
+
+        let upstream = self
+            .run(id.as_str(), port)
+            .await
+            .with_context(|| format!("starting container {id} again"))?;
+        info!(container = %id, %upstream, "container started again");
+
+        Ok(Container {
+            id: id.clone(),
+            upstream,
+        })
     }
 
     async fn remove(&self, id: &ContainerId) -> Result<()> {
@@ -359,8 +405,12 @@ impl ContainerRuntime for DockerRuntime {
 }
 
 impl DockerRuntime {
-    /// Start a created container and find out where it ended up.
-    async fn start(&self, id: &str, port: u16) -> Result<SocketAddr> {
+    /// Start a container and find out where it ended up.
+    ///
+    /// Not called `start`: that is the trait's, and this is the half of it that
+    /// both starting a container spaceport just created and starting one it
+    /// stopped earlier have in common.
+    async fn run(&self, id: &str, port: u16) -> Result<SocketAddr> {
         self.docker
             .start_container(id, None::<StartContainerOptions>)
             .await
@@ -472,6 +522,18 @@ fn is_not_found(error: &DockerError) -> bool {
         error,
         DockerError::DockerResponseServerError {
             status_code: 404,
+            ..
+        }
+    )
+}
+
+/// Whether the daemon answered "it already is", which docker says by refusing
+/// to change a container that is in the state it was asked for.
+fn is_not_modified(error: &DockerError) -> bool {
+    matches!(
+        error,
+        DockerError::DockerResponseServerError {
+            status_code: 304,
             ..
         }
     )
@@ -697,7 +759,7 @@ routing:
 
         let adopted = runtime.adopt(&app, &hello_manifest()).await.unwrap();
 
-        assert_eq!(adopted, Some(container.clone()));
+        assert_eq!(adopted, Some(Adopted::Running(container.clone())));
 
         // A manifest that names another image does not describe this
         // container, so there is nothing here to adopt — and answering that
@@ -726,6 +788,56 @@ container:
             runtime.adopt(&unknown, &hello_manifest()).await.unwrap(),
             None
         );
+    }
+
+    /// What suspending with `--stop-container` and resuming come to at the
+    /// engine: the container is kept, and comes back somewhere new.
+    #[tokio::test]
+    async fn stops_a_container_and_starts_the_same_one_again() {
+        let Some(runtime) = daemon().await else {
+            eprintln!("skipping: no docker daemon");
+            return;
+        };
+        let app: AppId = "spaceport-selftest-stop".parse().unwrap();
+        let before = runtime.launch(&app, &hello_manifest()).await.unwrap();
+
+        runtime.stop(&before.id).await.unwrap();
+
+        // Kept, so it is still spaceport's to account for — this is what a
+        // sweep must not mistake for a leftover.
+        let managed = runtime.managed().await.unwrap();
+        assert!(
+            managed.iter().any(|found| found.id == before.id),
+            "{managed:?}",
+        );
+        // And still adoptable, as the container it is rather than as one that
+        // is running.
+        assert_eq!(
+            runtime.adopt(&app, &hello_manifest()).await.unwrap(),
+            Some(Adopted::Stopped(before.id.clone())),
+        );
+        // Stopping it twice is not an error: it is being asked for the state it
+        // is already in.
+        runtime.stop(&before.id).await.unwrap();
+
+        let after = runtime.start(&before.id, &hello_manifest()).await.unwrap();
+
+        assert_eq!(after.id, before.id);
+        // A published port belongs to a run of a container rather than to the
+        // container, so the address is read again rather than remembered. It
+        // usually *is* a different port — but the engine is free to hand back
+        // the one it just freed, so what this asserts is that the address came
+        // from the engine and is usable, not that it changed.
+        assert!(after.upstream.ip().is_loopback());
+        assert_ne!(after.upstream.port(), 0);
+        assert_eq!(
+            runtime.adopt(&app, &hello_manifest()).await.unwrap(),
+            Some(Adopted::Running(after.clone())),
+        );
+
+        runtime.remove(&before.id).await.unwrap();
+        // Stopping something that is gone is not an error either.
+        runtime.stop(&before.id).await.unwrap();
     }
 
     #[tokio::test]
