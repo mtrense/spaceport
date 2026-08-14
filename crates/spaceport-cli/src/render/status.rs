@@ -50,6 +50,12 @@ pub fn status(status: &Status, colour: Colour) -> String {
         "edge",
         &format!("http {}, https {}", status.edge.http, status.edge.https),
     );
+    // Only when there is one. A spaceport that answers to no name of its own is
+    // a normal spaceport, and a line saying so every time would read as a
+    // setting somebody forgot rather than one they never needed.
+    if let Some(hostname) = &status.edge.hostname {
+        line("hostname", hostname);
+    }
     line("hosts", &format!("{} routed", status.edge.routed_hosts));
 
     let directory = match &status.tls.directory {
@@ -285,6 +291,7 @@ mod tests {
                 error: None,
             },
             edge: Edge {
+                hostname: None,
                 http: "0.0.0.0:80".parse().unwrap(),
                 https: "0.0.0.0:443".parse().unwrap(),
                 routed_hosts: 7,

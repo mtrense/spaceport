@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, de};
 
+use crate::app::manifest::Host;
+
 /// Path used when no `--config` is given.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/spaceport/spaceport.yaml";
 
@@ -22,6 +24,12 @@ pub const REFERENCE_CONFIG: &str = "\
 # setup will not overwrite it again.
 schema_version: 1
 edge:
+  # The host spaceport answers to as itself, rather than on behalf of an app.
+  # Routed and certified exactly as an app's host is, and no app may claim it.
+  # This is the address to hand to an outside service that has to call back.
+  # Leave it out and spaceport answers to no name but its apps'.
+  #
+  # hostname: spaceport.example.com
   listen:
     http: 0.0.0.0:80
     https: 0.0.0.0:443
@@ -152,6 +160,17 @@ impl<'de> Deserialize<'de> for SchemaVersion {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Edge {
+    /// The host spaceport answers to as itself, rather than on behalf of an
+    /// app. It is routed exactly as an app's host is — claimed against every
+    /// app, certified with the same machinery — and it is what an outside
+    /// service is given when it needs somewhere to call back to.
+    ///
+    /// Optional, because a host that only proxies apps needs no address of its
+    /// own and a config written before this existed has to go on working. A
+    /// spaceport without one simply answers to no name but its apps'.
+    #[serde(default)]
+    pub hostname: Option<Host>,
+
     pub listen: Listen,
 
     /// Where the `https` listener gets its certificate.
@@ -466,6 +485,45 @@ edge:
         .to_string();
 
         assert!(err.contains("self-signed"), "{err}");
+    }
+
+    /// A config written before spaceport had an address of its own has to go on
+    /// working, and does: without the key it simply answers to no name but its
+    /// apps'.
+    #[test]
+    fn has_no_hostname_of_its_own_unless_given_one() {
+        assert_eq!(Config::parse(MINIMAL).unwrap().edge.hostname, None);
+    }
+
+    #[test]
+    fn takes_the_hostname_the_config_names() {
+        let raw = MINIMAL.replace("edge:\n", "edge:\n  hostname: Spaceport.Example.COM\n");
+        let config = Config::parse(&raw).unwrap();
+
+        // Normalised on the way in, exactly as an app's host is: the routing
+        // table is a plain map and the edge never has to think about case.
+        assert_eq!(
+            config.edge.hostname.unwrap().as_str(),
+            "spaceport.example.com"
+        );
+    }
+
+    /// The same validation an app's host gets — a hostname spaceport cannot
+    /// route is worth refusing at startup rather than at the first callback.
+    #[test]
+    fn rejects_a_hostname_that_could_never_be_routed() {
+        // A port never matches (the edge strips it before looking a host up), a
+        // leading hyphen is not a label, and an underscore is not a hostname.
+        for (bad, reason) in [
+            ("spaceport.example.com:443", "without a port"),
+            ("-nope.test", "hyphen"),
+            ("not_a_host.test", "letters, digits, hyphens and dots"),
+        ] {
+            let raw = MINIMAL.replace("edge:\n", &format!("edge:\n  hostname: {bad}\n"));
+            let err = Config::parse(&raw).unwrap_err().to_string();
+
+            assert!(err.contains(reason), "{bad}: {err}");
+        }
     }
 
     #[test]

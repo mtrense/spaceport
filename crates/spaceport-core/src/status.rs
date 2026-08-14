@@ -70,6 +70,7 @@ impl Instance {
             config: self.config_path.display().to_string(),
             state: self.state().await,
             edge: Edge {
+                hostname: self.config.edge.hostname.as_ref().map(ToString::to_string),
                 http: self.config.edge.listen.http,
                 https: self.config.edge.listen.https,
                 routed_hosts: routed_hosts.len(),
@@ -317,6 +318,11 @@ pub struct State {
 /// Where client traffic comes in, and how much of it is claimed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Edge {
+    /// The host spaceport answers to as itself, if it was given one. What an
+    /// operator needs when they are about to hand an outside service an address
+    /// to call back on, and the first thing to check when one cannot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     pub http: SocketAddr,
     pub https: SocketAddr,
     /// How many hosts an app answers for.

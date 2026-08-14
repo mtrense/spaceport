@@ -5,6 +5,7 @@
 //! the TLS handshake, so a slow or hostile client can never stall the loop
 //! that is admitting everyone else.
 
+pub(crate) mod home;
 pub(crate) mod proxy;
 pub(crate) mod routes;
 mod service;
@@ -34,8 +35,12 @@ use service::EdgeService;
 /// What every connection shares. Cheap to clone behind an `Arc`; nothing in
 /// here is touched on the proxy path except the two scalars.
 pub struct EdgeState {
-    /// The routes spaceport answers itself.
+    /// The routes spaceport answers itself, on every host.
     pub router: Router,
+    /// The app spaceport serves on its own hostname, if it was given one. Kept
+    /// whether or not there is a hostname: which host reaches it is the routing
+    /// table's business, and the edge only needs the thing to hand it to.
+    pub home: Router,
     /// The apps traffic is forwarded to.
     pub apps: Arc<AppStore>,
     /// The connection pool traffic is forwarded through.
@@ -64,6 +69,7 @@ pub async fn serve(
 
     let state = Arc::new(EdgeState {
         router: routes::router(challenges),
+        home: home::router(),
         apps,
         upstreams: proxy::Upstreams::new(),
         https_port: listen.https.port(),

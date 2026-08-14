@@ -361,7 +361,13 @@ async fn run(args: RunArgs) -> Result<()> {
     let runtime = Arc::new(DockerRuntime::connect(data)?);
     runtime.ping().await?;
 
-    let apps = Arc::new(AppStore::new());
+    // Spaceport's own host is claimed before the first app is restored, so
+    // there is no window in which one could take it.
+    let apps = Arc::new(AppStore::answering_to(config.edge.hostname.clone()));
+    if let Some(hostname) = &config.edge.hostname {
+        info!(%hostname, "answering to this host as spaceport itself");
+    }
+
     let applier = Arc::new(Applier::new(
         apps.clone(),
         runtime,
@@ -621,6 +627,13 @@ fn check_config(args: ConfigArgs) -> Result<()> {
     let config = Config::load(&args.config)?;
 
     println!("{}: ok", args.config.display());
+    // Ahead of the listeners: this is the name the config *means*, and the
+    // addresses below are only where it is answered. Echoed back normalised, so
+    // a hostname that was typed in mixed case is confirmed as it will be routed.
+    match &config.edge.hostname {
+        Some(hostname) => println!("  edge answers to {hostname} as spaceport itself"),
+        None => println!("  edge answers to no host of its own"),
+    }
     for (proto, addr) in listeners(&config) {
         println!("  edge listens for {proto} on {addr}");
     }

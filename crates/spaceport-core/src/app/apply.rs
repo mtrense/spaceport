@@ -704,7 +704,7 @@ impl Applier {
     fn free_of_conflict(&self, id: &AppId, manifest: &AppManifest) -> Result<(), ApplyError> {
         match self.store.conflict(id, &manifest.routing.hosts) {
             Some((host, owner)) => Err(ApplyError::Conflict(anyhow!(
-                "host `{host}` is already claimed by app `{owner}`"
+                "host `{host}` is already claimed by {owner}"
             ))),
             None => Ok(()),
         }

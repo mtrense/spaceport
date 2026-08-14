@@ -23,6 +23,7 @@ use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use tower::ServiceExt;
 use tracing::{debug, warn};
 
 use super::EdgeState;
@@ -94,6 +95,17 @@ pub async fn handle(
 
     let app = match state.apps.routes().lookup(name).cloned() {
         Some(Route::Live(app)) => app,
+        // Spaceport's own host, which is served in this process. The body is
+        // boxed on the way in, as it is for every other route spaceport answers
+        // itself — the cost axum's ergonomics are worth on everything that is
+        // not the proxy path.
+        Some(Route::Spaceport) => {
+            let home = state.home.clone();
+            return Ok(home
+                .oneshot(req.map(Body::new))
+                .await
+                .unwrap_or_else(|never| match never {}));
+        }
         // The host is spoken for, by an app an operator has taken out of
         // service on purpose. Saying so — rather than 404, which would mean
         // spaceport has never heard of this name — is the difference between a
@@ -377,6 +389,7 @@ mod tests {
     async fn edge(apps: Arc<AppStore>) -> SocketAddr {
         let state = Arc::new(EdgeState {
             router: routes::router(std::sync::Arc::new(crate::acme::Challenges::new())),
+            home: crate::edge::home::router(),
             apps,
             upstreams: Upstreams::new(),
             https_port: 443,
@@ -524,5 +537,50 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "ok\n");
+    }
+
+    /// Reached over the same listener, by the same host lookup, as any app —
+    /// and answered in this process rather than forwarded anywhere.
+    #[tokio::test]
+    async fn serves_its_own_hostname_itself() {
+        let apps = Arc::new(AppStore::answering_to(Some(
+            "spaceport.test".parse().unwrap(),
+        )));
+        apps.insert(app("hello", "alpha.test", upstream().await))
+            .unwrap();
+        let edge = edge(apps).await;
+
+        let (status, body) = get(edge, "spaceport.test", "/").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.starts_with("spaceport "), "{body}");
+    }
+
+    /// Its own host is one host, not a catch-all: an app applied alongside it
+    /// still gets its traffic.
+    #[tokio::test]
+    async fn goes_on_forwarding_every_other_host() {
+        let apps = Arc::new(AppStore::answering_to(Some(
+            "spaceport.test".parse().unwrap(),
+        )));
+        apps.insert(app("hello", "alpha.test", upstream().await))
+            .unwrap();
+        let edge = edge(apps).await;
+
+        let (status, body) = get(edge, "alpha.test", "/greet").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.starts_with("host=alpha.test"), "{body}");
+    }
+
+    /// A spaceport that was given no hostname answers to none: the host that
+    /// would have been its own is a 404 like any other name.
+    #[tokio::test]
+    async fn serves_no_host_of_its_own_unless_configured() {
+        let edge = edge(Arc::new(AppStore::new())).await;
+
+        let (status, _) = get(edge, "spaceport.test", "/").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

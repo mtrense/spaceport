@@ -1,5 +1,11 @@
 schema_version: 1
 edge:
+  # The host spaceport answers to as itself, rather than on behalf of an app.
+  # It is routed exactly as an app's host is — no app may claim it, and it is
+  # certified by whatever the tls provider below is. This is the address to
+  # hand to an outside service that has to reach spaceport itself.
+  #
+  # hostname: spaceport.example.com
   listen:
     http: 0.0.0.0:80
     https: 0.0.0.0:443

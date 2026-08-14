@@ -25,6 +25,14 @@
 //! only in what an operator should read into it — one is a decision, the other
 //! is a fault — and so it is only a difference in what the edge says and what a
 //! status reports, never in what is claimed.
+//!
+//! One entry in the table belongs to no app at all: the host spaceport answers
+//! to as itself, configured as `edge.hostname` and served in spaceport's own
+//! process. It could have been a check in front of the edge instead, and is not,
+//! because being a route is what buys everything an address needs — the host is
+//! claimed against every app that will ever be applied, [`Routes::hosts`] names
+//! it so it is certified and renewed like any other, and the edge reaches it by
+//! the one lookup it already does. The only thing it does not do is forward.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
@@ -120,14 +128,24 @@ pub enum Route {
     /// about both, which is to come back — and say something different, because
     /// the operator cannot.
     Down(AppId),
+    /// The host spaceport answers to as itself. Served in-process rather than
+    /// forwarded anywhere, and belonging to no app.
+    ///
+    /// A route rather than a check in front of the edge on purpose: being in
+    /// the table is what claims the host against every app, what gets it a
+    /// certificate, and what makes it reachable by exactly the same lookup as
+    /// everything else.
+    Spaceport,
 }
 
 impl Route {
-    /// Whose route this is, running or not.
-    pub fn app(&self) -> &AppId {
+    /// Whose route this is, running or not. `None` for spaceport's own host,
+    /// which is nobody's.
+    pub fn app(&self) -> Option<&AppId> {
         match self {
-            Self::Live(app) => &app.id,
-            Self::Suspended(id) | Self::Down(id) => id,
+            Self::Live(app) => Some(&app.id),
+            Self::Suspended(id) | Self::Down(id) => Some(id),
+            Self::Spaceport => None,
         }
     }
 
@@ -135,7 +153,27 @@ impl Route {
     pub fn live(&self) -> Option<&Arc<App>> {
         match self {
             Self::Live(app) => Some(app),
-            Self::Suspended(_) | Self::Down(_) => None,
+            Self::Suspended(_) | Self::Down(_) | Self::Spaceport => None,
+        }
+    }
+}
+
+/// Who holds a host another app asked for.
+///
+/// An app is the usual answer and spaceport itself is the other one, and they
+/// read differently to an operator: one is a name to negotiate for, the other
+/// is a name to pick again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Claim {
+    App(AppId),
+    Spaceport,
+}
+
+impl std::fmt::Display for Claim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::App(id) => write!(f, "app `{id}`"),
+            Self::Spaceport => f.write_str("spaceport itself"),
         }
     }
 }
@@ -206,6 +244,10 @@ impl Default for AppStore {
 
 #[derive(Debug, Default)]
 struct Inner {
+    /// The host spaceport answers to as itself, if it was given one. Not an
+    /// app, and so not in any of the three maps — but in every routing table
+    /// they build, which is the whole point of it being here.
+    hostname: Option<Host>,
     /// Ordered, so listing apps is stable between calls.
     apps: BTreeMap<AppId, Arc<App>>,
     /// The apps that are recorded and claiming hosts but are not being run.
@@ -230,6 +272,22 @@ impl AppStore {
         Self::default()
     }
 
+    /// A store whose routing table also answers to `hostname` as spaceport
+    /// itself.
+    ///
+    /// The host is claimed from the first table onwards, before any app has
+    /// been applied, so there is no window in which an app could take it.
+    pub fn answering_to(hostname: Option<Host>) -> Self {
+        let store = Self::default();
+        if let Some(hostname) = hostname {
+            let mut inner = store.write();
+            inner.hostname = Some(hostname);
+            inner.rebuild_routes();
+        }
+
+        store
+    }
+
     /// The current routing snapshot. Cheap, and safe to hold across an await:
     /// the lock is released before this returns.
     pub fn routes(&self) -> Arc<Routes> {
@@ -246,7 +304,7 @@ impl AppStore {
         let mut inner = self.write();
 
         if let Some((host, owner)) = conflict(&inner.routes, &app.id, app.hosts()) {
-            bail!("host `{host}` is already claimed by app `{owner}`");
+            bail!("host `{host}` is already claimed by {owner}");
         }
 
         // An app that starts is no longer a suspended one, however it got here:
@@ -289,12 +347,12 @@ impl AppStore {
         self.generation.send_modify(|generation| *generation += 1);
     }
 
-    /// The first of `hosts` another app already serves, and which app that is.
+    /// The first of `hosts` that is already spoken for, and who by.
     ///
     /// [`AppStore::insert`] enforces this too — this is for asking *before*
     /// doing the expensive part of an apply, so a manifest that could never be
     /// routed does not get a container started for it first.
-    pub fn conflict(&self, id: &AppId, hosts: &[Host]) -> Option<(Host, AppId)> {
+    pub fn conflict(&self, id: &AppId, hosts: &[Host]) -> Option<(Host, Claim)> {
         conflict(&self.read().routes, id, hosts)
     }
 
@@ -341,7 +399,7 @@ impl AppStore {
         let mut inner = self.write();
 
         if let Some((host, owner)) = conflict(&inner.routes, &suspended.id, suspended.hosts()) {
-            bail!("host `{host}` is already claimed by app `{owner}`");
+            bail!("host `{host}` is already claimed by {owner}");
         }
 
         let id = suspended.id.clone();
@@ -409,7 +467,7 @@ impl AppStore {
         let mut inner = self.write();
 
         if let Some((host, owner)) = conflict(&inner.routes, &downed.id, downed.hosts()) {
-            bail!("host `{host}` is already claimed by app `{owner}`");
+            bail!("host `{host}` is already claimed by {owner}");
         }
 
         let id = downed.id.clone();
@@ -619,18 +677,24 @@ fn hosts(hosts: &[Host]) -> String {
         .join(", ")
 }
 
-/// Which of `hosts` is already taken by an app other than `id`.
+/// Which of `hosts` is already taken by someone other than `id`.
 ///
 /// Taken, not served: a suspended app holds its hosts against every other app
 /// exactly as a running one does. Anything else and an app could not be counted
 /// on to come back — the operator would resume it and find its name gone.
-fn conflict(routes: &Routes, id: &AppId, hosts: &[Host]) -> Option<(Host, AppId)> {
+///
+/// Spaceport's own hostname is taken by nobody who will ever give it up, which
+/// is why the answer says who holds a host rather than which app does.
+fn conflict(routes: &Routes, id: &AppId, hosts: &[Host]) -> Option<(Host, Claim)> {
     hosts.iter().find_map(|host| {
-        routes
-            .by_host
-            .get(host)
-            .filter(|route| route.app() != id)
-            .map(|route| (host.clone(), route.app().clone()))
+        let claim = match routes.by_host.get(host)? {
+            // Its own host, which it may keep, drop or re-claim freely.
+            route if route.app() == Some(id) => return None,
+            Route::Spaceport => Claim::Spaceport,
+            route => Claim::App(route.app()?.clone()),
+        };
+
+        Some((host.clone(), claim))
     })
 }
 
@@ -639,6 +703,10 @@ impl Inner {
     /// the cost buys the edge a map it never has to lock.
     fn rebuild_routes(&mut self) {
         let mut by_host = HashMap::new();
+        // Spaceport's own host goes in last, so that it wins the map outright
+        // rather than only by the conflict checks having done their job. The
+        // checks are what tell an operator why their app was refused; this is
+        // what makes it true whatever else went in.
         for app in self.apps.values() {
             for host in app.hosts() {
                 by_host.insert(host.clone(), Route::Live(app.clone()));
@@ -653,6 +721,9 @@ impl Inner {
             for host in app.hosts() {
                 by_host.insert(host.clone(), Route::Down(app.id.clone()));
             }
+        }
+        if let Some(hostname) = &self.hostname {
+            by_host.insert(hostname.clone(), Route::Spaceport);
         }
 
         self.routes = Arc::new(Routes { by_host });
@@ -1099,6 +1170,125 @@ routing:
         assert_eq!(containers.len(), 2);
         assert!(containers.contains(&ContainerId::new("container-of-running")));
         assert!(containers.contains(&ContainerId::new("container-of-kept")));
+    }
+
+    /// A store with a hostname of spaceport's own.
+    fn answering_to(hostname: &str) -> AppStore {
+        AppStore::answering_to(Some(hostname.parse().unwrap()))
+    }
+
+    /// Reachable by the same lookup as everything else — that is what makes it
+    /// "routed like an app" rather than a special case in front of the edge.
+    #[test]
+    fn routes_its_own_hostname() {
+        let store = answering_to("spaceport.test");
+
+        assert!(matches!(
+            store.routes().lookup("spaceport.test"),
+            Some(Route::Spaceport)
+        ));
+        // Nothing to forward to: it is served in spaceport's own process.
+        assert!(store.routes().serving("spaceport.test").is_none());
+        assert!(store.apps().is_empty());
+    }
+
+    #[test]
+    fn has_no_host_of_its_own_unless_configured() {
+        assert!(AppStore::answering_to(None).routes().is_empty());
+    }
+
+    #[test]
+    fn looks_its_own_hostname_up_case_insensitively() {
+        let store = answering_to("spaceport.test");
+
+        assert!(store.routes().lookup("Spaceport.TEST").is_some());
+    }
+
+    /// The claim holds from the very first routing table, before any app has
+    /// been applied — there is no window in which one could take it.
+    #[test]
+    fn refuses_an_app_that_wants_spaceports_own_hostname() {
+        let store = answering_to("spaceport.test");
+
+        let err = store
+            .insert(app("thief", &["spaceport.test"], 8080))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("already claimed by spaceport itself"), "{err}");
+        assert!(store.apps().is_empty());
+        assert!(matches!(
+            store.routes().lookup("spaceport.test"),
+            Some(Route::Spaceport)
+        ));
+    }
+
+    /// Refused before the expensive part of an apply, like any other conflict.
+    #[test]
+    fn says_who_holds_its_own_hostname_before_anything_is_started() {
+        let store = answering_to("spaceport.test");
+        let hosts: [Host; 1] = ["spaceport.test".parse().unwrap()];
+
+        let (host, claim) = store.conflict(&"thief".parse().unwrap(), &hosts).unwrap();
+
+        assert_eq!(host.as_str(), "spaceport.test");
+        assert_eq!(claim, Claim::Spaceport);
+        assert_eq!(claim.to_string(), "spaceport itself");
+    }
+
+    #[test]
+    fn refuses_a_suspended_or_down_app_over_its_own_hostname_too() {
+        let store = answering_to("spaceport.test");
+
+        let suspending = store
+            .insert_suspended(suspended("thief", &["spaceport.test"]))
+            .unwrap_err()
+            .to_string();
+        let downing = store
+            .insert_down(downed("thief", &["spaceport.test"], "never started"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            suspending.contains("claimed by spaceport itself"),
+            "{suspending}"
+        );
+        assert!(downing.contains("claimed by spaceport itself"), "{downing}");
+    }
+
+    /// Certificates are acquired for every name spaceport answers to, and its
+    /// own is one of them — an address an outside service is given has to
+    /// complete a handshake like any other.
+    #[test]
+    fn its_own_hostname_asks_for_a_certificate() {
+        let store = answering_to("spaceport.test");
+        store.insert(app("hello", &["alpha.test"], 8080)).unwrap();
+
+        let hosts = store.routes().hosts();
+
+        assert_eq!(hosts.len(), 2);
+        assert!(hosts.contains("spaceport.test"));
+        assert!(hosts.contains("alpha.test"));
+    }
+
+    /// Every mutation rebuilds the table from scratch, and the host has to
+    /// survive all of them — it is not an app, so nothing else would put it back.
+    #[test]
+    fn keeps_its_own_hostname_across_every_rebuild() {
+        let store = answering_to("spaceport.test");
+        let id: AppId = "hello".parse().unwrap();
+
+        store.insert(app("hello", &["alpha.test"], 8080)).unwrap();
+        store.suspend(&id, None);
+        store.insert(app("hello", &["alpha.test"], 9090)).unwrap();
+        store.take_down(&id, "the container stopped");
+        store.remove(&id);
+
+        assert!(matches!(
+            store.routes().lookup("spaceport.test"),
+            Some(Route::Spaceport)
+        ));
+        assert_eq!(store.routes().len(), 1);
     }
 
     #[test]
