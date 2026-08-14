@@ -12,6 +12,45 @@ pub const DEFAULT_CONFIG_PATH: &str = "/etc/spaceport/spaceport.yaml";
 /// The only schema this build understands, for configs and app manifests alike.
 pub const SCHEMA_VERSION: u64 = 1;
 
+/// The config [`crate::setup`] writes when a host has none yet.
+///
+/// Everything mandatory, filled in with what a fresh host wants, and everything
+/// else named in a comment: the file an operator opens next has to say what it
+/// is they can change, because there is nowhere else on the host that does.
+pub const REFERENCE_CONFIG: &str = "\
+# Written by `spaceport setup` because this host had no config yet. Yours now —
+# setup will not overwrite it again.
+schema_version: 1
+edge:
+  listen:
+    http: 0.0.0.0:80
+    https: 0.0.0.0:443
+  tls:
+    # `self-signed` generates a throwaway certificate at every start. Nothing
+    # trusts it, so it is for development and nothing else.
+    provider: self-signed
+
+    # `acme` gets a real certificate per host from a CA, proving control of each
+    # host over the plaintext listener. It needs the hosts' DNS to point here
+    # and port 80 to be reachable from the internet.
+    #
+    # provider: acme
+    # acme:
+    #   # `staging`, `production`, or another CA's directory URL. Staging by
+    #   # default: the first run of a new setup is the one most likely to be
+    #   # wrong, and staging is the environment that forgives that.
+    #   directory: staging
+    #   # Where the CA sends expiry and revocation notices.
+    #   contact: [mailto:ops@example.com]
+    #   # No CA issues without this, so spaceport refuses to start without it.
+    #   terms_of_service_agreed: true
+state:
+  # Where spaceport remembers the apps it has been told to run, and the
+  # certificates it has been issued. Created if it is not there, and readable
+  # only by the user spaceport runs as.
+  directory: /var/lib/spaceport
+";
+
 /// A parsed and validated spaceport configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -242,6 +281,19 @@ edge:
         let raw = std::fs::read_to_string(&path).unwrap();
 
         Config::parse(&raw).unwrap();
+    }
+
+    /// `spaceport setup` writes this one onto hosts, unread, and a host whose
+    /// service will not start is a poor way to find out it does not parse.
+    #[test]
+    fn the_reference_config_is_valid() {
+        let config = Config::parse(REFERENCE_CONFIG).unwrap();
+
+        assert_eq!(config.edge.tls.provider, TlsProvider::SelfSigned);
+        assert_eq!(
+            config.state.directory,
+            PathBuf::from(crate::state::DEFAULT_STATE_DIR)
+        );
     }
 
     #[test]

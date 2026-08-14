@@ -10,6 +10,7 @@ use spaceport_core::app::{AppId, AppRepository, AppStore, Applier, Pattern, reco
 use spaceport_core::config::TlsProvider;
 use spaceport_core::operator::{DEFAULT_OPERATOR_ENDPOINT, client, server};
 use spaceport_core::runtime::DockerRuntime;
+use spaceport_core::setup;
 use spaceport_core::state::{self, Db, StateLock};
 use spaceport_core::{Config, OperatorEndpoint, acme, config::DEFAULT_CONFIG_PATH, edge};
 use tokio_util::sync::CancellationToken;
@@ -27,6 +28,9 @@ struct Cli {
 enum Command {
     /// Start spaceport in the foreground.
     Run(RunArgs),
+    /// Install this spaceport on the host as a system service, or update the
+    /// one that is already installed.
+    Setup(SetupArgs),
     /// Check that spaceport is set up correctly.
     Check {
         #[command(subcommand)]
@@ -45,6 +49,22 @@ struct RunArgs {
     config: ConfigArgs,
 
     /// Expose the operator interface on a unix socket path or local address.
+    #[arg(short, long, value_name = "SOCKET|ADDRESS")]
+    operator: Option<OperatorEndpoint>,
+}
+
+#[derive(Debug, Args)]
+struct SetupArgs {
+    /// A config file to install at the config path. Without one, a host that
+    /// has no config yet gets a reference one to edit.
+    #[arg(short, long, value_name = "FILE")]
+    initial_config: Option<PathBuf>,
+
+    #[command(flatten)]
+    config: ConfigArgs,
+
+    /// Expose the operator interface on a unix socket path or local address.
+    /// Leaving it out is what takes an installed one away again.
     #[arg(short, long, value_name = "SOCKET|ADDRESS")]
     operator: Option<OperatorEndpoint>,
 }
@@ -122,6 +142,7 @@ struct ConfigArgs {
 async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Run(args) => run(args).await,
+        Command::Setup(args) => setup(args),
         Command::Check { command } => match command {
             CheckCommand::Config(args) => check_config(args),
             CheckCommand::State(args) => check_state(args).await,
@@ -248,6 +269,20 @@ async fn run(args: RunArgs) -> Result<()> {
     }
 
     served
+}
+
+/// Install this binary as the host's spaceport service, and start it.
+fn setup(args: SetupArgs) -> Result<()> {
+    let report = setup::install(&setup::Setup {
+        config: args.config.config,
+        initial_config: args.initial_config,
+        operator: args.operator,
+    })?;
+
+    println!("{report}");
+    println!("{}: enabled and restarted", setup::systemd::UNIT_NAME);
+
+    Ok(())
 }
 
 async fn apply(args: ApplyArgs) -> Result<()> {
