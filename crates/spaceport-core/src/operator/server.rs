@@ -42,7 +42,7 @@ pub async fn serve(
     events: Arc<EventBus>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let router = router(applier, events);
+    let router = router(applier, events, shutdown.clone());
 
     match endpoint {
         OperatorEndpoint::Tcp(addr) => {
@@ -113,12 +113,16 @@ where
     Ok(())
 }
 
-fn router(applier: Arc<Applier>, events: Arc<EventBus>) -> Router {
+fn router(applier: Arc<Applier>, events: Arc<EventBus>, shutdown: CancellationToken) -> Router {
     Router::new()
         .route("/apps", get(list))
         .route("/apps/{id}", put(apply).delete(destroy))
         .route("/events", get(events_stream))
-        .with_state(Operator { applier, events })
+        .with_state(Operator {
+            applier,
+            events,
+            shutdown,
+        })
 }
 
 /// What the handlers work from. Each of them extracts the one half it needs,
@@ -127,6 +131,7 @@ fn router(applier: Arc<Applier>, events: Arc<EventBus>) -> Router {
 struct Operator {
     applier: Arc<Applier>,
     events: Arc<EventBus>,
+    shutdown: CancellationToken,
 }
 
 impl FromRef<Operator> for Arc<Applier> {
@@ -141,6 +146,12 @@ impl FromRef<Operator> for Arc<EventBus> {
     }
 }
 
+impl FromRef<Operator> for CancellationToken {
+    fn from_ref(operator: &Operator) -> Self {
+        operator.shutdown.clone()
+    }
+}
+
 /// `GET /events?app=&category=&level=&history=`: what spaceport is doing, as
 /// it does it.
 ///
@@ -148,8 +159,14 @@ impl FromRef<Operator> for Arc<EventBus> {
 /// watcher stays connected until it or spaceport goes away. Filtering happens
 /// here rather than at the far end so that watching one app does not mean
 /// shipping every event to a client that will discard nearly all of them.
+///
+/// "Spaceport goes away" has to end the stream from this side: a graceful
+/// shutdown waits for the responses still in flight, and a stream that only
+/// ends when the client hangs up would hold the whole process open for as long
+/// as somebody is watching it.
 async fn events_stream(
     State(events): State<Arc<EventBus>>,
+    State(shutdown): State<CancellationToken>,
     Query(query): Query<EventQuery>,
 ) -> Response {
     let filter = match query.filter() {
@@ -163,29 +180,39 @@ async fn events_stream(
         past.into_iter()
             .map(|event| Ok::<Bytes, Infallible>(line(&event))),
     );
-    let live = futures_util::stream::unfold((receiver, filter), |(mut receiver, filter)| async {
-        loop {
-            match receiver.recv().await {
-                Ok(event) if filter.matches(&event) => {
-                    return Some((Ok(line(&event)), (receiver, filter)));
-                }
-                // Not for this watcher; wait for one that is.
-                Ok(_) => {}
-                // A watcher too slow to keep up is told so in the stream
-                // itself, which is the only place it would notice.
-                Err(RecvError::Lagged(missed)) => {
-                    let event = Event::now(
-                        Level::Warn,
-                        "stream",
-                        format!("dropped {missed} events this client could not keep up with"),
-                    );
+    let live = futures_util::stream::unfold(
+        (receiver, filter, shutdown),
+        |(mut receiver, filter, shutdown)| async {
+            loop {
+                let received = tokio::select! {
+                    // Spaceport is stopping, so there is nothing more to
+                    // report and nothing to wait for.
+                    () = shutdown.cancelled() => return None,
+                    received = receiver.recv() => received,
+                };
 
-                    return Some((Ok(line(&event)), (receiver, filter)));
+                match received {
+                    Ok(event) if filter.matches(&event) => {
+                        return Some((Ok(line(&event)), (receiver, filter, shutdown)));
+                    }
+                    // Not for this watcher; wait for one that is.
+                    Ok(_) => {}
+                    // A watcher too slow to keep up is told so in the stream
+                    // itself, which is the only place it would notice.
+                    Err(RecvError::Lagged(missed)) => {
+                        let event = Event::now(
+                            Level::Warn,
+                            "stream",
+                            format!("dropped {missed} events this client could not keep up with"),
+                        );
+
+                        return Some((Ok(line(&event)), (receiver, filter, shutdown)));
+                    }
+                    Err(RecvError::Closed) => return None,
                 }
-                Err(RecvError::Closed) => return None,
             }
-        }
-    });
+        },
+    );
 
     Response::builder()
         .header(http::header::CONTENT_TYPE, "application/x-ndjson")
@@ -507,18 +534,33 @@ container:
     }
 
     fn router_and_events() -> (Router, Arc<EventBus>) {
-        let (_, router, events) = store_router_and_events_on(OneContainer::default());
+        let (_, router, events, _) = parts_on(OneContainer::default());
 
         (router, events)
     }
 
     fn store_router_and_events_on(runtime: OneContainer) -> (Arc<AppStore>, Router, Arc<EventBus>) {
+        let (store, router, events, _) = parts_on(runtime);
+
+        (store, router, events)
+    }
+
+    /// Everything a test might want a hand on, shutdown token included.
+    fn parts_on(
+        runtime: OneContainer,
+    ) -> (Arc<AppStore>, Router, Arc<EventBus>, CancellationToken) {
         let store = Arc::new(AppStore::new());
         let repository = AppRepository::new(Db::in_memory().unwrap());
         let applier = Applier::new(store.clone(), Arc::new(runtime), repository);
         let events = Arc::new(EventBus::new());
+        let shutdown = CancellationToken::new();
 
-        (store, router(Arc::new(applier), events.clone()), events)
+        (
+            store,
+            router(Arc::new(applier), events.clone(), shutdown.clone()),
+            events,
+            shutdown,
+        )
     }
 
     /// An event as a call site would have produced it.
@@ -882,6 +924,19 @@ container:
         events.emit(event(Level::Info, None, "after"));
 
         assert_eq!(next_line(&mut stream).await.message, "after");
+    }
+
+    /// A stream that outlived the shutdown would be a response still in
+    /// flight, and a graceful shutdown waits for those: the process would hang
+    /// for as long as anyone was watching it.
+    #[tokio::test]
+    async fn a_watcher_is_let_go_when_spaceport_shuts_down() {
+        let (_, router, _, shutdown) = parts_on(OneContainer::default());
+        let mut stream = watch(&router, "").await;
+
+        shutdown.cancel();
+
+        assert!(stream.next().await.is_none(), "the stream should have ended");
     }
 
     #[tokio::test]
