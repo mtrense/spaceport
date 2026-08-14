@@ -29,6 +29,7 @@ use super::OperatorEndpoint;
 use crate::app::apply::{Applier, ApplyError, DestroyError};
 use crate::app::{App, AppId, AppManifest, Pattern, health};
 use crate::events::{Event, EventBus, EventFilter, Level};
+use crate::status::Instance;
 
 /// Only the owner may talk to the socket: reaching it is the right to start
 /// containers on this host.
@@ -38,11 +39,11 @@ const SOCKET_MODE: u32 = 0o600;
 /// Serve the operator interface until `shutdown` is cancelled.
 pub async fn serve(
     endpoint: &OperatorEndpoint,
-    applier: Arc<Applier>,
+    instance: Arc<Instance>,
     events: Arc<EventBus>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let router = router(applier, events, shutdown.clone());
+    let router = router(instance, events, shutdown.clone());
 
     match endpoint {
         OperatorEndpoint::Tcp(addr) => {
@@ -113,30 +114,38 @@ where
     Ok(())
 }
 
-fn router(applier: Arc<Applier>, events: Arc<EventBus>, shutdown: CancellationToken) -> Router {
+fn router(instance: Arc<Instance>, events: Arc<EventBus>, shutdown: CancellationToken) -> Router {
     Router::new()
         .route("/apps", get(list))
         .route("/apps/{id}", put(apply).delete(destroy))
         .route("/events", get(events_stream))
+        .route("/status", get(status))
         .with_state(Operator {
-            applier,
+            instance,
             events,
             shutdown,
         })
 }
 
-/// What the handlers work from. Each of them extracts the one half it needs,
-/// so adding the event bus did not change what an app handler asks for.
+/// What the handlers work from. Each of them extracts the one part it needs,
+/// so a handler that only applies apps never learns that there is an event bus
+/// or a config file anywhere near it.
 #[derive(Clone)]
 struct Operator {
-    applier: Arc<Applier>,
+    instance: Arc<Instance>,
     events: Arc<EventBus>,
     shutdown: CancellationToken,
 }
 
 impl FromRef<Operator> for Arc<Applier> {
     fn from_ref(operator: &Operator) -> Self {
-        operator.applier.clone()
+        operator.instance.applier.clone()
+    }
+}
+
+impl FromRef<Operator> for Arc<Instance> {
+    fn from_ref(operator: &Operator) -> Self {
+        operator.instance.clone()
     }
 }
 
@@ -304,37 +313,41 @@ struct ListQuery {
     pattern: Option<String>,
 }
 
-/// Where each app stands right now, in the order it was given.
+/// `GET /status`: what this spaceport is, as JSON.
 ///
-/// Checked concurrently: the answer is one round trip per app, and a listing
-/// should not take as long as the slowest dead app in it.
-async fn statuses(apps: &[Arc<App>]) -> Vec<&'static str> {
-    let checks: Vec<_> = apps
-        .iter()
-        .cloned()
-        .map(|app| {
-            tokio::spawn(async move {
-                // Any host of the app's own will do; the check is addressed to
-                // the upstream either way.
-                let host = app.hosts()[0].as_str();
-                let readiness = &app.manifest.container.health.readiness;
+/// JSON where the app routes answer in prose, because this is the one response
+/// whose rendering depends on who is reading it: `spaceport status` lays it out
+/// and colours it for a terminal, `--json` hands it straight on, and a script
+/// with `curl` gets something it can read either way.
+async fn status(State(instance): State<Arc<Instance>>) -> Response {
+    let status = instance.snapshot().await;
 
-                health::probe(app.upstream, host, readiness).await
-            })
-        })
-        .collect();
-
-    let mut statuses = Vec::with_capacity(checks.len());
-    for check in checks {
-        statuses.push(match check.await {
-            Ok(Ok(())) => "ready",
-            // Either the app did not answer or the check itself panicked, and
-            // an operator can do nothing different about the two.
-            _ => "unreachable",
-        });
+    match serde_json::to_vec(&status) {
+        Ok(body) => (
+            StatusCode::OK,
+            [(http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        // Nothing in a status can fail to serialise, and if one ever does the
+        // operator should hear about it rather than get half a report.
+        Err(error) => {
+            warn!(%error, "could not serialise the status");
+            refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not serialise the status: {error}"),
+            )
+        }
     }
+}
 
-    statuses
+/// Where each app stands right now, in the order it was given.
+async fn statuses(apps: &[Arc<App>]) -> Vec<&'static str> {
+    health::probe_all(apps)
+        .await
+        .into_iter()
+        .map(|ready| if ready { "ready" } else { "unreachable" })
+        .collect()
 }
 
 /// Render the apps as columns, wide enough for what is in them.
@@ -506,6 +519,13 @@ mod tests {
         }
     }
 
+    const CONFIG: &str = "schema_version: 1
+edge:
+  listen:
+    http: 0.0.0.0:8080
+    https: 0.0.0.0:8443
+";
+
     const MANIFEST: &str = "schema_version: 1
 source:
   type: image
@@ -550,14 +570,30 @@ container:
         runtime: OneContainer,
     ) -> (Arc<AppStore>, Router, Arc<EventBus>, CancellationToken) {
         let store = Arc::new(AppStore::new());
-        let repository = AppRepository::new(Db::in_memory().unwrap());
-        let applier = Applier::new(store.clone(), Arc::new(runtime), repository);
+        let db = Db::in_memory().unwrap();
+        let applier = Arc::new(Applier::new(
+            store.clone(),
+            Arc::new(runtime),
+            AppRepository::new(db.clone()),
+        ));
         let events = Arc::new(EventBus::new());
         let shutdown = CancellationToken::new();
 
+        let instance = Arc::new(Instance {
+            version: "9.9.9".to_owned(),
+            started_at: time::OffsetDateTime::now_utc(),
+            config_path: "/etc/spaceport/spaceport.yaml".into(),
+            config: crate::Config::parse(CONFIG).unwrap(),
+            operator: "/run/spaceport.sock".parse().unwrap(),
+            applier,
+            db,
+            certificates: None,
+            reconciled: crate::app::reconcile::Report::default(),
+        });
+
         (
             store,
-            router(Arc::new(applier), events.clone(), shutdown.clone()),
+            router(instance, events.clone(), shutdown.clone()),
             events,
             shutdown,
         )
@@ -936,7 +972,10 @@ container:
 
         shutdown.cancel();
 
-        assert!(stream.next().await.is_none(), "the stream should have ended");
+        assert!(
+            stream.next().await.is_none(),
+            "the stream should have ended"
+        );
     }
 
     #[tokio::test]
@@ -951,6 +990,26 @@ container:
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("level"), "{body}");
+    }
+
+    /// The one response that is not prose, and that a client parses back into
+    /// the type it was serialised from.
+    #[tokio::test]
+    async fn answers_the_status_as_json() {
+        let (router, _) = router_and_events();
+        put_app(&router, "hello", MANIFEST).await;
+
+        let request = Request::builder()
+            .uri("/status")
+            .body(Body::empty())
+            .unwrap();
+        let (code, body) = call(&router, request).await;
+
+        assert_eq!(code, StatusCode::OK);
+        let status: crate::status::Status = serde_json::from_str(&body).expect("a status");
+        assert_eq!(status.version, "9.9.9");
+        assert_eq!(status.apps.running, 1);
+        assert_eq!(status.edge.routed_hosts, 1);
     }
 
     #[tokio::test]

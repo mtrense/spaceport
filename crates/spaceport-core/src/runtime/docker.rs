@@ -304,6 +304,21 @@ impl ContainerRuntime for DockerRuntime {
         Ok(())
     }
 
+    async fn engine(&self) -> Result<String> {
+        let version = self
+            .docker
+            .version()
+            .await
+            .context("the docker daemon did not answer")?;
+        let unknown = || "unknown".to_owned();
+
+        Ok(format!(
+            "docker {} (api {})",
+            version.version.unwrap_or_else(unknown),
+            version.api_version.unwrap_or_else(unknown),
+        ))
+    }
+
     async fn managed(&self) -> Result<Vec<Managed>> {
         // `all`, not just the running ones: a container that died while
         // spaceport was down is still spaceport's to account for, and one left

@@ -20,6 +20,7 @@ use tokio::net::{TcpStream, UnixStream};
 use super::OperatorEndpoint;
 use crate::app::{AppId, Pattern};
 use crate::events::{Category, Event, Level};
+use crate::status::Status;
 
 /// Ask a running spaceport to apply `manifest` as the app named `id`.
 ///
@@ -43,6 +44,18 @@ pub async fn list(endpoint: &OperatorEndpoint, pattern: Option<&Pattern>) -> Res
     };
 
     send_to(endpoint, builder("GET", &uri).body(Full::default())?).await
+}
+
+/// Ask what this spaceport is and how it is doing.
+///
+/// The one call that comes back as data rather than as prose: what a status
+/// should look like depends on whether a person is reading it, and only this
+/// side knows that.
+pub async fn status(endpoint: &OperatorEndpoint) -> Result<Status> {
+    let body = send_to(endpoint, builder("GET", "/status").body(Full::default())?).await?;
+
+    serde_json::from_str(&body)
+        .context("the operator interface sent something that is not a status")
 }
 
 /// Ask it to stop the app named `id` and forget it.

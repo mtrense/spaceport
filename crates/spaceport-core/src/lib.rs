@@ -10,6 +10,7 @@ pub mod operator;
 pub mod runtime;
 pub mod setup;
 pub mod state;
+pub mod status;
 
 pub use app::{AppId, AppManifest};
 pub use config::Config;

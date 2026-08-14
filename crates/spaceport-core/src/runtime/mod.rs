@@ -98,6 +98,18 @@ pub trait ContainerRuntime: Send + Sync {
     /// Stop and delete a container. Succeeds if it is already gone.
     async fn remove(&self, id: &ContainerId) -> Result<()>;
 
+    /// What this engine is, in a few words for an operator to read.
+    ///
+    /// Asked of the engine rather than remembered, so that an answer arriving
+    /// at all is itself the news: this is how a status report finds out that
+    /// the daemon everything else depends on has gone away.
+    ///
+    /// The default is for engines that have nothing to say about themselves,
+    /// which is no real one.
+    async fn engine(&self) -> Result<String> {
+        Ok("an engine that does not name itself".to_owned())
+    }
+
     /// Every container this runtime is running for spaceport, running or not.
     ///
     /// Spaceport's containers outlive the spaceport that started them, so this

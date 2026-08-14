@@ -92,6 +92,36 @@ pub async fn probe(addr: SocketAddr, host: &str, readiness: &Readiness) -> Resul
 /// How long [`probe`] waits for an app to answer.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// [`probe`] every app at once, answering in the order they were given.
+///
+/// Concurrent because the answer is one round trip per app, and neither a
+/// listing nor a status report should take as long as the slowest dead app in
+/// it. A check that panicked counts as a failed one: an operator can do nothing
+/// different about the two.
+pub async fn probe_all(apps: &[std::sync::Arc<super::App>]) -> Vec<bool> {
+    let checks: Vec<_> = apps
+        .iter()
+        .cloned()
+        .map(|app| {
+            tokio::spawn(async move {
+                // Any host of the app's own will do; the check is addressed to
+                // the upstream either way.
+                let host = app.hosts()[0].as_str();
+                let readiness = &app.manifest.container.health.readiness;
+
+                probe(app.upstream, host, readiness).await
+            })
+        })
+        .collect();
+
+    let mut ready = Vec::with_capacity(checks.len());
+    for check in checks {
+        ready.push(matches!(check.await, Ok(Ok(()))));
+    }
+
+    ready
+}
+
 /// One check, given `timeout` to finish.
 async fn check(addr: SocketAddr, host: &str, readiness: &Readiness) -> Result<()> {
     let attempt = async {

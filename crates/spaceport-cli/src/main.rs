@@ -17,7 +17,9 @@ use spaceport_core::operator::{DEFAULT_OPERATOR_ENDPOINT, client, server};
 use spaceport_core::runtime::DockerRuntime;
 use spaceport_core::setup;
 use spaceport_core::state::{self, Db, StateLock};
+use spaceport_core::status::Instance;
 use spaceport_core::{Config, OperatorEndpoint, acme, config::DEFAULT_CONFIG_PATH, edge};
+use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::Layer as _;
@@ -65,6 +67,8 @@ enum Command {
     },
     /// Watch what a running spaceport is doing, as it does it.
     Stream(StreamArgs),
+    /// Report what a running spaceport is and how it is doing.
+    Status(StatusArgs),
 }
 
 #[derive(Debug, Args)]
@@ -177,6 +181,23 @@ struct StreamArgs {
 }
 
 #[derive(Debug, Args)]
+struct StatusArgs {
+    /// Colour the report, even when this is not writing to a terminal.
+    /// Without it, colour is used when a terminal is there to show it and
+    /// `NO_COLOR` is not set.
+    #[arg(short, long)]
+    pretty: bool,
+
+    /// Print the status as the JSON it arrives as. Never coloured: whatever
+    /// reads this is not looking at it.
+    #[arg(long, conflicts_with = "pretty")]
+    json: bool,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
 struct ServerArgs {
     /// The spaceport to talk to: an operator socket, or an address over the
     /// network.
@@ -212,10 +233,33 @@ async fn main() -> Result<()> {
             AppsCommand::Destroy(args) => destroy(args).await,
         },
         Command::Stream(args) => stream(args).await,
+        Command::Status(args) => status(args).await,
     }
 }
 
+/// Ask a running spaceport what it is, and lay the answer out.
+async fn status(args: StatusArgs) -> Result<()> {
+    let status = client::status(&args.server.server).await?;
+
+    if args.json {
+        // What arrived, indented rather than reshaped: anything reading this
+        // is reading the same fields the operator interface sent.
+        println!("{}", serde_json::to_string_pretty(&status)?);
+
+        return Ok(());
+    }
+
+    print!("{}", render::status(&status, Colour::detect(args.pretty)));
+
+    Ok(())
+}
+
 async fn run(args: RunArgs) -> Result<()> {
+    // Before anything is loaded or opened, so that the uptime a status reports
+    // is how long this process has been alive rather than how long it has been
+    // finished starting.
+    let started_at = OffsetDateTime::now_utc();
+
     // Two consumers of the same events, each filtered for what it is: the log
     // this service writes, and the stream an operator watches — which can
     // afford the debug-level detail that would drown a log file, and cannot
@@ -309,9 +353,23 @@ async fn run(args: RunArgs) -> Result<()> {
     // Without `--operator` there is no way to tell spaceport what to run, which
     // is a legitimate way to start it: the edge still serves, and still says so.
     let operator = args.operator.map(|endpoint| {
+        // Everything a status report is made of, gathered while the things it
+        // is made of are still in scope.
+        let instance = Arc::new(Instance {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            started_at,
+            config_path: args.config.config.clone(),
+            config: config.clone(),
+            operator: endpoint.clone(),
+            applier,
+            db,
+            certificates: certificates.clone(),
+            reconciled: report,
+        });
+
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            let result = server::serve(&endpoint, applier, events, shutdown.clone()).await;
+            let result = server::serve(&endpoint, instance, events, shutdown.clone()).await;
 
             // An operator interface that never came up is a startup failure,
             // and one nobody would otherwise hear about until they tried to

@@ -1,70 +1,15 @@
 //! Turning an event into a line for a person to read.
 //!
-//! At most one saturated colour per line, and it is the level: an operator
-//! watching a stream is looking for the line that went wrong, not admiring the
-//! palette. Everything structural — the timestamp, the field names — recedes,
-//! and the message itself keeps the terminal's own foreground, because it is
-//! the part being read rather than the part being scanned past.
-
-use std::io::IsTerminal;
+//! The one saturated colour is the level: an operator watching a stream is
+//! looking for the line that went wrong. The message itself keeps the
+//! terminal's own foreground, because it is the part being read.
 
 use spaceport_core::events::{Event, Level};
 
-const RESET: &str = "\x1b[0m";
-const DIM: &str = "\x1b[2m";
-const BOLD: &str = "\x1b[1m";
-const RED: &str = "\x1b[31m";
-const BOLD_RED: &str = "\x1b[1;31m";
-const YELLOW: &str = "\x1b[33m";
-const GREEN: &str = "\x1b[32m";
-const CYAN: &str = "\x1b[36m";
+use super::{BOLD, BOLD_RED, CYAN, Colour, DIM, GREEN, RED, YELLOW};
 
 /// The field whose value is the reason the line is being read at all.
 const ERROR_FIELD: &str = "error";
-
-/// Set by anything that would rather not be sent escape codes.
-const NO_COLOUR_VAR: &str = "NO_COLOR";
-
-/// Whether these lines carry colour.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Colour {
-    Yes,
-    No,
-}
-
-impl Colour {
-    /// Colour when a person is watching, and not when the stream is being
-    /// piped into something that would only have to strip it out again.
-    ///
-    /// `forced` is `--pretty`, which is an operator saying they want it
-    /// regardless — including into a pager, which is the case the terminal
-    /// check gets wrong.
-    pub fn detect(forced: bool) -> Self {
-        if forced {
-            return Self::Yes;
-        }
-        if std::env::var_os(NO_COLOUR_VAR).is_some() {
-            return Self::No;
-        }
-
-        match std::io::stdout().is_terminal() {
-            true => Self::Yes,
-            false => Self::No,
-        }
-    }
-
-    /// `text` in `code`, or `text` as it was.
-    ///
-    /// Takes the text already padded to its column: a colour code is not a
-    /// character on the screen, and padding after wrapping would count it as
-    /// one and misalign every coloured line.
-    fn paint(self, code: &str, text: &str) -> String {
-        match self {
-            Self::Yes => format!("{code}{text}{RESET}"),
-            Self::No => text.to_owned(),
-        }
-    }
-}
 
 /// One event as a line.
 ///
@@ -129,6 +74,8 @@ fn level_colour(level: Level) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::RESET;
+    use crate::render::tests::strip;
     use spaceport_core::events::Event;
 
     fn event(level: Level, app: Option<&str>) -> Event {
@@ -241,28 +188,5 @@ mod tests {
             "coloured columns do not line up"
         );
         assert_eq!(width(&short, Colour::No), width(&short, Colour::Yes));
-    }
-
-    /// What a terminal would not print, dropped the crude way: every escape
-    /// here is `\x1b[` and then letters, digits and semicolons up to an `m`.
-    fn strip(line: &str) -> String {
-        let mut out = String::new();
-        let mut rest = line;
-
-        while let Some(at) = rest.find('\x1b') {
-            out.push_str(&rest[..at]);
-            match rest[at..].find('m') {
-                Some(end) => rest = &rest[at + end + 1..],
-                None => return out,
-            }
-        }
-        out.push_str(rest);
-
-        out
-    }
-
-    #[test]
-    fn forcing_colour_beats_asking_the_terminal() {
-        assert_eq!(Colour::detect(true), Colour::Yes);
     }
 }
