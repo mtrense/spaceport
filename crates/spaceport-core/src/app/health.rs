@@ -1,9 +1,18 @@
 //! Deciding whether an app is working.
 //!
-//! Readiness only, for now, and only during an apply: the question this
-//! answers is "may traffic be routed here yet?", asked once, at the one moment
-//! spaceport is in a position to wait for the answer. Watching an app that has
-//! *stopped* being ready is a supervisor's job, and there is no supervisor.
+//! The same check, asked at three moments, which is why one [`Probe`] describes
+//! all three. [`wait_until_ready`] asks "may traffic be routed here yet?" once,
+//! during an apply, at the one moment spaceport is in a position to wait for
+//! the answer. [`probe`] asks "is it answering right now?" for a listing, and
+//! waits for nobody. [`watch`] asks "is it still working?" over and over for as
+//! long as the app is routed, and hands the answer to the supervisor.
+//!
+//! The difference between the first and the last is only which way the streak
+//! runs. An apply is waiting for `success_threshold` checks to pass and gives
+//! up once `failure_threshold` have failed; a watch has already seen it pass
+//! and is waiting for `failure_threshold` to fail. Neither reacts to a single
+//! check, because one check catches a garbage-collection pause as readily as a
+//! broken app.
 
 use std::io;
 use std::net::SocketAddr;
@@ -24,14 +33,14 @@ use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 use tracing::debug;
 
-use super::manifest::{Check, Readiness};
+use super::manifest::{Check, Probe};
 
 /// Wait until the app at `addr` passes its readiness check.
 ///
 /// Returns as soon as it does. Gives up once `failure_threshold` checks in a
 /// row have failed, and says what the last failure was — that message is the
 /// only thing the operator will have to go on.
-pub async fn wait_until_ready(addr: SocketAddr, host: &str, readiness: &Readiness) -> Result<()> {
+pub async fn wait_until_ready(addr: SocketAddr, host: &str, readiness: &Probe) -> Result<()> {
     if readiness.kind == Check::None {
         return Ok(());
     }
@@ -68,6 +77,50 @@ pub async fn wait_until_ready(addr: SocketAddr, host: &str, readiness: &Readines
     }
 }
 
+/// Watch the app at `addr` until it stops working, and say what went wrong.
+///
+/// Returns only on failure — `failure_threshold` checks in a row — so a caller
+/// awaiting this is asking "tell me when this app needs restarting" and
+/// nothing else. An app that stays up keeps this pending forever, which is why
+/// the caller is expected to drop the future when the app is replaced,
+/// suspended or destroyed rather than to wait for it to say so.
+///
+/// A single failure is not enough and is not even reported. An app is allowed
+/// to miss a check — a slow request, a pause, a moment of load — and a
+/// supervisor that restarted it for that would be a worse fault than the one it
+/// was watching for. `initial_delay` is the grace after a start: the app has
+/// already passed its readiness check by the time this runs, but an app can be
+/// ready and still be warming up.
+pub async fn watch(addr: SocketAddr, host: &str, liveness: &Probe) -> String {
+    if liveness.kind == Check::None {
+        // Nothing to watch for. Pending forever is the honest answer: this app
+        // will never be found broken by a check, only by its container going.
+        std::future::pending::<()>().await;
+    }
+
+    sleep(liveness.initial_delay).await;
+
+    let mut failed = 0;
+    loop {
+        match check(addr, host, liveness).await {
+            Ok(()) => failed = 0,
+            Err(error) => {
+                failed += 1;
+                debug!(%addr, %error, failed, "liveness check failed");
+
+                if failed >= liveness.failure_threshold {
+                    return format!(
+                        "it failed {failed} {} checks in a row: {error:#}",
+                        liveness.kind.as_str(),
+                    );
+                }
+            }
+        }
+
+        sleep(liveness.interval).await;
+    }
+}
+
 /// One look at an app that is already running, for reporting rather than
 /// gating: does it answer right now?
 ///
@@ -76,8 +129,8 @@ pub async fn wait_until_ready(addr: SocketAddr, host: &str, readiness: &Readines
 /// "there is no way to tell". Its own short timeout, because whoever asked is
 /// waiting on a listing and a dead app must not hold it up for the length of
 /// an apply's patience.
-pub async fn probe(addr: SocketAddr, host: &str, readiness: &Readiness) -> Result<()> {
-    let readiness = Readiness {
+pub async fn probe(addr: SocketAddr, host: &str, readiness: &Probe) -> Result<()> {
+    let readiness = Probe {
         kind: match readiness.kind {
             Check::None => Check::Tcp,
             kind => kind,
@@ -123,7 +176,7 @@ pub async fn probe_all(apps: &[std::sync::Arc<super::App>]) -> Vec<bool> {
 }
 
 /// One check, given `timeout` to finish.
-async fn check(addr: SocketAddr, host: &str, readiness: &Readiness) -> Result<()> {
+async fn check(addr: SocketAddr, host: &str, readiness: &Probe) -> Result<()> {
     let attempt = async {
         match readiness.kind {
             Check::Tcp => tcp(addr).await,
@@ -223,14 +276,14 @@ mod tests {
     use std::time::Duration;
     use tokio::net::TcpListener;
 
-    fn quick(kind: Check) -> Readiness {
-        Readiness {
+    fn quick(kind: Check) -> Probe {
+        Probe {
             kind,
             initial_delay: Duration::ZERO,
             interval: Duration::from_millis(10),
             timeout: Duration::from_millis(500),
             failure_threshold: 5,
-            ..Readiness::default()
+            ..Probe::default()
         }
     }
 
@@ -281,7 +334,7 @@ mod tests {
             drop(listener);
         });
 
-        let readiness = Readiness {
+        let readiness = Probe {
             failure_threshold: 100,
             ..quick(Check::Tcp)
         };
@@ -346,8 +399,8 @@ mod tests {
         addr
     }
 
-    fn http_readiness() -> Readiness {
-        Readiness {
+    fn http_readiness() -> Probe {
+        Probe {
             path: Some("/healthz".to_owned()),
             ..quick(Check::Http)
         }
@@ -388,7 +441,7 @@ mod tests {
     #[tokio::test]
     async fn a_missing_health_path_still_counts_as_answering() {
         let addr = flaky_http(0).await;
-        let readiness = Readiness {
+        let readiness = Probe {
             path: Some("/nope".to_owned()),
             ..quick(Check::Http)
         };
@@ -401,7 +454,7 @@ mod tests {
     #[tokio::test]
     async fn requires_a_success_streak_when_asked_to() {
         let addr = flaky_http(0).await;
-        let readiness = Readiness {
+        let readiness = Probe {
             success_threshold: 3,
             ..http_readiness()
         };
@@ -411,5 +464,76 @@ mod tests {
         wait_until_ready(addr, "alpha.test", &readiness)
             .await
             .unwrap();
+    }
+
+    /// The whole point of watching: an app that passed its readiness check and
+    /// was routed to has since stopped answering, and only a standing check
+    /// notices — the container is still running, so the engine says nothing.
+    #[tokio::test]
+    async fn notices_an_app_that_stops_answering() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let watching =
+            tokio::spawn(async move { watch(addr, "alpha.test", &quick(Check::Tcp)).await });
+
+        // Let it pass a few checks first, so what it reports is a working app
+        // going away rather than one that was never there.
+        sleep(Duration::from_millis(50)).await;
+        drop(listener);
+
+        let reason = timeout(Duration::from_secs(10), watching)
+            .await
+            .expect("watch should have given up by now")
+            .unwrap();
+
+        assert!(reason.contains("failed 5 tcp checks in a row"), "{reason}");
+    }
+
+    /// A supervisor that restarted an app for one missed check would be a
+    /// worse fault than the one it was watching for: a slow request or a
+    /// garbage-collection pause looks exactly like a broken app for one check.
+    #[tokio::test]
+    async fn does_not_give_up_on_a_single_failed_check() {
+        let addr = flaky_http(1).await;
+
+        let liveness = http_readiness();
+        let watching = watch(addr, "alpha.test", &liveness);
+
+        assert!(
+            timeout(Duration::from_millis(200), watching).await.is_err(),
+            "watch gave up over one failed check"
+        );
+    }
+
+    /// `none` says never restart this app for failing a check, so the watch
+    /// has nothing to report and must not report anything.
+    #[tokio::test]
+    async fn never_gives_up_on_an_app_it_was_told_not_to_check() {
+        let addr = dead_address().await;
+
+        let liveness = quick(Check::None);
+        let watching = watch(addr, "alpha.test", &liveness);
+
+        assert!(timeout(Duration::from_millis(100), watching).await.is_err());
+    }
+
+    /// The reason is handed to the supervisor and from there to the operator,
+    /// who was not watching: it has to say how many checks failed and what the
+    /// app actually said the last time.
+    #[tokio::test]
+    async fn says_how_many_checks_failed_and_what_the_last_one_said() {
+        let addr = flaky_http(u32::MAX).await;
+        let liveness = http_readiness();
+
+        let reason = timeout(
+            Duration::from_secs(10),
+            watch(addr, "alpha.test", &liveness),
+        )
+        .await
+        .expect("watch should have given up by now");
+
+        assert!(reason.contains("failed 5 http checks in a row"), "{reason}");
+        assert!(reason.contains("503"), "{reason}");
     }
 }

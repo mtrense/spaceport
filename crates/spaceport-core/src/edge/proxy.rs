@@ -110,6 +110,24 @@ pub async fn handle(
                 format!("the app serving {name} is suspended\n"),
             ));
         }
+        // The host is spoken for by an app that should be serving and is not,
+        // and spaceport is already trying to get it back. Answering here rather
+        // than forwarding is the difference between a caller that waits a
+        // second and one that waits out a connect timeout for a container that
+        // is not there — and 503, not 502, because there is nothing wrong with
+        // the request.
+        Some(Route::Down(app)) => {
+            debug!(
+                app = %app,
+                host = name,
+                path = req.uri().path(),
+                "the app serving this host is not running"
+            );
+            return Ok(refuse(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("the app serving {name} is not running\n"),
+            ));
+        }
         None => {
             debug!(
                 host = name,
@@ -462,6 +480,24 @@ mod tests {
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(body.contains("serving alpha.test is suspended"), "{body}");
+    }
+
+    /// The host is spoken for by an app spaceport is already trying to get
+    /// back. Forwarding would spend a connect timeout on a container that is
+    /// not there, and a 404 would tell the caller to give up on the address.
+    #[tokio::test]
+    async fn answers_for_a_down_app_instead_of_forwarding() {
+        let apps = Arc::new(AppStore::new());
+        apps.insert(app("hello", "alpha.test", upstream().await))
+            .unwrap();
+        apps.take_down(&"hello".parse().unwrap(), "the container stopped")
+            .unwrap();
+        let edge = edge(apps).await;
+
+        let (status, body) = get(edge, "alpha.test", "/").await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("serving alpha.test is not running"), "{body}");
     }
 
     #[tokio::test]

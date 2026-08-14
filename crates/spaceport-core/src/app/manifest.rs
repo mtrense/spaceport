@@ -119,18 +119,39 @@ pub struct Container {
 pub struct Health {
     /// What has to succeed before traffic is routed to a newly applied app.
     #[serde(default)]
-    pub readiness: Readiness,
+    pub readiness: Probe,
+
+    /// What has to keep succeeding for spaceport to leave the app alone.
+    ///
+    /// Optional, and off when it is not there — which is the one default in
+    /// this file that is not simply the safe value. A liveness check is a
+    /// standing instruction to restart the app, and an app that never asked for
+    /// one must not acquire it by being applied to a newer spaceport. Saying
+    /// `type: none` is the other way to say the same thing, for a manifest that
+    /// wants to be explicit about it.
+    ///
+    /// A container that has exited is restarted either way: that is the engine
+    /// reporting a fact, not spaceport forming an opinion. This is for the app
+    /// that is still running and has stopped working, which is the only case
+    /// nobody but the app itself can settle.
+    pub liveness: Option<Probe>,
 }
 
-/// The check an app has to pass before it is routed to.
+/// A check spaceport makes against a running app.
 ///
 /// A single struct rather than a tagged enum per check kind, so that
 /// `deny_unknown_fields` keeps working — a manifest that misspells `path` is
 /// far more common than one that needs the extra type safety, and it is the
 /// one worth catching.
+///
+/// The same fields answer both questions the manifest asks. Readiness is "may
+/// traffic go here yet?", where `failure_threshold` is how long an apply waits
+/// before giving up; liveness is "is it still working?", where the very same
+/// number is how many checks in a row have to fail before spaceport restarts
+/// it. One kind of check, two moments to ask it.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Readiness {
+pub struct Probe {
     /// Which kind of check to make.
     #[serde(rename = "type", default)]
     pub kind: Check,
@@ -138,7 +159,7 @@ pub struct Readiness {
     /// The path to request. Required by `http`, meaningless otherwise.
     pub path: Option<String>,
 
-    /// The port to check. Not supported yet — see [`Readiness::validate`].
+    /// The port to check. Not supported yet — see [`Probe::validate`].
     pub port: Option<u16>,
 
     /// How long to wait before the first check. Containers that are going to
@@ -173,7 +194,7 @@ pub struct Readiness {
     pub success_threshold: u32,
 }
 
-/// The kind of readiness check.
+/// The kind of check to make.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Check {
@@ -184,7 +205,9 @@ pub enum Check {
     Tcp,
     /// Request a path and require a non-error status.
     Http,
-    /// Route to the app the moment its container starts.
+    /// Ask nothing. For readiness, route to the app the moment its container
+    /// starts; for liveness, never restart an app whose container is still
+    /// running.
     None,
 }
 
@@ -210,7 +233,7 @@ fn default_success_threshold() -> u32 {
     1
 }
 
-impl Default for Readiness {
+impl Default for Probe {
     fn default() -> Self {
         Self {
             kind: Check::default(),
@@ -225,21 +248,23 @@ impl Default for Readiness {
     }
 }
 
-impl Readiness {
+impl Probe {
     /// How long a wholly unresponsive app is given before an apply gives up.
     pub fn budget(&self) -> Duration {
         self.initial_delay + self.interval * self.failure_threshold
     }
 
-    fn validate(&self) -> Result<()> {
+    /// `which` is the name the manifest gave this check — `readiness` or
+    /// `liveness` — so that an operator with both is told which one is wrong.
+    fn validate(&self, which: &str) -> Result<()> {
         match self.kind {
             Check::Http if self.path.is_none() => {
-                bail!("a readiness check of type `http` needs a `path` to request");
+                bail!("a {which} check of type `http` needs a `path` to request");
             }
             Check::Http => {}
             _ if self.path.is_some() => {
                 bail!(
-                    "`path` only means something for a readiness check of type `http`, not `{}`",
+                    "`path` only means something for a {which} check of type `http`, not `{}`",
                     self.kind.as_str()
                 );
             }
@@ -250,18 +275,18 @@ impl Readiness {
         // port that is never published would fail every check.
         if self.port.is_some() {
             bail!(
-                "a readiness `port` of its own is not supported yet: the check uses the port traffic is routed to"
+                "a {which} `port` of its own is not supported yet: the check uses the port traffic is routed to"
             );
         }
 
         if self.failure_threshold == 0 || self.success_threshold == 0 {
-            bail!("readiness thresholds count checks, so they must be at least 1");
+            bail!("{which} thresholds count checks, so they must be at least 1");
         }
         if self.interval.is_zero() {
-            bail!("a readiness `interval` of zero would check without ever pausing");
+            bail!("a {which} `interval` of zero would check without ever pausing");
         }
         if self.timeout.is_zero() {
-            bail!("a readiness `timeout` of zero would fail every check");
+            bail!("a {which} `timeout` of zero would fail every check");
         }
 
         Ok(())
@@ -401,7 +426,13 @@ impl AppManifest {
             bail!("container.port must be a port an app can listen on, not 0");
         }
 
-        self.container.health.readiness.validate()?;
+        self.container.health.readiness.validate("readiness")?;
+        // Nothing cross-checks the two: liveness starts only once readiness has
+        // already passed, so a liveness check that gives up far sooner than an
+        // apply would is the normal way to write one, not a mistake.
+        if let Some(liveness) = &self.container.health.liveness {
+            liveness.validate("liveness")?;
+        }
 
         Ok(())
     }
@@ -573,7 +604,7 @@ routing:
             .health
             .readiness;
 
-        assert_eq!(readiness, Readiness::default());
+        assert_eq!(readiness, Probe::default());
         assert_eq!(readiness.kind, Check::Tcp);
         assert_eq!(readiness.budget(), Duration::from_secs(30));
     }
@@ -682,6 +713,126 @@ success_threshold: 2",
             .to_string();
 
         assert!(err.contains("ping"), "{err}");
+    }
+
+    /// `MINIMAL` with a liveness section, indented into place.
+    fn with_liveness(fields: &str) -> String {
+        let fields: String = fields
+            .lines()
+            .map(|line| format!("      {line}\n"))
+            .collect();
+
+        format!("{MINIMAL}container:\n  health:\n    liveness:\n{fields}")
+    }
+
+    /// The one default here that is not simply the safe value. Every app
+    /// already applied was written without a liveness block, and if absence
+    /// meant "watch it" they would all quietly acquire a standing instruction
+    /// to restart on the next upgrade.
+    #[test]
+    fn watches_nothing_unless_a_manifest_asks_for_it() {
+        let health = AppManifest::parse(MINIMAL).unwrap().container.health;
+
+        assert_eq!(health.liveness, None);
+        // And readiness is still there, so absent liveness is absence and not
+        // a health section that failed to parse.
+        assert_eq!(health.readiness, Probe::default());
+    }
+
+    #[test]
+    fn parses_an_http_liveness_check() {
+        let raw = with_liveness(
+            "type: http
+path: /livez
+interval: 15s
+timeout: 3s
+initial_delay: 30s
+failure_threshold: 4
+success_threshold: 1",
+        );
+
+        let liveness = AppManifest::parse(&raw)
+            .unwrap()
+            .container
+            .health
+            .liveness
+            .unwrap();
+
+        assert_eq!(liveness.kind, Check::Http);
+        assert_eq!(liveness.path.as_deref(), Some("/livez"));
+        assert_eq!(liveness.interval, Duration::from_secs(15));
+        assert_eq!(liveness.timeout, Duration::from_secs(3));
+        assert_eq!(liveness.initial_delay, Duration::from_secs(30));
+        assert_eq!(liveness.failure_threshold, 4);
+        assert_eq!(liveness.success_threshold, 1);
+    }
+
+    /// An operator with both checks configured gets one error message, and it
+    /// has to say which of the two they need to go and fix.
+    #[test]
+    fn says_liveness_when_it_is_the_liveness_check_that_is_wrong() {
+        let err = AppManifest::parse(&with_liveness("type: http"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("liveness"), "{err}");
+        assert!(!err.contains("readiness"), "{err}");
+    }
+
+    /// The other half of the same worry: naming the check must not have turned
+    /// every message into the liveness one.
+    #[test]
+    fn says_readiness_when_it_is_the_readiness_check_that_is_wrong() {
+        let err = AppManifest::parse(&with_readiness("type: http"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("readiness"), "{err}");
+        assert!(!err.contains("liveness"), "{err}");
+    }
+
+    /// The two checks answer different questions and are written to different
+    /// budgets — a slow apply and a twitchy restart are both reasonable — so
+    /// neither may be allowed to inherit the other's settings.
+    #[test]
+    fn takes_the_two_checks_independently() {
+        let raw = format!(
+            "{MINIMAL}container:
+  health:
+    readiness:
+      type: http
+      path: /healthz
+      interval: 500ms
+      failure_threshold: 60
+    liveness:
+      type: tcp
+      interval: 10s
+      failure_threshold: 3
+"
+        );
+
+        let health = AppManifest::parse(&raw).unwrap().container.health;
+        let liveness = health.liveness.unwrap();
+
+        assert_eq!(health.readiness.kind, Check::Http);
+        assert_eq!(health.readiness.path.as_deref(), Some("/healthz"));
+        assert_eq!(health.readiness.interval, Duration::from_millis(500));
+        assert_eq!(health.readiness.failure_threshold, 60);
+
+        assert_eq!(liveness.kind, Check::Tcp);
+        assert_eq!(liveness.path, None);
+        assert_eq!(liveness.interval, Duration::from_secs(10));
+        assert_eq!(liveness.failure_threshold, 3);
+    }
+
+    #[test]
+    fn rejects_a_liveness_interval_of_zero() {
+        let err = AppManifest::parse(&with_liveness("interval: 0s"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("without ever pausing"), "{err}");
+        assert!(err.contains("liveness"), "{err}");
     }
 
     #[test]

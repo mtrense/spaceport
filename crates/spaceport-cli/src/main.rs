@@ -9,7 +9,7 @@ use clap::{Args, Parser, Subcommand};
 use render::Colour;
 use spaceport_core::acme::account::{AcmeCa, Transport};
 use spaceport_core::acme::{CertificateRepository, Certificates, Challenges};
-use spaceport_core::app::{AppId, AppRepository, AppStore, Applier, Pattern, reconcile};
+use spaceport_core::app::{AppId, AppRepository, AppStore, Applier, Pattern, reconcile, supervise};
 use spaceport_core::config::TlsProvider;
 use spaceport_core::events::{self, Category, Event, EventBus, Level};
 use spaceport_core::operator::client::Watch;
@@ -389,6 +389,11 @@ async fn run(args: RunArgs) -> Result<()> {
             shutdown.cancel();
         }
     });
+
+    // After reconciliation, which settles what should be running, and after the
+    // shutdown token, which is the only thing that stops it. From here on, an
+    // app that stops running is spaceport's problem rather than an operator's.
+    tokio::spawn(supervise(applier.clone(), shutdown.clone()));
 
     // Without `--operator` there is no way to tell spaceport what to run, which
     // is a legitimate way to start it: the edge still serves, and still says so.

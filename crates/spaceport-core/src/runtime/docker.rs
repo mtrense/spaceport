@@ -13,21 +13,23 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use bollard::Docker;
 use bollard::errors::Error as DockerError;
-use bollard::models::{ContainerCreateBody, HostConfig, PortBinding, PortMap};
+use bollard::models::{ContainerCreateBody, EventMessage, HostConfig, PortBinding, PortMap};
 use bollard::query_parameters::{
-    CreateContainerOptionsBuilder, CreateImageOptionsBuilder, InspectContainerOptions,
-    ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
-    StopContainerOptionsBuilder,
+    CreateContainerOptionsBuilder, CreateImageOptionsBuilder, EventsOptionsBuilder,
+    InspectContainerOptions, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
+    StartContainerOptions, StopContainerOptionsBuilder,
 };
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use super::{Adopted, Container, ContainerId, ContainerRuntime, Managed};
+use super::{Adopted, Container, ContainerId, ContainerRuntime, Events, Managed, RuntimeEvent};
 use crate::app::manifest::Source;
 use crate::app::{AppId, AppManifest};
 
@@ -398,9 +400,125 @@ impl ContainerRuntime for DockerRuntime {
                         }
                     });
 
-                Some(Managed { id, app })
+                // The daemon's own word for it, and the only one that means
+                // running: `restarting`, `paused` and `exited` are all
+                // containers that are not serving.
+                let running = container.state
+                    == Some(bollard::models::ContainerSummaryStateEnum::RUNNING);
+
+                Some(Managed { id, app, running })
             })
             .collect())
+    }
+
+    fn watch(&self) -> Events {
+        // The daemon is asked for spaceport's containers only, and only for the
+        // three things that mean one has stopped serving. Everything else the
+        // daemon has to say about a container is something spaceport asked it
+        // to do.
+        let docker = self.docker.clone();
+        let (events, mut received) = mpsc::channel(WATCH_BUFFER);
+        tokio::spawn(pump(docker, events));
+
+        // The task ends when this stream is dropped, because that is when the
+        // channel it is sending into closes.
+        Box::pin(stream::poll_fn(move |context| received.poll_recv(context)))
+    }
+}
+
+/// How many events may be waiting while the supervisor deals with one.
+///
+/// Generous, because a docker daemon restarting reports every container it is
+/// taking down at once and the supervisor may be several seconds into a
+/// restart when it does. Overflowing is not a disaster — the supervisor sweeps
+/// on a timer regardless — but it is a lost second.
+const WATCH_BUFFER: usize = 256;
+
+/// How long to wait before asking the daemon for its events again.
+///
+/// The stream ends whenever the daemon is restarted or the socket goes, and
+/// neither is a reason to stop supervising: spaceport outlives the daemon it
+/// talks to, and this is how it comes back to it.
+const RECONNECT: Duration = Duration::from_secs(5);
+
+/// Read the daemon's event stream into `events` forever, reconnecting whenever
+/// it breaks and saying so when it does.
+async fn pump(docker: Docker, events: mpsc::Sender<RuntimeEvent>) {
+    let managed = format!("{MANAGED_LABEL}=true");
+    let filters = HashMap::from([
+        ("type", vec!["container"]),
+        ("label", vec![managed.as_str()]),
+        ("event", vec!["die", "oom", "destroy"]),
+    ]);
+    let options = EventsOptionsBuilder::new().filters(&filters).build();
+
+    // The first connection is not a reconnection: whoever is watching has just
+    // asked for the stream and has not missed anything yet.
+    let mut interrupted = false;
+    loop {
+        if interrupted && events.send(RuntimeEvent::Desynchronised).await.is_err() {
+            return;
+        }
+
+        let mut stream = docker.events(Some(options.clone()));
+        while let Some(message) = stream.next().await {
+            match message {
+                Ok(message) => {
+                    let Some(event) = translate(&message) else {
+                        continue;
+                    };
+                    if events.send(event).await.is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    debug!(%error, "the docker event stream broke");
+                    break;
+                }
+            }
+        }
+
+        interrupted = true;
+        tokio::time::sleep(RECONNECT).await;
+    }
+}
+
+/// What one of the daemon's messages means to spaceport, if it means anything.
+///
+/// A message spaceport cannot place — no id, an action it did not ask for — is
+/// dropped rather than guessed at. The supervisor's sweep is what catches
+/// anything this cannot read.
+fn translate(message: &EventMessage) -> Option<RuntimeEvent> {
+    let actor = message.actor.as_ref()?;
+    let container = ContainerId::new(actor.id.clone()?);
+    let attributes = actor.attributes.as_ref();
+
+    // Straight off the event: a container that has been removed cannot be
+    // inspected afterwards, so the label it carried is the only thing that can
+    // still say whose it was.
+    let app = attributes
+        .and_then(|attributes| attributes.get(APP_LABEL))
+        .and_then(|app| match app.parse::<AppId>() {
+            Ok(app) => Some(app),
+            Err(error) => {
+                warn!(container = %container, label = app, %error, "a spaceport container reported an id spaceport cannot read");
+                None
+            }
+        });
+
+    match message.action.as_deref()? {
+        "die" => Some(RuntimeEvent::Died {
+            container,
+            app,
+            // The daemon reports it as an attribute, as a string, and only
+            // sometimes. A status nobody can read is the same as none.
+            exit_code: attributes
+                .and_then(|attributes| attributes.get("exitCode"))
+                .and_then(|code| code.parse().ok()),
+        }),
+        "oom" => Some(RuntimeEvent::OutOfMemory { container, app }),
+        "destroy" => Some(RuntimeEvent::Destroyed { container, app }),
+        _ => None,
     }
 }
 
@@ -661,8 +779,9 @@ mod tests {
         Some(runtime)
     }
 
-    /// Wait for an app to start listening. Nothing gates a launch on
-    /// readiness yet, so the test has to do what health checks will.
+    /// Wait for an app to start listening. `launch` returns as soon as the
+    /// port is published, and gating on readiness is the apply path's job
+    /// rather than the runtime's, so a test at this level does it itself.
     async fn wait_until_listening(addr: SocketAddr) -> bool {
         for _ in 0..100 {
             if tokio::net::TcpStream::connect(addr).await.is_ok() {
@@ -858,5 +977,43 @@ container:
             .to_string();
 
         assert!(err.contains("cannot do yet"), "{err}");
+    }
+
+    /// The supervisor's fast path, end to end against a real daemon: the label
+    /// on the event is what says whose container it was, and a container that
+    /// has been removed cannot be inspected afterwards to ask.
+    #[tokio::test]
+    async fn reports_a_container_of_its_own_dying() {
+        let Some(runtime) = daemon().await else {
+            eprintln!("skipping: no docker daemon");
+            return;
+        };
+        let app: AppId = "spaceport-selftest-events".parse().unwrap();
+        // Subscribed before anything is started, because an event that happened
+        // before the stream existed is one the stream will never carry.
+        let mut events = runtime.watch();
+        let container = runtime.launch(&app, &hello_manifest()).await.unwrap();
+        assert!(wait_until_listening(container.upstream).await);
+
+        runtime.stop(&container.id).await.unwrap();
+
+        // The daemon has plenty else to say about a busy host, so this waits
+        // for the one event it is about rather than for the first to arrive.
+        let died = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while let Some(event) = events.next().await {
+                if event.container() == Some(&container.id)
+                    && matches!(event, RuntimeEvent::Died { .. })
+                {
+                    return event;
+                }
+            }
+            panic!("the event stream ended");
+        })
+        .await
+        .expect("the daemon never reported the container dying");
+
+        assert_eq!(died.app(), Some(&app));
+
+        runtime.remove(&container.id).await.unwrap();
     }
 }

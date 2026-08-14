@@ -21,6 +21,7 @@ use anyhow::Result;
 use tracing::{info, warn};
 
 use super::apply::Applier;
+use super::store::Downed;
 use super::{AppId, AppManifest};
 
 /// What a reconciliation did.
@@ -75,7 +76,7 @@ pub async fn reconcile(applier: &Arc<Applier>) -> Result<Report> {
         };
 
         match applier
-            .restore(record.id.clone(), manifest, record.suspended)
+            .restore(record.id.clone(), manifest.clone(), record.suspended)
             .await
         {
             Ok(restored) if restored.was_suspended() => {
@@ -91,10 +92,27 @@ pub async fn reconcile(applier: &Arc<Applier>) -> Result<Report> {
                 report.restored.push(app.id.clone());
             }
             Err(error) => {
+                let reason = format!("{error:#}");
                 warn!(app = %record.id, %error, "could not restore app");
-                report
-                    .failed
-                    .push((record.id.clone(), format!("{error:#}")));
+
+                // Left in the store as down rather than left out of it: the
+                // hosts it was applied for are still its own, the edge answers
+                // for them instead of pretending never to have heard of them,
+                // and the supervisor has something to keep trying for. An app
+                // that could not be started at boot is in exactly the position
+                // of one whose container died a minute later.
+                let downed = Downed {
+                    id: record.id.clone(),
+                    manifest,
+                    reason: reason.clone(),
+                };
+                // Only a conflict can refuse it, which means another app has
+                // its hosts and it could not run under this manifest anyway.
+                if let Err(error) = applier.store().insert_down(downed) {
+                    warn!(app = %record.id, %error, "the app that would not start cannot claim its hosts either");
+                }
+
+                report.failed.push((record.id.clone(), reason));
             }
         }
     }
@@ -186,6 +204,7 @@ mod tests {
             containers.push(Managed {
                 id: id.clone(),
                 app: Some(app.clone()),
+                running: true,
             });
             self.upstreams.lock().unwrap().insert(id.clone(), upstream);
 
@@ -375,6 +394,7 @@ container:
         runtime.containers.lock().unwrap().push(Managed {
             id: ContainerId::new("orphan-1"),
             app: Some(id("gone")),
+            running: true,
         });
         let (applier, _, repository) = restarted(runtime.clone(), Db::in_memory().unwrap());
         repository
@@ -399,6 +419,7 @@ container:
         runtime.containers.lock().unwrap().push(Managed {
             id: ContainerId::new("nameless-1"),
             app: None,
+            running: true,
         });
         let (applier, _, _) = restarted(runtime.clone(), Db::in_memory().unwrap());
 

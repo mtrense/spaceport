@@ -12,9 +12,11 @@ pub mod docker;
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::pin::Pin;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use futures_util::Stream;
 
 use crate::app::{AppId, AppManifest};
 
@@ -61,6 +63,14 @@ pub struct Container {
 pub struct Managed {
     pub id: ContainerId,
     pub app: Option<AppId>,
+    /// Whether the engine has it running right now.
+    ///
+    /// This is what makes a listing enough to supervise from. A container that
+    /// is here and stopped is an app that has exited, and one that is not here
+    /// at all is an app whose container has been removed — and either can
+    /// happen while the engine's event stream is broken, which is precisely
+    /// when this is the only way to find out.
+    pub running: bool,
 }
 
 /// A container the engine already has for an app, which the app's manifest
@@ -88,6 +98,92 @@ impl Adopted {
     }
 }
 
+/// What the engine says has happened to a container spaceport is running.
+///
+/// Only the bad news. An engine reports a great deal — created, started,
+/// attached, every health check it makes itself — and none of it tells
+/// spaceport anything it did not already know, because spaceport is what asked
+/// for it. What it cannot know without being told is that a container it
+/// started has stopped being one.
+///
+/// The app is optional for the same reason it is on [`Managed`]: the label can
+/// be missing or unreadable, and a container that can no longer say whose it
+/// was is still one that has just died.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeEvent {
+    /// Its main process exited, with this status where the engine said one.
+    Died {
+        container: ContainerId,
+        app: Option<AppId>,
+        exit_code: Option<i64>,
+    },
+    /// It was killed for using more memory than it was allowed. Reported apart
+    /// from a plain exit because it is the one cause an operator can do
+    /// something about without changing the app.
+    OutOfMemory {
+        container: ContainerId,
+        app: Option<AppId>,
+    },
+    /// It is gone. Whatever comes next is a new container, not this one again.
+    Destroyed {
+        container: ContainerId,
+        app: Option<AppId>,
+    },
+    /// Not news about any one container: the runtime lost the engine and has
+    /// found it again, so whatever happened in between was missed.
+    ///
+    /// This is what makes an event stream safe to depend on. A watcher that
+    /// only ever reacted to events would believe an app was fine for as long as
+    /// the connection stayed broken; one that hears this goes and looks
+    /// instead.
+    Desynchronised,
+}
+
+impl RuntimeEvent {
+    /// Which container it is about, if it is about one.
+    pub fn container(&self) -> Option<&ContainerId> {
+        match self {
+            Self::Died { container, .. }
+            | Self::OutOfMemory { container, .. }
+            | Self::Destroyed { container, .. } => Some(container),
+            Self::Desynchronised => None,
+        }
+    }
+
+    /// Whose container it is, as far as the engine could say.
+    pub fn app(&self) -> Option<&AppId> {
+        match self {
+            Self::Died { app, .. }
+            | Self::OutOfMemory { app, .. }
+            | Self::Destroyed { app, .. } => app.as_ref(),
+            Self::Desynchronised => None,
+        }
+    }
+
+    /// One phrase for a log line, saying what the engine reported.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Died {
+                exit_code: Some(code),
+                ..
+            } => format!("its container exited with status {code}"),
+            Self::Died { .. } => "its container exited".to_owned(),
+            Self::OutOfMemory { .. } => {
+                "its container was killed for running out of memory".to_owned()
+            }
+            Self::Destroyed { .. } => "its container was removed".to_owned(),
+            Self::Desynchronised => "the engine's event stream was interrupted".to_owned(),
+        }
+    }
+}
+
+/// A stream of [`RuntimeEvent`]s that ends only when it is dropped.
+///
+/// Boxed because it is a trait method's return type, and owned rather than
+/// borrowing the runtime because whoever watches it holds it for the life of
+/// the process.
+pub type Events = Pin<Box<dyn Stream<Item = RuntimeEvent> + Send>>;
+
 /// A container engine spaceport can run apps on.
 #[async_trait]
 pub trait ContainerRuntime: Send + Sync {
@@ -95,8 +191,9 @@ pub trait ContainerRuntime: Send + Sync {
     /// runtime is already running under that name.
     ///
     /// Returns only once the container is started and its port is published —
-    /// not once the app inside it is ready to serve. Readiness is what health
-    /// checks are for, and they do not exist yet.
+    /// not once the app inside it is ready to serve. Waiting for that is what
+    /// the readiness check in the manifest is for, and the apply path does it
+    /// before it routes anything here.
     async fn launch(&self, app: &AppId, manifest: &AppManifest) -> Result<Container>;
 
     /// The container this runtime *already* has for `app`, if it is one this
@@ -171,4 +268,22 @@ pub trait ContainerRuntime: Send + Sync {
     /// is what a restart reconciles against: anything here that no app is
     /// recorded for is a leftover, and nothing else may be touched.
     async fn managed(&self) -> Result<Vec<Managed>>;
+
+    /// Tell me when a container of mine stops being one.
+    ///
+    /// The stream is the supervisor's fast path and nothing more: it turns "an
+    /// app died" from something noticed at the next sweep into something
+    /// noticed in the same second. Everything it reports could be found by
+    /// asking [`ContainerRuntime::managed`] often enough, which is exactly what
+    /// the supervisor falls back to — so an engine with nothing to say here
+    /// costs latency rather than supervision, and the default is to say
+    /// nothing.
+    ///
+    /// It must not end on its own. An engine that goes away is a
+    /// [`RuntimeEvent::Desynchronised`] and then whatever comes next; a stream
+    /// that simply stopped would look exactly like an engine on which nothing
+    /// ever goes wrong.
+    fn watch(&self) -> Events {
+        Box::pin(futures_util::stream::empty())
+    }
 }

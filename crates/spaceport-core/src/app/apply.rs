@@ -14,8 +14,9 @@
 //! goes. A destroy forgets the app and deletes its container; a suspend
 //! remembers both.
 
+use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::anyhow;
@@ -195,6 +196,18 @@ pub struct Applier {
     store: Arc<AppStore>,
     runtime: Arc<dyn ContainerRuntime>,
     repository: AppRepository,
+    /// The apps something is in the middle of doing something to.
+    ///
+    /// Every verb here takes containers down and puts them up, and the engine
+    /// reports all of it — a replaced container dying is indistinguishable, in
+    /// an event stream, from one that crashed. This is how the supervisor tells
+    /// the difference: an app in here is being seen to, and whatever the engine
+    /// has to say about it is spaceport's own doing.
+    ///
+    /// Counted rather than a set, because two operators applying the same app
+    /// at once must not have the first one to finish clear the mark for the
+    /// second.
+    settling: Mutex<HashMap<AppId, usize>>,
 }
 
 impl Applier {
@@ -207,7 +220,40 @@ impl Applier {
             store,
             runtime,
             repository,
+            settling: Mutex::default(),
         }
+    }
+
+    /// Mark `id` as being worked on until the returned guard is dropped.
+    ///
+    /// Not a lock: it excludes nobody and blocks nothing. Two applies of the
+    /// same app still race each other exactly as they did before — the store is
+    /// what settles that — and all this says is that whatever the engine
+    /// reports about this app in the meantime was asked for.
+    fn settling(&self, id: &AppId) -> Settling<'_> {
+        *self.settle_marks().entry(id.clone()).or_insert(0) += 1;
+
+        Settling {
+            applier: self,
+            id: id.clone(),
+        }
+    }
+
+    /// Whether something is in the middle of doing something to `id`.
+    ///
+    /// The supervisor's one question before it acts on an event: an app that is
+    /// being applied, resumed, suspended or destroyed is not an app that has
+    /// broken, however much the engine's event stream makes it look like one.
+    pub fn is_settling(&self, id: &AppId) -> bool {
+        self.settle_marks().contains_key(id)
+    }
+
+    /// A poisoned lock means a thread panicked mid-mutation. Nothing here can
+    /// repair that, and carrying on would leave an app marked as being worked
+    /// on by nobody, which the supervisor would take as a reason to leave it
+    /// down forever.
+    fn settle_marks(&self) -> std::sync::MutexGuard<'_, HashMap<AppId, usize>> {
+        self.settling.lock().expect("applier settle lock poisoned")
     }
 
     /// The apps this applier has running.
@@ -225,6 +271,57 @@ impl Applier {
         self.runtime.as_ref()
     }
 
+    /// Start the app named `id` again, because it has stopped serving.
+    ///
+    /// The supervisor's one verb, and it does not consult the record: an app
+    /// gets here because it is recorded as wanted and is not running, which is
+    /// the question already answered. What it does is take the app out of
+    /// service if it is still nominally in it — so the edge answers rather than
+    /// forwarding to a container that is not there — and then start it the way
+    /// an apply would.
+    ///
+    /// Deliberately a fresh container every time, rather than starting again
+    /// the one that exited. The two reasons an app gets here are that its
+    /// container has gone and that its container is up and no longer working,
+    /// and only one of those has anything worth keeping; a restart that
+    /// sometimes reused a container and sometimes did not would differ from an
+    /// apply in a way nobody could predict from the outside.
+    ///
+    /// Failing leaves the app down, claiming its hosts, with `reason` on it for
+    /// a status report to show. The supervisor is what decides to try again.
+    pub async fn restart(&self, id: &AppId, reason: &str) -> Result<Arc<App>, ApplyError> {
+        let _settling = self.settling(id);
+
+        // Whichever of the two it is, the manifest is the same one: what the
+        // store is holding for this app, which is what the record said.
+        let manifest = match self.store.take_down(id, reason) {
+            Some(app) => app.manifest.clone(),
+            None => match self.store.downed(id) {
+                Some(down) => down.manifest,
+                None => {
+                    return Err(ApplyError::Failed(anyhow!(
+                        "no app named `{id}` is running or down"
+                    )));
+                }
+            },
+        };
+
+        match self.start(id.clone(), manifest.clone()).await {
+            Ok(app) => {
+                info!(app = %id, container = %app.container, upstream = %app.upstream, "app restarted");
+
+                Ok(app)
+            }
+            Err(error) => {
+                // It came out of `apps` on the way in and never went back, so
+                // all this does is say why for whoever reads the status next.
+                self.store.note_down(id, format!("{error:#}"));
+
+                Err(error)
+            }
+        }
+    }
+
     /// Stop the app named `id` and forget it, routes and container both.
     ///
     /// The routes go first, so nothing is forwarded to a container on its way
@@ -233,6 +330,7 @@ impl Applier {
     /// the error names it, because by then it is a container only the operator
     /// can clean up.
     pub async fn destroy(&self, id: &AppId) -> Result<Removed, DestroyError> {
+        let _settling = self.settling(id);
         let app = self
             .store
             .remove(id)
@@ -276,6 +374,7 @@ impl Applier {
     /// for the same state it is in. It will still stop the container if that is
     /// now being asked for and it is still running.
     pub async fn suspend(&self, id: &AppId, stop_container: bool) -> Result<(), SuspendError> {
+        let _settling = self.settling(id);
         let held = match self.store.get(id) {
             // Unroute first, holding on to where its container was: until the
             // engine says otherwise, it is running and reachable there.
@@ -328,6 +427,7 @@ impl Applier {
     /// Resuming an app that is already running is not an error, for the same
     /// reason suspending a suspended one is not.
     pub async fn resume(&self, id: &AppId) -> Result<Arc<App>, ResumeError> {
+        let _settling = self.settling(id);
         if let Some(app) = self.store.get(id) {
             return Ok(app);
         }
@@ -413,6 +513,7 @@ impl Applier {
         manifest: AppManifest,
         suspend: bool,
     ) -> Result<Applied, ApplyError> {
+        let _settling = self.settling(&id);
         let recorded = manifest.source_text().to_owned();
         let held = self.store.suspended(&id);
         let suspend = suspend || held.is_some();
@@ -496,6 +597,7 @@ impl Applier {
         manifest: AppManifest,
         suspended: bool,
     ) -> Result<Restored, ApplyError> {
+        let _settling = self.settling(&id);
         self.free_of_conflict(&id, &manifest)?;
 
         if suspended {
@@ -647,9 +749,31 @@ impl Applier {
     }
 }
 
+/// The mark that says an app is being worked on, for as long as it is held.
+///
+/// Held by value and never inspected: it exists for its `Drop`, and the one
+/// thing a caller must do with it is keep it alive until the work is finished.
+pub struct Settling<'a> {
+    applier: &'a Applier,
+    id: AppId,
+}
+
+impl Drop for Settling<'_> {
+    fn drop(&mut self) {
+        let mut marks = self.applier.settle_marks();
+        match marks.get_mut(&self.id) {
+            Some(1) | None => {
+                marks.remove(&self.id);
+            }
+            Some(held) => *held -= 1,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::store::Downed;
     use crate::runtime::{Container, ContainerId, Managed};
     use crate::state::Db;
     use anyhow::{Result, bail};
@@ -768,6 +892,7 @@ mod tests {
                 .map(|(index, app)| Managed {
                     id: ContainerId::new(format!("{app}-{}", 9001 + index)),
                     app: Some(app.clone()),
+                    running: true,
                 })
                 .filter(|container| !removed.contains(&container.id))
                 .collect())
@@ -1607,5 +1732,160 @@ container:
         assert!(destroyed.container().is_none());
         assert!(store.routes().is_empty());
         assert!(runtime.removed.lock().unwrap().is_empty());
+    }
+
+    // Restarting, and the mark that keeps the supervisor off an app spaceport
+    // is already seeing to.
+
+    #[tokio::test]
+    async fn restarting_a_running_app_gives_it_a_new_container() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+        let before = started(
+            applier
+                .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
+                .await
+                .unwrap(),
+        );
+
+        let after = applier
+            .restart(&"hello".parse().unwrap(), "its container exited")
+            .await
+            .unwrap();
+
+        assert_ne!(after.container, before.container);
+        assert_eq!(runtime.launched.lock().unwrap().len(), 2);
+        assert_eq!(
+            store.routes().serving("alpha.test").unwrap().upstream,
+            after.upstream
+        );
+        assert!(store.down_apps().is_empty());
+    }
+
+    /// A restart that fails leaves the app claiming its hosts and saying why,
+    /// because that is what the supervisor tries again from and what a status
+    /// report reads.
+    #[tokio::test]
+    async fn a_restart_that_fails_leaves_the_app_down_with_a_reason() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+        applier
+            .apply("hello".parse().unwrap(), manifest("alpha.test"), false)
+            .await
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime {
+            refuse: true,
+            ..Default::default()
+        });
+        let applier = Applier::new(
+            store.clone(),
+            runtime,
+            AppRepository::new(Db::in_memory().unwrap()),
+        );
+
+        let error = applier
+            .restart(&"hello".parse().unwrap(), "its container exited")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ApplyError::Failed(_)));
+        let reason = store
+            .downed(&"hello".parse().unwrap())
+            .expect("it should be down")
+            .reason;
+        assert!(reason.contains("no image for you"), "{reason}");
+        // Not serving, and still spoken for.
+        assert!(store.routes().serving("alpha.test").is_none());
+        assert!(store.routes().lookup("alpha.test").is_some());
+    }
+
+    /// The supervisor's way back for an app that never started: it is in the
+    /// store as down rather than as running, and a restart has to work from
+    /// that as readily as from a container that has just died.
+    #[tokio::test]
+    async fn restarting_an_app_that_is_already_down_starts_it() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+        store
+            .insert_down(Downed {
+                id: "hello".parse().unwrap(),
+                manifest: manifest("alpha.test"),
+                reason: "no image `x:1`".to_owned(),
+            })
+            .unwrap();
+
+        let app = applier
+            .restart(&"hello".parse().unwrap(), "trying again")
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.launched.lock().unwrap().len(), 1);
+        assert_eq!(
+            store.routes().serving("alpha.test").unwrap().upstream,
+            app.upstream
+        );
+        assert!(store.down_apps().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restarting_an_app_nobody_has_heard_of_says_so() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _) = applier(runtime);
+
+        let error = applier
+            .restart(&"ghost".parse().unwrap(), "its container exited")
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("no app named `ghost`"),
+            "{error}"
+        );
+    }
+
+    /// What keeps the supervisor off an app spaceport is already working on:
+    /// every verb takes containers down and puts them up, and the engine
+    /// reports all of it exactly as it reports a crash.
+    #[tokio::test]
+    async fn marks_an_app_while_it_is_being_worked_on() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _) = applier(runtime);
+        let id: AppId = "hello".parse().unwrap();
+
+        assert!(!applier.is_settling(&id));
+        {
+            let _held = applier.settling(&id);
+            assert!(applier.is_settling(&id));
+        }
+        assert!(!applier.is_settling(&id));
+    }
+
+    /// Two operators applying the same app at once must not have the first one
+    /// to finish clear the mark for the second.
+    #[tokio::test]
+    async fn the_mark_outlasts_the_first_of_two_verbs_to_finish() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _) = applier(runtime);
+        let id: AppId = "hello".parse().unwrap();
+
+        let outer = applier.settling(&id);
+        let inner = applier.settling(&id);
+
+        drop(inner);
+        assert!(applier.is_settling(&id));
+        drop(outer);
+        assert!(!applier.is_settling(&id));
+    }
+
+    /// The mark is one app's, not the applier's: an apply of one app must not
+    /// stop the supervisor acting on another that died at the same moment.
+    #[tokio::test]
+    async fn the_mark_is_only_about_the_app_it_names() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _) = applier(runtime);
+
+        let _held = applier.settling(&"hello".parse().unwrap());
+
+        assert!(!applier.is_settling(&"other".parse().unwrap()));
     }
 }

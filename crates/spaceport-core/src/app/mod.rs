@@ -7,13 +7,15 @@ pub mod pattern;
 pub mod reconcile;
 pub mod repository;
 pub mod store;
+pub mod supervisor;
 
 pub use apply::{Applied, Applier, Restored};
 pub use manifest::AppManifest;
 pub use pattern::Pattern;
 pub use reconcile::reconcile;
 pub use repository::{AppRecord, AppRepository};
-pub use store::{App, AppStore, Removed, Route, Routes, Suspended};
+pub use store::{App, AppStore, Downed, Removed, Route, Routes, Suspended};
+pub use supervisor::supervise;
 
 use std::fmt;
 use std::str::FromStr;

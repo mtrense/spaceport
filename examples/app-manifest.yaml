@@ -22,8 +22,26 @@ container:
       failure_threshold: 30     # default: `30` — with the interval, how long an
                                 # apply waits for a slow app before giving up
       success_threshold: 1      # default: `1`
-    liveness:
-      # Same as above
+    liveness:          # omit entirely -> spaceport never restarts an app whose
+                       # container is still running. Unlike readiness, this has
+                       # no default: a liveness check is a standing instruction
+                       # to restart, and an app that never asked for one does
+                       # not acquire it by being applied to a newer spaceport.
+                       # A container that has *exited* is restarted either way.
+      type: http                # http|tcp|none   (`none` means the same as
+                                # leaving the whole block out)
+      path: /healthz            # required when `http`, no default
+      initial_delay: 10s        # default: `0s` — the grace after a start. The
+                                # app has already passed its readiness check by
+                                # then, but ready is not always warm.
+      interval: 10s             # default: `1s`
+      timeout: 5s               # default: `5s`
+      failure_threshold: 3      # default: `30` — how many checks in a row have
+                                # to fail before spaceport restarts the app.
+                                # Lower than readiness usually wants: here it is
+                                # how long a broken app goes on serving, not how
+                                # long a slow one is given to start.
+      success_threshold: 1      # default: `1`
   volumes:                      # volumes are kept when an app is deleted
     - name: data                # host path is calculated as <data-dir>/app-id/<volume-name>
       mount: /var/lib/my-app/data

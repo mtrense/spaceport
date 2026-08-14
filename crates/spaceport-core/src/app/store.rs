@@ -19,6 +19,12 @@
 //! [`Routes::hosts`], which is where certificate acquisition gets its names,
 //! goes on naming a suspended app's hosts, so its certificates go on being
 //! renewed and are valid the moment it comes back.
+//!
+//! An app the supervisor has taken out of the table because its container died
+//! is in exactly the same position, and is kept the same way. The difference is
+//! only in what an operator should read into it — one is a decision, the other
+//! is a fault — and so it is only a difference in what the edge says and what a
+//! status reports, never in what is claimed.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
@@ -26,7 +32,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{Result, bail};
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::AppId;
 use super::manifest::{AppManifest, Host};
@@ -79,6 +85,29 @@ impl Suspended {
     }
 }
 
+/// An app that is recorded and claims its hosts, and that spaceport is failing
+/// to run.
+///
+/// What the supervisor puts an app into the moment its container stops being
+/// one, and takes it out of when it has started it again. It carries only what
+/// starting it again needs — there is no container, because the container is
+/// the thing that has gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Downed {
+    pub id: AppId,
+    pub manifest: AppManifest,
+    /// What the supervisor last saw go wrong, in the words an operator will
+    /// read in a status report.
+    pub reason: String,
+}
+
+impl Downed {
+    /// The hosts it goes on claiming while it is not serving.
+    pub fn hosts(&self) -> &[Host] {
+        &self.manifest.routing.hosts
+    }
+}
+
 /// What the edge finds when it looks up a host.
 #[derive(Debug, Clone)]
 pub enum Route {
@@ -86,6 +115,11 @@ pub enum Route {
     Live(Arc<App>),
     /// An app that is suspended. Answer for it, and do not forward.
     Suspended(AppId),
+    /// An app that should be running and is not. Answer for it too — the same
+    /// answer as for a suspended one, because the caller can do the same thing
+    /// about both, which is to come back — and say something different, because
+    /// the operator cannot.
+    Down(AppId),
 }
 
 impl Route {
@@ -93,7 +127,7 @@ impl Route {
     pub fn app(&self) -> &AppId {
         match self {
             Self::Live(app) => &app.id,
-            Self::Suspended(id) => id,
+            Self::Suspended(id) | Self::Down(id) => id,
         }
     }
 
@@ -101,7 +135,7 @@ impl Route {
     pub fn live(&self) -> Option<&Arc<App>> {
         match self {
             Self::Live(app) => Some(app),
-            Self::Suspended(_) => None,
+            Self::Suspended(_) | Self::Down(_) => None,
         }
     }
 }
@@ -178,9 +212,16 @@ struct Inner {
     ///
     /// Kept apart from `apps` rather than as a flag on one map, because almost
     /// everything that asks the store for apps means the running ones and
-    /// would have to remember to filter. The two maps are disjoint: an id is in
-    /// one or the other, never both.
+    /// would have to remember to filter.
     suspended: BTreeMap<AppId, Suspended>,
+    /// The apps that should be running and are not, as the supervisor found
+    /// them.
+    ///
+    /// Apart from `suspended` for the same reason `suspended` is apart from
+    /// `apps`: an operator asking which apps are deliberately down must not be
+    /// told about the ones that are down because something broke. The three
+    /// maps are disjoint — an id is in exactly one of them, never two.
+    down: BTreeMap<AppId, Downed>,
     routes: Arc<Routes>,
 }
 
@@ -209,8 +250,10 @@ impl AppStore {
         }
 
         // An app that starts is no longer a suspended one, however it got here:
-        // resuming it, or applying over it without `--suspended`.
+        // resuming it, or applying over it without `--suspended`. Nor is it a
+        // down one — this is exactly what the supervisor does about that.
         inner.suspended.remove(&app.id);
+        inner.down.remove(&app.id);
         inner.apps.insert(app.id.clone(), app.clone());
         inner.rebuild_routes();
         let routes = inner.routes.len();
@@ -304,6 +347,9 @@ impl AppStore {
         let id = suspended.id.clone();
         let claimed = hosts(suspended.hosts());
         inner.apps.remove(&id);
+        // Suspending outranks being down: an app an operator has taken out of
+        // service is not one the supervisor should go on trying to start.
+        inner.down.remove(&id);
         inner.suspended.insert(id.clone(), suspended);
         inner.rebuild_routes();
         drop(inner);
@@ -314,12 +360,112 @@ impl AppStore {
         Ok(())
     }
 
-    /// Drop the app under `id`, along with its routes — running or suspended.
+    /// Take the app under `id` out of service without giving up its hosts,
+    /// because it is not serving whether spaceport likes it or not.
+    ///
+    /// The counterpart of [`AppStore::suspend`], and it keeps the same promise:
+    /// the hosts stay claimed, so nothing else can take them while spaceport is
+    /// getting the app back, and the certificates for them go on being renewed.
+    /// What differs is the answer the edge gives and what a status calls it.
+    ///
+    /// Returns the app as it was running, or `None` if no *running* app is
+    /// under that id — an app that is already down is left as it was, reason
+    /// and all, because the first thing that went wrong is the one worth
+    /// reporting.
+    pub fn take_down(&self, id: &AppId, reason: impl Into<String>) -> Option<Arc<App>> {
+        let mut inner = self.write();
+        let app = inner.apps.remove(id)?;
+        let reason = reason.into();
+
+        inner.down.insert(
+            id.clone(),
+            Downed {
+                id: id.clone(),
+                manifest: app.manifest.clone(),
+                reason: reason.clone(),
+            },
+        );
+        inner.rebuild_routes();
+        drop(inner);
+        self.announce();
+
+        warn!(
+            app = %id,
+            hosts = %hosts(app.hosts()),
+            reason = %reason,
+            "the app is not serving, and its hosts are answered rather than forwarded",
+        );
+
+        Some(app)
+    }
+
+    /// Put an app that was never running into the down map: recorded, claiming
+    /// its hosts, and known to be broken.
+    ///
+    /// What a restore that failed leaves behind, so that an app which could not
+    /// be started at boot is supervised from then on rather than only being
+    /// mentioned once in the startup log.
+    pub fn insert_down(&self, downed: Downed) -> Result<()> {
+        let mut inner = self.write();
+
+        if let Some((host, owner)) = conflict(&inner.routes, &downed.id, downed.hosts()) {
+            bail!("host `{host}` is already claimed by app `{owner}`");
+        }
+
+        let id = downed.id.clone();
+        let claimed = hosts(downed.hosts());
+        let reason = downed.reason.clone();
+        inner.apps.remove(&id);
+        inner.suspended.remove(&id);
+        inner.down.insert(id.clone(), downed);
+        inner.rebuild_routes();
+        drop(inner);
+        self.announce();
+
+        warn!(app = %id, hosts = %claimed, %reason, "app is not running and claims these hosts without serving them");
+
+        Ok(())
+    }
+
+    /// Say something new about why an app that is already down is down.
+    ///
+    /// What a failed attempt to start it again leaves behind. Touches no
+    /// routes — it was not serving before and it is not serving now — so
+    /// nothing is announced and nothing wakes up for it.
+    ///
+    /// Does nothing for an app that is not down, which is the right answer for
+    /// an attempt that was overtaken by an operator applying the app in the
+    /// meantime: that app is running, and last week's reason is not news.
+    pub fn note_down(&self, id: &AppId, reason: impl Into<String>) -> bool {
+        let mut inner = self.write();
+        let Some(down) = inner.down.get_mut(id) else {
+            return false;
+        };
+        down.reason = reason.into();
+
+        true
+    }
+
+    /// The down app under `id`, if it is one.
+    pub fn downed(&self, id: &AppId) -> Option<Downed> {
+        self.read().down.get(id).cloned()
+    }
+
+    /// Every app that should be running and is not.
+    pub fn down_apps(&self) -> Vec<Downed> {
+        self.read().down.values().cloned().collect()
+    }
+
+    /// Drop the app under `id`, along with its routes — running, suspended or
+    /// down.
     pub fn remove(&self, id: &AppId) -> Option<Removed> {
         let mut inner = self.write();
         let removed = match inner.apps.remove(id) {
             Some(app) => Removed::Live(app),
-            None => Removed::Suspended(Box::new(inner.suspended.remove(id)?)),
+            None => match inner.suspended.remove(id) {
+                Some(app) => Removed::Suspended(Box::new(app)),
+                None => Removed::Down(Box::new(inner.down.remove(id)?)),
+            },
         };
         inner.rebuild_routes();
         let routes = inner.routes.len();
@@ -423,12 +569,13 @@ impl AppStore {
 /// it, remove its container — and the only thing that differs is whether there
 /// is a container to remove, which a suspended app may not have.
 ///
-/// The suspended side is boxed, as in [`crate::app::Applied`]: it carries a
-/// whole manifest where the live side carries an `Arc`.
+/// The suspended and down sides are boxed, as in [`crate::app::Applied`]: they
+/// carry a whole manifest where the live side carries an `Arc`.
 #[derive(Debug, Clone)]
 pub enum Removed {
     Live(Arc<App>),
     Suspended(Box<Suspended>),
+    Down(Box<Downed>),
 }
 
 impl Removed {
@@ -436,6 +583,7 @@ impl Removed {
         match self {
             Self::Live(app) => &app.id,
             Self::Suspended(app) => &app.id,
+            Self::Down(app) => &app.id,
         }
     }
 
@@ -443,6 +591,7 @@ impl Removed {
         match self {
             Self::Live(app) => &app.manifest,
             Self::Suspended(app) => &app.manifest,
+            Self::Down(app) => &app.manifest,
         }
     }
 
@@ -450,11 +599,13 @@ impl Removed {
         &self.manifest().routing.hosts
     }
 
-    /// The container to take down with it, if it had one.
+    /// The container to take down with it, if it had one. A down app has none:
+    /// its container going is what put it there.
     pub fn container(&self) -> Option<&ContainerId> {
         match self {
             Self::Live(app) => Some(&app.container),
             Self::Suspended(app) => app.container.as_ref().map(Adopted::id),
+            Self::Down(_) => None,
         }
     }
 }
@@ -498,6 +649,11 @@ impl Inner {
                 by_host.insert(host.clone(), Route::Suspended(app.id.clone()));
             }
         }
+        for app in self.down.values() {
+            for host in app.hosts() {
+                by_host.insert(host.clone(), Route::Down(app.id.clone()));
+            }
+        }
 
         self.routes = Arc::new(Routes { by_host });
     }
@@ -535,6 +691,16 @@ routing:
             id: app.id,
             manifest: app.manifest,
             container: None,
+        }
+    }
+
+    fn downed(id: &str, hosts: &[&str], reason: &str) -> Downed {
+        let app = app(id, hosts, 1);
+
+        Downed {
+            id: app.id,
+            manifest: app.manifest,
+            reason: reason.to_owned(),
         }
     }
 
@@ -751,6 +917,169 @@ routing:
         assert!(removed.container().is_none());
         assert!(store.routes().is_empty());
         assert!(store.suspended_apps().is_empty());
+    }
+
+    #[test]
+    fn a_down_app_is_routed_but_not_served() {
+        let store = AppStore::new();
+        store.insert(app("hello", &["alpha.test"], 8080)).unwrap();
+
+        let was = store
+            .take_down(&"hello".parse().unwrap(), "the container stopped")
+            .unwrap();
+
+        assert_eq!(was.upstream.port(), 8080);
+        // The host is still spoken for — that is what the edge answers 503 on.
+        assert!(store.routes().lookup("alpha.test").is_some());
+        assert!(store.routes().serving("alpha.test").is_none());
+        // And it is no longer one of the apps that are running.
+        assert!(store.apps().is_empty());
+        assert!(store.get(&"hello".parse().unwrap()).is_none());
+        assert_eq!(store.down_apps().len(), 1);
+    }
+
+    /// The hosts stay claimed while the supervisor works: an app that lost its
+    /// name the moment its container died could not be started again.
+    #[test]
+    fn a_down_app_keeps_its_hosts_from_another_app() {
+        let store = AppStore::new();
+        store.insert(app("hello", &["alpha.test"], 8080)).unwrap();
+        store.take_down(&"hello".parse().unwrap(), "the container stopped");
+
+        let err = store
+            .insert(app("other", &["alpha.test"], 9090))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("already claimed by app `hello`"), "{err}");
+    }
+
+    /// Certificates are acquired for every name spaceport answers to, and a
+    /// down app is still one of them — so that an app comes back to traffic it
+    /// can serve rather than to a handshake it cannot complete.
+    #[test]
+    fn a_down_app_still_asks_for_certificates() {
+        let store = AppStore::new();
+        store
+            .insert(app("hello", &["alpha.test", "beta.test"], 8080))
+            .unwrap();
+        store.take_down(&"hello".parse().unwrap(), "the container stopped");
+
+        let hosts = store.routes().hosts();
+        assert_eq!(hosts.len(), 2);
+        assert!(hosts.contains("alpha.test"));
+        assert!(hosts.contains("beta.test"));
+    }
+
+    #[test]
+    fn taking_down_an_app_that_is_not_running_says_so() {
+        let store = AppStore::new();
+        assert!(
+            store
+                .take_down(&"ghost".parse().unwrap(), "the container stopped")
+                .is_none()
+        );
+    }
+
+    /// The supervisor sees an app fail more than once, and the first thing that
+    /// went wrong is the one worth reporting — a later, vaguer reason
+    /// overwriting it would lose the fault an operator is looking for.
+    #[test]
+    fn taking_down_an_app_that_is_already_down_leaves_the_first_reason_alone() {
+        let store = AppStore::new();
+        store.insert(app("hello", &["alpha.test"], 8080)).unwrap();
+        let id: AppId = "hello".parse().unwrap();
+
+        store.take_down(&id, "the container exited with 1").unwrap();
+        // Nothing to take down any more, which is how the first reason survives.
+        assert!(store.take_down(&id, "the container is gone").is_none());
+
+        assert_eq!(
+            store.downed(&id).unwrap().reason,
+            "the container exited with 1"
+        );
+        assert_eq!(store.down_apps().len(), 1);
+    }
+
+    #[test]
+    fn starting_a_down_app_makes_it_live_again() {
+        let store = AppStore::new();
+        store.insert(app("hello", &["alpha.test"], 8080)).unwrap();
+        store.take_down(&"hello".parse().unwrap(), "the container stopped");
+
+        store.insert(app("hello", &["alpha.test"], 9090)).unwrap();
+
+        assert_eq!(upstream(&store, "alpha.test").unwrap().port(), 9090);
+        assert!(store.down_apps().is_empty());
+        assert_eq!(store.apps().len(), 1);
+    }
+
+    /// An attempt to start a down app that fails again says something newer
+    /// about why, and an attempt overtaken by an operator applying the app must
+    /// not put last week's reason back on a running one.
+    #[test]
+    fn saying_why_an_app_is_down_only_lands_on_an_app_that_is_down() {
+        let store = AppStore::new();
+        store.insert(app("hello", &["alpha.test"], 8080)).unwrap();
+        let id: AppId = "hello".parse().unwrap();
+        store.take_down(&id, "the container stopped");
+
+        assert!(store.note_down(&id, "the image is not there"));
+        assert_eq!(store.downed(&id).unwrap().reason, "the image is not there");
+
+        store.insert(app("hello", &["alpha.test"], 9090)).unwrap();
+        assert!(!store.note_down(&id, "still nothing"));
+    }
+
+    /// Suspending outranks being down: an app an operator has taken out of
+    /// service is not one the supervisor should go on trying to start.
+    #[test]
+    fn suspending_a_down_app_takes_it_out_of_the_down_apps() {
+        let store = AppStore::new();
+        store.insert(app("hello", &["alpha.test"], 8080)).unwrap();
+        store.take_down(&"hello".parse().unwrap(), "the container stopped");
+
+        store
+            .insert_suspended(suspended("hello", &["alpha.test"]))
+            .unwrap();
+
+        assert!(store.down_apps().is_empty());
+        assert_eq!(store.suspended_apps().len(), 1);
+        assert!(matches!(
+            store.routes().lookup("alpha.test"),
+            Some(Route::Suspended(_))
+        ));
+    }
+
+    #[test]
+    fn removing_a_down_app_drops_its_claim() {
+        let store = AppStore::new();
+        store
+            .insert_down(downed("hello", &["alpha.test"], "the container stopped"))
+            .unwrap();
+
+        let removed = store.remove(&"hello".parse().unwrap()).unwrap();
+
+        assert_eq!(removed.id().as_str(), "hello");
+        assert!(matches!(removed, Removed::Down(_)));
+        // Its container going is what put it there, so there is none to remove.
+        assert!(removed.container().is_none());
+        assert!(store.routes().is_empty());
+        assert!(store.down_apps().is_empty());
+    }
+
+    #[test]
+    fn recording_a_down_app_over_a_claimed_host_is_refused() {
+        let store = AppStore::new();
+        store.insert(app("hello", &["alpha.test"], 8080)).unwrap();
+
+        let err = store
+            .insert_down(downed("other", &["alpha.test"], "the container stopped"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("already claimed by app `hello`"), "{err}");
+        assert!(store.down_apps().is_empty());
     }
 
     /// What a sweep checks against: a suspended app's container is spoken for

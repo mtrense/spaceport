@@ -161,14 +161,24 @@ impl Instance {
             .map(|(app, _)| app.id.clone())
             .collect();
 
-        // Why each app that failed to come back at startup failed, so a `down`
-        // app can say more than that it is down.
-        let reasons: BTreeMap<&AppId, &String> = self
+        // Why each app that is not running is not running, so a `down` app can
+        // say more than that it is down.
+        //
+        // The store first and the startup report second. The store is what the
+        // supervisor keeps current — an app that died an hour after boot, or
+        // that spaceport has given up restarting, is only in there — and the
+        // report is the fallback for the one case the store cannot hold: an app
+        // whose recorded manifest this build cannot parse, which never got as
+        // far as claiming a host.
+        let mut reasons: BTreeMap<AppId, String> = self
             .reconciled
             .failed
             .iter()
-            .map(|(id, reason)| (id, reason))
+            .map(|(id, reason)| (id.clone(), reason.clone()))
             .collect();
+        for down in self.applier.store().down_apps() {
+            reasons.insert(down.id, down.reason);
+        }
 
         // Not running, and not a fault: an app is in here because somebody said
         // so, and it must not be counted among the ones that failed.
@@ -188,7 +198,7 @@ impl Instance {
                     .filter(|record| !suspended.contains(&record.id))
                     .map(|record| Down {
                         id: record.id.clone(),
-                        reason: reasons.get(&record.id).map(|reason| (*reason).clone()),
+                        reason: reasons.get(&record.id).cloned(),
                     })
                     .collect();
 
