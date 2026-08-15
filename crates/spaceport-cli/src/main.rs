@@ -561,6 +561,19 @@ async fn run(args: RunArgs) -> Result<()> {
     let github = Arc::new(github::Network::new()?);
     let connections = Arc::new(ConnectionRepository::new(db.clone()));
 
+    // Whatever webhooks missed, healed on a timer. Started unconditionally,
+    // even on a host with no connections at all: a connection can be made while
+    // spaceport is running, and a loop that was not started because there were
+    // none at startup would never notice the first one. A pass over zero
+    // connections asks GitHub nothing and says nothing, so the cost of being
+    // wrong that way is a task asleep for an hour.
+    tokio::spawn(github::maintain(
+        connections.clone(),
+        github.clone(),
+        github::reconcile::Policy::default(),
+        shutdown.clone(),
+    ));
+
     // Shared between the two listeners on purpose: `spaceport connect github
     // --auto` issues a state on the operator socket, and the browser that
     // answers for it arrives at the edge.

@@ -438,6 +438,29 @@ impl ConnectionRepository {
             .await
     }
 
+    /// When a reconciliation pass last wrote down what GitHub said about
+    /// `app_id`, if one ever has.
+    ///
+    /// The newest `seen_at` across the installations, because a pass stamps
+    /// every row it writes with the same moment — so the maximum is when the
+    /// pass ran, and `None` means no pass has succeeded yet. Reported rather
+    /// than computed from the interval: what an operator wants to know when a
+    /// repository is missing is whether the cache is stale, and only the rows
+    /// can say that.
+    pub async fn last_reconciled(&self, app_id: i64) -> Result<Option<String>> {
+        self.db
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT MAX(seen_at) FROM github_installations WHERE app_id = ?1",
+                        [app_id],
+                        |row| row.get(0),
+                    )
+                    .context("reading when a github connection was last reconciled")
+            })
+            .await
+    }
+
     /// Write down that delivery `delivery_id` arrived, and say whether it is
     /// new.
     ///
@@ -782,6 +805,25 @@ mod tests {
         let other = repository.installations(43).await.unwrap();
         assert_eq!(other.len(), 1);
         assert_eq!(other[0].repositories, ["another-org/site"]);
+    }
+
+    /// An empty listing is not the same answer as a cache nothing has ever
+    /// filled, and `spaceport connect show` has to be able to tell them apart.
+    #[tokio::test]
+    async fn says_when_an_app_was_last_reconciled_and_when_it_never_has_been() {
+        let repository = repository();
+
+        assert!(repository.last_reconciled(42).await.unwrap().is_none());
+
+        repository
+            .record_installations(42, &[installation(7, &["an-organisation/site"])])
+            .await
+            .unwrap();
+
+        let reconciled = repository.last_reconciled(42).await.unwrap().unwrap();
+        assert!(reconciled.ends_with('Z'), "{reconciled}");
+        // Another app's pass is not this one's.
+        assert!(repository.last_reconciled(43).await.unwrap().is_none());
     }
 
     #[tokio::test]

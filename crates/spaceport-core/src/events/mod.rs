@@ -151,6 +151,10 @@ const CATEGORIES: &[(&str, &str)] = &[
         "spaceport_core::connections::github::webhook",
         "connection.webhook",
     ),
+    (
+        "spaceport_core::connections::github::reconcile",
+        "connection.reconcile",
+    ),
     ("spaceport_core::connections", "connection"),
     ("spaceport_core::edge", "edge"),
     ("spaceport_core::operator", "operator"),
@@ -332,6 +336,25 @@ mod tests {
         assert!(
             Category::new("connection.webhook").within(&Category::new("connection")),
             "a webhook is still a connection event"
+        );
+    }
+
+    /// The two halves of knowing what GitHub says are worth telling apart:
+    /// `connection.webhook` is what arrived unasked and `connection.reconcile`
+    /// is what spaceport went and asked for, and an operator wondering why a
+    /// repository is not showing up wants to know which of the two found it.
+    #[test]
+    fn categorises_a_reconciliation_pass_apart_from_the_deliveries() {
+        assert_eq!(
+            Category::for_target("spaceport_core::connections::github::reconcile").as_str(),
+            "connection.reconcile"
+        );
+        assert!(
+            Category::new("connection.reconcile").within(&Category::new("connection")),
+            "a reconciliation is still a connection event"
+        );
+        assert!(
+            !Category::new("connection.reconcile").within(&Category::new("connection.webhook"))
         );
     }
 

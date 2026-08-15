@@ -1170,6 +1170,15 @@ async fn connection(
         Err(error) => out.field("installed", format!("could not be read: {error:#}")),
     }
 
+    // How old that answer is, which is the question behind "why is my
+    // repository not here" — a cache nothing has refreshed yet and a cache
+    // refreshed a minute ago call for quite different next steps.
+    match connections.last_reconciled(held.app_id).await {
+        Ok(Some(reconciled)) => out.field("refreshed", reconciled),
+        Ok(None) => out.field("refreshed", "not yet — the first pass is hourly".to_owned()),
+        Err(error) => out.field("refreshed", format!("could not be read: {error:#}")),
+    }
+
     (StatusCode::OK, out.render()).into_response()
 }
 

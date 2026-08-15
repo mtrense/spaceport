@@ -14,19 +14,22 @@
 //! with registering an App an operator created by hand, reading the key it
 //! signs with, and the client that asks GitHub what the App is and mints the
 //! tokens that act as its installations — and, beside registering an App by
-//! hand, the App Manifest flow that has GitHub create one instead — and the
-//! webhook, which verifies what GitHub delivers and records it as an event.
-//! Acting on a delivery is a later step and lives nowhere yet.
+//! hand, the App Manifest flow that has GitHub create one instead — the
+//! webhook, which verifies what GitHub delivers and records it as an event, and
+//! the reconciliation that asks GitHub outright on a timer and heals whatever a
+//! webhook missed. Acting on any of it is a later step and lives nowhere yet.
 
 pub mod api;
 pub mod jwt;
 pub mod key;
 pub mod manifest;
+pub mod reconcile;
 pub mod register;
 pub mod repository;
 pub mod webhook;
 
 pub use api::{Client, Network, Transport};
 pub use manifest::{Attempt, Attempts};
+pub use reconcile::maintain;
 pub use register::{Registration, connect};
 pub use repository::{Connection, ConnectionRepository, Installation};

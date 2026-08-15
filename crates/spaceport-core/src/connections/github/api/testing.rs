@@ -79,6 +79,8 @@ struct State {
     minted: usize,
     /// Answer every request with this status and body instead.
     refusal: Option<(StatusCode, String)>,
+    /// Refuse only what this app signs for, whoever else is being answered.
+    refused_app: Option<i64>,
     /// Headers added to a refusal, for the rate limit's sake.
     refusal_headers: Vec<(String, String)>,
     /// Offer a next page for ever, however many have been served.
@@ -111,6 +113,7 @@ impl FakeGitHub {
                 token_lifetime: TOKEN_LIFETIME,
                 minted: 0,
                 refusal: None,
+                refused_app: None,
                 refusal_headers: Vec::new(),
                 endless: false,
                 converted: None,
@@ -171,6 +174,17 @@ impl FakeGitHub {
         self.state.lock().unwrap().refusal = Some((status, body.to_owned()));
     }
 
+    /// Stop accepting the credentials of the app `app_id`, and go on answering
+    /// for every other app registered here.
+    ///
+    /// The shape of one connection of several being broken — a key rotated on
+    /// the settings page, an app deleted on github.com — which is the case a
+    /// pass over many connections has to survive. Matched on the `iss` claim,
+    /// so a call made as an installation of that app is refused at the mint.
+    pub(crate) fn refuses_the_app(&self, app_id: i64) {
+        self.state.lock().unwrap().refused_app = Some(app_id);
+    }
+
     /// Say that this app has no requests left until `reset`, a unix timestamp.
     pub(crate) fn exhaust_the_rate_limit(&self, reset: i64) {
         self.state.lock().unwrap().refusal_headers = vec![
@@ -220,9 +234,17 @@ impl FakeGitHub {
     fn handle(&self, request: &Request<Bytes>) -> Response<Bytes> {
         let path = request.uri().path().to_owned();
         let page = page_number(request.uri().query());
+        let signed_by = issuer(request);
         let mut state = self.state.lock().unwrap();
 
         state.requests.push(recorded(request));
+
+        if state.refused_app.is_some() && state.refused_app == signed_by {
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Bytes::from_static(br#"{"message":"Bad credentials"}"#))
+                .unwrap();
+        }
 
         if let Some((status, body)) = state.refusal.clone() {
             let mut response = Response::builder().status(status);
