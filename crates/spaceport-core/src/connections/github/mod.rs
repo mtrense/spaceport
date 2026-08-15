@@ -14,9 +14,9 @@
 //! with registering an App an operator created by hand, reading the key it
 //! signs with, and the client that asks GitHub what the App is and mints the
 //! tokens that act as its installations — and, beside registering an App by
-//! hand, the App Manifest flow that has GitHub create one instead. Verifying
-//! webhook signatures and serving the webhook route are each their own module,
-//! and each arrives with the step that needs it.
+//! hand, the App Manifest flow that has GitHub create one instead — and the
+//! webhook, which verifies what GitHub delivers and records it as an event.
+//! Acting on a delivery is a later step and lives nowhere yet.
 
 pub mod api;
 pub mod jwt;
@@ -24,6 +24,7 @@ pub mod key;
 pub mod manifest;
 pub mod register;
 pub mod repository;
+pub mod webhook;
 
 pub use api::{Client, Network, Transport};
 pub use manifest::{Attempt, Attempts};

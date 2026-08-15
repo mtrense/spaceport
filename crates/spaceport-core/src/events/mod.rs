@@ -147,6 +147,10 @@ const CATEGORIES: &[(&str, &str)] = &[
     ("spaceport_core::edge::tls", "tls"),
     ("spaceport_core::acme::resolver", "tls"),
     ("spaceport_core::acme", "acme"),
+    (
+        "spaceport_core::connections::github::webhook",
+        "connection.webhook",
+    ),
     ("spaceport_core::connections", "connection"),
     ("spaceport_core::edge", "edge"),
     ("spaceport_core::operator", "operator"),
@@ -308,6 +312,26 @@ mod tests {
         assert_eq!(
             Category::for_target("spaceport_core::connections::github::repository").as_str(),
             "connection"
+        );
+    }
+
+    /// What a forge says to a spaceport is worth watching on its own — an
+    /// operator setting a connection up wants the deliveries and not the
+    /// registration — while everything else under `connections` stays where it
+    /// was, which is what the ordering of the two rows buys.
+    #[test]
+    fn categorises_a_webhook_delivery_under_the_connection_it_arrived_for() {
+        assert_eq!(
+            Category::for_target("spaceport_core::connections::github::webhook").as_str(),
+            "connection.webhook"
+        );
+        assert_eq!(
+            Category::for_target("spaceport_core::connections::github::register").as_str(),
+            "connection"
+        );
+        assert!(
+            Category::new("connection.webhook").within(&Category::new("connection")),
+            "a webhook is still a connection event"
         );
     }
 

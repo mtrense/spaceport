@@ -29,14 +29,15 @@ use std::sync::Arc;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
-use http::StatusCode;
+use axum::routing::{get, post};
+use bytes::Bytes;
+use http::{HeaderMap, StatusCode};
 use serde::Deserialize;
 use time::OffsetDateTime;
 use tracing::warn;
 
 use crate::connections::github::manifest::{self, Attempts, Manifest};
-use crate::connections::github::{ConnectionRepository, Transport, register};
+use crate::connections::github::{ConnectionRepository, Transport, register, webhook};
 
 /// What the pages on spaceport's own host are served out of.
 ///
@@ -65,6 +66,7 @@ pub fn router(home: Arc<Home>) -> Router {
             &format!("{}/{{state}}/callback", manifest::SETUP_PATH),
             get(callback),
         )
+        .route(manifest::WEBHOOK_PATH, post(deliver))
         .with_state(home)
 }
 
@@ -216,6 +218,31 @@ async fn callback(
     )
 }
 
+/// `POST /connections/github/webhooks`: GitHub has something to say.
+///
+/// The body arrives as [`Bytes`] and not through axum's `Json` extractor, and
+/// that is the whole reason this handler is three lines rather than one. The
+/// signature is an HMAC over the exact bytes GitHub sent, so any extractor that
+/// parses and re-serialises them — reordering a key, dropping a space, changing
+/// how a number is spelled — hands the verifier a body that never existed and
+/// turns every genuine delivery into a refused one. The parsing that does
+/// happen happens after the signature has been checked.
+///
+/// The answer is a status and no body: what is reading it is GitHub's delivery
+/// machinery, which records the status and nothing else.
+async fn deliver(State(home): State<Arc<Home>>, headers: HeaderMap, body: Bytes) -> Response {
+    match webhook::receive(&home.connections, &headers, &body).await {
+        Ok(outcome) => outcome.status().into_response(),
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "a github webhook delivery could not be handled");
+
+            // A 500 rather than a refusal, because this is spaceport's fault
+            // and a retry is exactly what should happen.
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct Callback {
     /// GitHub's one-time code. Optional because a browser can arrive here with
@@ -306,11 +333,14 @@ fn escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connections::Secret;
+    use crate::connections::github::Connection;
     use crate::connections::github::api::testing::FakeGitHub;
     use crate::state::Db;
     use axum::body::Body;
     use http::Request;
     use http_body_util::BodyExt;
+    use ring::hmac;
     use tower::ServiceExt;
 
     const HOSTNAME: &str = "spaceport.example.com";
@@ -543,6 +573,308 @@ mod tests {
         assert!(!escaped.contains("<script>"), "{escaped}");
         assert!(escaped.contains("&lt;script&gt;"), "{escaped}");
         assert!(escaped.contains("&quot;&gt;"), "{escaped}");
+    }
+
+    /// A connection as an operator would have registered one, with a webhook
+    /// secret the tests can sign with.
+    async fn connect(home: &Home, slug: &str, app_id: i64, webhook_secret: &str) {
+        home.connections
+            .record(&Connection {
+                slug: slug.to_owned(),
+                app_id,
+                name: "Spaceport for Acme".to_owned(),
+                owner: "an-organisation".to_owned(),
+                client_id: "Iv1.0123456789abcdef".to_owned(),
+                client_secret: Secret::new("a-client-secret"),
+                webhook_secret: Secret::new(webhook_secret),
+                private_key: Secret::new("-----BEGIN RSA PRIVATE KEY-----"),
+                connected_at: String::new(),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// The signature GitHub would have sent, computed rather than pasted.
+    fn signed(secret: &str, body: &str) -> String {
+        let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+        let tag = hmac::sign(&key, body.as_bytes());
+        let hex: String = tag.as_ref().iter().map(|byte| format!("{byte:02x}")).fold(
+            String::new(),
+            |mut all, digits| {
+                all.push_str(&digits);
+                all
+            },
+        );
+
+        format!("sha256={hex}")
+    }
+
+    /// One delivery, posted at the real route through the real router.
+    async fn deliver_headers(
+        home: Arc<Home>,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (StatusCode, String) {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/connections/github/webhooks");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+
+        let response = router(home)
+            .oneshot(request.body(Body::from(body.to_owned())).unwrap())
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    /// A delivery of `event` for `app_id`, signed with `secret`.
+    async fn deliver(
+        home: Arc<Home>,
+        app_id: i64,
+        secret: &str,
+        event: &str,
+        delivery_id: &str,
+        body: &str,
+    ) -> StatusCode {
+        deliver_headers(
+            home,
+            &[
+                ("x-github-event", event),
+                ("x-github-delivery", delivery_id),
+                ("x-github-hook-installation-target-type", "integration"),
+                ("x-github-hook-installation-target-id", &app_id.to_string()),
+                ("x-hub-signature-256", &signed(secret, body)),
+            ],
+            body,
+        )
+        .await
+        .0
+    }
+
+    const PUSH: &str =
+        r#"{"repository":{"full_name":"an-organisation/site"},"installation":{"id":7}}"#;
+
+    /// Accepted and not merely `200`: nothing acts on a delivery yet, which is
+    /// what `202` says.
+    #[tokio::test]
+    async fn a_properly_signed_delivery_is_accepted() {
+        let home = plain_home();
+        connect(&home, "spaceport-for-acme", 42, "a-webhook-secret").await;
+
+        let status = deliver(home, 42, "a-webhook-secret", "push", "delivery-1", PUSH).await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    /// GitHub retries what it did not get a 2xx for, so the same delivery id
+    /// arrives more than once and must be observed exactly once.
+    #[tokio::test]
+    async fn the_same_delivery_twice_is_recorded_once() {
+        let home = plain_home();
+        connect(&home, "spaceport-for-acme", 42, "a-webhook-secret").await;
+
+        let first = deliver(
+            home.clone(),
+            42,
+            "a-webhook-secret",
+            "push",
+            "delivery-1",
+            PUSH,
+        )
+        .await;
+        let second = deliver(
+            home.clone(),
+            42,
+            "a-webhook-secret",
+            "push",
+            "delivery-1",
+            PUSH,
+        )
+        .await;
+
+        assert_eq!(first, StatusCode::ACCEPTED);
+        assert_eq!(second, StatusCode::OK);
+        // And the row is still the first one's, rather than having been written
+        // twice — asking again says it is known.
+        assert!(
+            !home
+                .connections
+                .record_delivery("delivery-1", 42, "push")
+                .await
+                .unwrap()
+        );
+    }
+
+    /// The signature is the only thing that says a delivery is GitHub's, so a
+    /// delivery without one is a stranger's.
+    #[tokio::test]
+    async fn an_unsigned_delivery_is_refused() {
+        let home = plain_home();
+        connect(&home, "spaceport-for-acme", 42, "a-webhook-secret").await;
+
+        let (status, _) = deliver_headers(
+            home,
+            &[
+                ("x-github-event", "push"),
+                ("x-github-delivery", "delivery-1"),
+                ("x-github-hook-installation-target-type", "integration"),
+                ("x-github-hook-installation-target-id", "42"),
+            ],
+            PUSH,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_delivery_signed_with_the_wrong_secret_is_refused() {
+        let home = plain_home();
+        connect(&home, "spaceport-for-acme", 42, "a-webhook-secret").await;
+
+        let status = deliver(
+            home,
+            42,
+            "another-webhook-secret",
+            "push",
+            "delivery-1",
+            PUSH,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// A hook for an App this spaceport does not hold ought to be disabled
+    /// rather than retried forever, and `404` is what tells GitHub so.
+    #[tokio::test]
+    async fn a_delivery_for_an_app_nothing_connects_to_is_not_found() {
+        let home = plain_home();
+        connect(&home, "spaceport-for-acme", 42, "a-webhook-secret").await;
+
+        let status = deliver(home, 99, "a-webhook-secret", "push", "delivery-1", PUSH).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// An App's own hook is the only hook spaceport registers; a repository
+    /// hook somebody pointed at this url is not one of its deliveries.
+    #[tokio::test]
+    async fn a_delivery_from_a_hook_that_is_not_an_apps_own_is_not_found() {
+        let home = plain_home();
+        connect(&home, "spaceport-for-acme", 42, "a-webhook-secret").await;
+
+        let (status, _) = deliver_headers(
+            home,
+            &[
+                ("x-github-event", "push"),
+                ("x-github-delivery", "delivery-1"),
+                ("x-github-hook-installation-target-type", "repository"),
+                ("x-github-hook-installation-target-id", "42"),
+                ("x-hub-signature-256", &signed("a-webhook-secret", PUSH)),
+            ],
+            PUSH,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Without an id there is nothing to deduplicate on, and a retry could not
+    /// be told from a new delivery.
+    #[tokio::test]
+    async fn a_delivery_without_an_id_is_refused() {
+        let home = plain_home();
+        connect(&home, "spaceport-for-acme", 42, "a-webhook-secret").await;
+
+        let (status, _) = deliver_headers(
+            home,
+            &[
+                ("x-github-event", "push"),
+                ("x-github-hook-installation-target-type", "integration"),
+                ("x-github-hook-installation-target-id", "42"),
+                ("x-hub-signature-256", &signed("a-webhook-secret", PUSH)),
+            ],
+            PUSH,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// GitHub sends a `ping` the moment a hook is created, and it is the first
+    /// delivery any App ever makes — handled like every other event, with no
+    /// case of its own.
+    #[tokio::test]
+    async fn a_ping_is_accepted_like_anything_else() {
+        let home = plain_home();
+        connect(&home, "spaceport-for-acme", 42, "a-webhook-secret").await;
+
+        let status = deliver(
+            home,
+            42,
+            "a-webhook-secret",
+            "ping",
+            "delivery-ping",
+            r#"{"zen":"Design for failure."}"#,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    /// The signature says the delivery is genuine; whether spaceport can read
+    /// the body is a separate question and not one GitHub can fix.
+    #[tokio::test]
+    async fn a_signed_delivery_whose_body_is_not_json_is_still_accepted() {
+        let home = plain_home();
+        connect(&home, "spaceport-for-acme", 42, "a-webhook-secret").await;
+
+        let status = deliver(
+            home,
+            42,
+            "a-webhook-secret",
+            "push",
+            "delivery-1",
+            "not json at all",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    /// The multi-app invariant, and the one that matters most: a spaceport
+    /// holding several connections verifies each delivery against the secret of
+    /// the App that header names, and against no other. A spaceport that tried
+    /// every secret in turn would pass every assertion but the last two.
+    #[tokio::test]
+    async fn two_connections_verify_their_own_deliveries_and_nobody_elses() {
+        let home = plain_home();
+        connect(&home, "alpha", 1, "alphas-secret").await;
+        connect(&home, "beta", 2, "betas-secret").await;
+
+        assert_eq!(
+            deliver(home.clone(), 1, "alphas-secret", "push", "alpha-1", PUSH).await,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            deliver(home.clone(), 2, "betas-secret", "push", "beta-1", PUSH).await,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            deliver(home.clone(), 1, "betas-secret", "push", "alpha-2", PUSH).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            deliver(home, 2, "alphas-secret", "push", "beta-2", PUSH).await,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[test]
