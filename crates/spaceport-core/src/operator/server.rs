@@ -200,6 +200,25 @@ impl FromRef<Operator> for Nudge {
     }
 }
 
+/// The shove that tells the build worker to go and look, told apart from the
+/// reconciler's by its type and by nothing else.
+///
+/// Both are a [`Nudge`], and a handler extracting one by that type alone would
+/// get whichever the state happened to offer. They are emphatically not
+/// interchangeable: waking the reconciler is a GitHub round trip per
+/// connection, which is the amplification `connections::github::webhook`
+/// refuses to build, and waking the builder is two queries against a local
+/// database. A newtype is what makes asking for the wrong one impossible rather
+/// than merely unlikely.
+#[derive(Clone)]
+struct Building(Nudge);
+
+impl FromRef<Operator> for Building {
+    fn from_ref(operator: &Operator) -> Self {
+        Self(operator.instance.building.clone())
+    }
+}
+
 impl FromRef<Operator> for Arc<EventBus> {
     fn from_ref(operator: &Operator) -> Self {
         operator.events.clone()
@@ -916,7 +935,8 @@ fn builds(out: &mut Report, built: &Built) {
         Built::None => {
             out.field(
                 "build",
-                "nothing built from this yet — a pass is due within minutes of a push".to_owned(),
+                "nothing built from this yet — a pass is due within minutes of the tracking or a push"
+                    .to_owned(),
             );
 
             return;
@@ -1743,11 +1763,16 @@ const DEFAULT_MANIFEST_PATH: &str = "spaceport.yaml";
 /// place, so this ends with the app tracking exactly what the query describes,
 /// whether or not it tracked something before.
 ///
-/// A push to the branch is built from here on, and deployed by nothing: what a
-/// push produces is an image, and running it is `spaceport apps deploy`, which
-/// is a decision an operator takes. The response says so, because an operator
-/// who has just pointed an app at a branch would otherwise sit waiting for a
-/// deployment that is not coming.
+/// The branch's current head is built at once, and every push to it from then
+/// on. The first of those is what makes tracking a repository that already has
+/// commits do anything at all: the builder only ever builds a revision written
+/// down beside a tracking, and a repository whose last push is older than the
+/// tracking would otherwise wait for a push that may never come.
+///
+/// None of it is deployed by anything: what a build produces is an image, and
+/// running it is `spaceport apps deploy`, which is a decision an operator takes.
+/// The response says so, because an operator who has just pointed an app at a
+/// branch would otherwise sit waiting for a deployment that is not coming.
 ///
 /// The app does not have to have been applied first. Applying and tracking are
 /// the two ways an app comes to exist: one hands spaceport a manifest, the other
@@ -1776,6 +1801,7 @@ async fn track(
     State(connections): State<Arc<ConnectionRepository>>,
     State(tracking): State<Arc<TrackingRepository>>,
     State(github): State<Arc<dyn Transport>>,
+    State(building): State<Building>,
     UrlPath(id): UrlPath<String>,
     Query(query): Query<TrackQuery>,
 ) -> Response {
@@ -1826,30 +1852,61 @@ async fn track(
         Err(error) => return refuse(StatusCode::BAD_REQUEST, &error),
     };
 
+    // Built once and used for both questions GitHub is asked here, since the
+    // second of them is asked whether or not the first was: an operator who
+    // named the branch has said which branch, and not which commit it is at.
+    let client = match Client::new(&connection, github) {
+        Ok(client) => client,
+        Err(error) => {
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not act as `{}`: {error:#}", connection.slug),
+            );
+        }
+    };
+
     let (branch, repository) = match query.branch.as_deref() {
         Some(branch) => match branch_named(branch) {
             Ok(branch) => (branch, cached_name),
             Err(error) => return refuse(StatusCode::BAD_REQUEST, &error),
         },
-        None => {
-            let client = match Client::new(&connection, github) {
-                Ok(client) => client,
-                Err(error) => {
-                    return refuse(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &format!("could not act as `{}`: {error:#}", connection.slug),
-                    );
-                }
-            };
+        None => match client.repository(installation_id, &cached_name).await {
+            Ok(record) => (record.default_branch, record.full_name),
+            // GitHub's own sentence, under the status the edge uses for the
+            // same thing: what failed is the far end, and there is nothing
+            // wrong with the request that got here.
+            Err(error) => return refuse(StatusCode::BAD_GATEWAY, &format!("{error:#}")),
+        },
+    };
 
-            match client.repository(installation_id, &cached_name).await {
-                Ok(record) => (record.default_branch, record.full_name),
-                // GitHub's own sentence, under the status the edge uses for the
-                // same thing: what failed is the far end, and there is nothing
-                // wrong with the request that got here.
-                Err(error) => return refuse(StatusCode::BAD_GATEWAY, &format!("{error:#}")),
-            }
+    // Where the branch has got to, whether it was named or asked for. This is
+    // what gives the tracking something to build: a repository whose last push
+    // is older than the tracking produces no delivery, and the builder only
+    // ever builds a revision that is written down.
+    //
+    // Asked before anything is recorded, on the same reasoning as everything
+    // above it — a branch this repository does not have, and a GitHub having a
+    // bad minute, both leave the app tracking whatever it tracked before.
+    let head = match client
+        .branch_head(installation_id, &repository, &branch)
+        .await
+    {
+        Ok(Some(head)) => head,
+        // Under the status the request deserves rather than the far end's: a
+        // branch that is not there is something somebody typed, and `502` would
+        // send them to look at GitHub for a mistake of their own. The
+        // installation is still named, because a repository whose branches this
+        // app cannot see answers the same way and reads the same from here.
+        Ok(None) => {
+            return refuse(
+                StatusCode::NOT_FOUND,
+                &format!(
+                    "`{repository}` has no branch `{branch}` — check the spelling, or that `{}` still reaches every branch of it\n  omit `--branch` to track whichever branch the repository calls its default",
+                    connection.slug,
+                ),
+            );
         }
+        Err(error) => return refuse(StatusCode::BAD_GATEWAY, &format!("{error:#}")),
     };
 
     if let Err(error) = tracking
@@ -1873,17 +1930,36 @@ async fn track(
         );
     }
 
-    // What the last line says turns on whether there is anything to deploy to.
+    // Written after the row rather than through it, because `record` clears the
+    // revision on purpose: a sha carried across a re-track was never on the new
+    // ref. This is the head that *is* on it, resolved a moment ago — so a
+    // re-track resolves afresh rather than keeping a stale one.
+    if let Err(error) = tracking.record_revision(&id, &head).await {
+        return refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not record the commit `{id}` is to be built from: {error:#}"),
+        );
+    }
+
+    // After the rows and never before, which is the order a push writes in and
+    // for its reason: the builder reads the trackings for itself, so a shove
+    // that arrived first would send it to look at a revision that is not
+    // written down yet.
+    building.0.nudge();
+
+    let head = abbreviated(&head);
+
+    // What the last lines say turns on whether there is anything to deploy to.
     // A read that fails is taken as the app having a manifest, because that is
     // the case the sentence is vaguest about and so the safer one to be wrong
     // in: it promises nothing that is not true of both.
     let last = if holds(&instance, &id).await.unwrap_or(true) {
         format!(
-            "  a push to `{branch}` is built from here on, and deployed by nothing — run what it built with `spaceport apps deploy {id}`\n"
+            "  `{branch}` is at {head}, which is being built now, and every push to it is built from here on\n  what comes out is deployed by nothing — run it with `spaceport apps deploy {id}`\n"
         )
     } else {
         format!(
-            "  nothing has been applied under `{id}`, so spaceport knows where its code is and has nothing to run\n  a push to `{branch}` is built from here on — `spaceport apps deploy {id}` then runs it, manifest and all\n"
+            "  nothing has been applied under `{id}`, so spaceport knows where its code is and has nothing to run\n  `{branch}` is at {head}, which is being built now, and every push to it is built from here on\n  `spaceport apps deploy {id}` then runs what came out, manifest and all\n"
         )
     };
 
@@ -1975,6 +2051,23 @@ fn manifest_path(given: Option<&str>) -> Result<String, String> {
     }
 
     Ok(path.to_owned())
+}
+
+/// How much of a sha the operator interface prints when it names one.
+///
+/// Seven, which is what [`crate::build::image`] tags an image with and what
+/// `connections::github::push` logs a pushed head as. An operator reads the
+/// three side by side — the answer to a track, the tag it produced, the line
+/// that says a branch moved — and a fourth spelling would make them do the
+/// comparison by eye.
+const ABBREVIATED_SHA: usize = 7;
+
+/// The first few digits of a sha, which is how a person says one out loud.
+///
+/// Whole where it is shorter than that, so a fixture or a truncated field is
+/// printed as itself rather than silently cut to nothing.
+fn abbreviated(sha: &str) -> &str {
+    sha.get(..ABBREVIATED_SHA).unwrap_or(sha)
 }
 
 /// The branch as it was given, if it is a branch.
@@ -2402,7 +2495,7 @@ fn refuse(status: StatusCode, message: &str) -> Response {
 mod tests {
     use super::*;
     use crate::app::{App, AppRepository, AppStore};
-    use crate::connections::github::api::testing::FakeGitHub;
+    use crate::connections::github::api::testing::{FakeGitHub, HEAD};
     use crate::events::Level;
     use crate::runtime::{Container, ContainerId, ContainerRuntime, Managed};
     use crate::state::Db;
@@ -2464,6 +2557,10 @@ edge:
     https: 0.0.0.0:8443
 ";
 
+    /// A second commit, for the tests that move an app from one branch to
+    /// another and have to tell the two heads apart.
+    const OTHER_HEAD: &str = "89abcdef0123456789abcdef0123456789abcdef";
+
     const MANIFEST: &str = "schema_version: 1
 source:
   type: image
@@ -2492,7 +2589,7 @@ container:
     }
 
     fn router_and_events() -> (Router, Arc<EventBus>) {
-        let (_, router, events, _, _, _, _, _) = parts_on(OneContainer::default());
+        let (_, router, events, _, _, _, _, _, _) = parts_on(OneContainer::default());
 
         (router, events)
     }
@@ -2500,13 +2597,13 @@ container:
     /// A router and the GitHub behind it, for the connection tests — which are
     /// the only ones that care what GitHub answers.
     fn router_and_github() -> (Router, Arc<FakeGitHub>) {
-        let (_, router, _, _, github, _, _, _) = parts_on(OneContainer::default());
+        let (_, router, _, _, github, _, _, _, _) = parts_on(OneContainer::default());
 
         (router, github)
     }
 
     fn store_router_and_events_on(runtime: OneContainer) -> (Arc<AppStore>, Router, Arc<EventBus>) {
-        let (store, router, events, _, _, _, _, _) = parts_on(runtime);
+        let (store, router, events, _, _, _, _, _, _) = parts_on(runtime);
 
         (store, router, events)
     }
@@ -2525,6 +2622,9 @@ container:
         Arc<ConnectionRepository>,
         Arc<TrackingRepository>,
         Arc<BuildRepository>,
+        // The shove a track gives the build worker, which is the only way a
+        // test can see that the worker was told at all.
+        Nudge,
     );
 
     fn parts_on(runtime: OneContainer) -> Parts {
@@ -2569,6 +2669,9 @@ container:
         let connections = Arc::new(ConnectionRepository::new(db.clone()));
         let tracking = Arc::new(TrackingRepository::new(db.clone()));
         let builds = Arc::new(BuildRepository::new(db.clone()));
+        // Held rather than made in place, so that a test can watch it: this is
+        // the builder's signal and emphatically not the reconciler's.
+        let building = Nudge::new();
         let instance = Arc::new(Instance {
             version: "9.9.9".to_owned(),
             started_at: time::OffsetDateTime::now_utc(),
@@ -2582,6 +2685,7 @@ container:
             github: github.clone(),
             attempts: Arc::new(crate::connections::github::Attempts::new()),
             nudge: Nudge::new(),
+            building: building.clone(),
             db,
             certificates: None,
             reconciled: crate::app::reconcile::Report::default(),
@@ -2596,6 +2700,7 @@ container:
             connections,
             tracking,
             builds,
+            building,
         )
     }
 
@@ -3271,7 +3376,7 @@ container:
     /// for as long as anyone was watching it.
     #[tokio::test]
     async fn a_watcher_is_let_go_when_spaceport_shuts_down() {
-        let (_, router, _, shutdown, _, _, _, _) = parts_on(OneContainer::default());
+        let (_, router, _, shutdown, _, _, _, _, _) = parts_on(OneContainer::default());
         let mut stream = watch(&router, "").await;
 
         shutdown.cancel();
@@ -3652,7 +3757,7 @@ container:
     /// particular repository is in reach, and a count cannot answer that.
     #[tokio::test]
     async fn shows_the_repositories_each_installation_reaches() {
-        let (_, router, _, _, _, connections, _, _) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, _, _) = parts_on(OneContainer::default());
         post_connection(&router, registration("spaceport-acme", 42)).await;
         connections
             .record_installations(
@@ -3696,7 +3801,7 @@ container:
     /// a failure to look if it is printed as an empty list.
     #[tokio::test]
     async fn says_when_an_installation_reaches_no_repository_at_all() {
-        let (_, router, _, _, _, connections, _, _) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, _, _) = parts_on(OneContainer::default());
         post_connection(&router, registration("spaceport-acme", 42)).await;
         connections
             .record_installations(
@@ -3763,25 +3868,27 @@ container:
     /// An app applied, a connection made, and one repository cached as
     /// reachable through it — which is the state every tracking starts from.
     async fn tracking_router() -> (Router, Arc<FakeGitHub>) {
-        let (router, github, _, _) = tracking_parts().await;
+        let (router, github, _, _, _) = tracking_parts().await;
 
         (router, github)
     }
 
-    /// The same, with the stores themselves — for the tests that ask what was
-    /// written down rather than what was said back.
+    /// The same, with the stores themselves and the shove the build worker
+    /// waits on — for the tests that ask what was written down rather than what
+    /// was said back.
     async fn tracking_parts() -> (
         Router,
         Arc<FakeGitHub>,
         Arc<TrackingRepository>,
         Arc<BuildRepository>,
+        Nudge,
     ) {
-        let (_, router, _, _, github, connections, tracking, builds) =
+        let (_, router, _, _, github, connections, tracking, builds, building) =
             parts_on(OneContainer::default());
         put_app(&router, "site", MANIFEST).await;
         connected_and_reaching(&router, &connections).await;
 
-        (router, github, tracking, builds)
+        (router, github, tracking, builds, building)
     }
 
     /// The connection every tracking here goes through, with the one repository
@@ -3979,7 +4086,7 @@ container:
     /// watching a branch for an app that does not exist.
     #[tokio::test]
     async fn destroys_an_app_that_is_only_tracked() {
-        let (router, _, tracking, _) = tracking_parts().await;
+        let (router, _, tracking, _, _) = tracking_parts().await;
         track_app(
             &router,
             "echo",
@@ -4007,7 +4114,7 @@ container:
 
     #[tokio::test]
     async fn destroying_a_running_app_forgets_what_it_tracked() {
-        let (router, _, tracking, _) = tracking_parts().await;
+        let (router, _, tracking, _, _) = tracking_parts().await;
         track_app(
             &router,
             "site",
@@ -4151,11 +4258,14 @@ container:
         assert!(body.contains("`main`"), "{body}");
     }
 
-    /// An operator who named the branch has said everything there is to know,
-    /// and asking github anyway would be a round trip to confirm their typing.
+    /// An operator who named the branch has said which branch, and nothing
+    /// about which commit it is at — so the repository itself is left unread
+    /// and the branch is asked for, which is the round trip that has something
+    /// to say.
     #[tokio::test]
-    async fn takes_the_branch_it_was_given_without_asking_github() {
+    async fn takes_the_branch_it_was_given_without_asking_for_the_default() {
         let (router, github) = tracking_router().await;
+        github.branch_is_at("an-organisation/site", "release/2026", HEAD);
 
         let (status, body) = track_app(
             &router,
@@ -4169,10 +4279,9 @@ container:
         assert!(body.contains("manifest   spaceport.yaml"), "{body}");
         assert!(body.contains("connection spaceport-acme"), "{body}");
         assert!(body.contains("deployed by nothing"), "{body}");
-        assert!(
-            repositories_read(&github).is_empty(),
-            "{:?}",
-            repositories_read(&github)
+        assert_eq!(
+            repositories_read(&github),
+            ["/repos/an-organisation/site/branches/release/2026"]
         );
     }
 
@@ -4182,6 +4291,7 @@ container:
     async fn resolves_the_branch_from_github_when_none_was_given() {
         let (router, github) = tracking_router().await;
         github.repository_defaults_to("an-organisation/site", "trunk");
+        github.branch_is_at("an-organisation/site", "trunk", HEAD);
 
         let (status, body) = track_app(
             &router,
@@ -4192,7 +4302,14 @@ container:
 
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("branch     trunk"), "{body}");
-        assert_eq!(repositories_read(&github), ["/repos/an-organisation/site"]);
+        // The repository for the branch, and then that branch for its head.
+        assert_eq!(
+            repositories_read(&github),
+            [
+                "/repos/an-organisation/site",
+                "/repos/an-organisation/site/branches/trunk"
+            ]
+        );
         let (_, shown) = show_app(&router, "site", "").await;
         assert!(shown.contains("an-organisation/site on trunk"), "{shown}");
     }
@@ -4214,11 +4331,152 @@ container:
         assert!(body.contains("github's own trouble"), "{body}");
     }
 
+    /// The bug this is all for: a repository whose last push is older than the
+    /// tracking produces no delivery, and the builder only ever builds a
+    /// revision written down beside a tracking — so tracking one resolves the
+    /// branch's head itself rather than waiting for a push that may never come.
+    #[tokio::test]
+    async fn tracking_a_repository_records_the_head_its_branch_is_at() {
+        let (router, _, tracking, _, _) = tracking_parts().await;
+
+        let (status, body) = track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let read = tracking
+            .by_app(&"site".parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.revision.as_deref(), Some(HEAD));
+        // Stamped as a push stamps one, so that "when did spaceport last see
+        // this ref move" has an answer from the moment the tracking exists.
+        assert!(
+            read.revision_seen_at.as_deref().unwrap().ends_with('Z'),
+            "{read:?}"
+        );
+        // And the operator is told which commit that is, abbreviated as every
+        // other sha spaceport prints for a person.
+        assert!(body.contains("`main` is at 0123456"), "{body}");
+        assert!(body.contains("being built now"), "{body}");
+    }
+
+    /// A revision written down is a build wanted, and an operator who has just
+    /// tracked a repository should not wait out the builder's interval to see
+    /// it start.
+    #[tokio::test]
+    async fn tracking_a_repository_wakes_the_build_worker() {
+        let (router, _, _, _, building) = tracking_parts().await;
+        let woken = building.changed();
+
+        track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main",
+        )
+        .await;
+
+        assert!(woken.has_changed().unwrap());
+    }
+
+    /// A mistyped `--branch` is the likeliest way anybody reaches this, and
+    /// until now nothing checked that a named branch existed at all — so it
+    /// would have been recorded, and nothing would ever have built it.
+    ///
+    /// Refused as a request that named something that is not there, not as a
+    /// far end that failed: what went wrong is on this side of the wire.
+    #[tokio::test]
+    async fn refuses_a_branch_github_does_not_have() {
+        let (router, _, tracking, _, _) = tracking_parts().await;
+
+        let (status, body) = track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=mian",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("has no branch `mian`"), "{body}");
+        assert!(body.contains("an-organisation/site"), "{body}");
+        // And says the way out that costs nothing to take.
+        assert!(body.contains("omit `--branch`"), "{body}");
+        assert!(
+            tracking
+                .by_app(&"site".parse().unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Settled before anything is written down, like everything above it: a
+    /// github having a bad minute leaves the app tracking what it tracked
+    /// before rather than a repository nothing can be built from.
+    #[tokio::test]
+    async fn records_nothing_when_github_will_not_say_where_the_branch_is() {
+        let (router, github, tracking, _, _) = tracking_parts().await;
+        github.refuse_with(StatusCode::INTERNAL_SERVER_ERROR, "<html>");
+
+        let (status, body) = track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(body.contains("github's own trouble"), "{body}");
+        assert!(
+            tracking
+                .by_app(&"site".parse().unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A head belonged to the ref it was seen on, so a re-track resolves the
+    /// new branch's afresh — carrying the old one over would make the first
+    /// build of the new branch look like one that had already happened.
+    #[tokio::test]
+    async fn re_tracking_resolves_the_new_branchs_head_rather_than_keeping_the_old() {
+        let (router, github, tracking, _, _) = tracking_parts().await;
+        github.branch_is_at("an-organisation/site", "release", OTHER_HEAD);
+        track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main",
+        )
+        .await;
+
+        let (status, _) = track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=release",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let read = tracking
+            .by_app(&"site".parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.branch, "release");
+        assert_eq!(read.revision.as_deref(), Some(OTHER_HEAD));
+    }
+
     /// An app is built from one place, so pointing it somewhere else replaces
     /// rather than adds.
     #[tokio::test]
     async fn re_tracking_an_app_replaces_what_it_tracked() {
-        let (router, _) = tracking_router().await;
+        let (router, github) = tracking_router().await;
+        github.branch_is_at("an-organisation/site", "release", OTHER_HEAD);
         track_app(
             &router,
             "site",
@@ -4262,9 +4520,9 @@ container:
             body.contains("through the `spaceport-acme` connection"),
             "{body}"
         );
-        // Nothing has been taken from the branch, so there is no revision to
-        // report — and reporting one would say a build had happened.
-        assert!(!body.contains("last saw"), "{body}");
+        // Tracking resolved the branch's head, so there is a revision from the
+        // moment the tracking was made rather than only after a push.
+        assert!(body.contains(&format!("last saw {HEAD}")), "{body}");
     }
 
     /// Most apps are an image somebody applied, and a line telling them they
@@ -4315,7 +4573,7 @@ container:
     /// at all.
     #[tokio::test]
     async fn shows_a_build_that_is_still_waiting_for_a_worker() {
-        let (router, _, _, builds) = tracking_parts().await;
+        let (router, _, _, builds, _) = tracking_parts().await;
         tracked_and_requested(&builds, &router, "0123abc").await;
 
         let (status, body) = show_app(&router, "site", "").await;
@@ -4326,7 +4584,7 @@ container:
 
     #[tokio::test]
     async fn shows_the_image_a_successful_build_produced() {
-        let (router, _, _, builds) = tracking_parts().await;
+        let (router, _, _, builds, _) = tracking_parts().await;
         tracked_and_requested(&builds, &router, "0123abc").await;
         builds
             .succeeded(
@@ -4352,7 +4610,7 @@ container:
     /// build failed is left pushing again to find out.
     #[tokio::test]
     async fn shows_why_a_build_failed_and_what_it_printed() {
-        let (router, _, _, builds) = tracking_parts().await;
+        let (router, _, _, builds, _) = tracking_parts().await;
         tracked_and_requested(&builds, &router, "0123abc").await;
         builds
             .failed(
@@ -4379,7 +4637,7 @@ container:
     /// stops — and the line above it says that is what happened.
     #[tokio::test]
     async fn shows_the_end_of_a_long_build_log() {
-        let (router, _, _, builds) = tracking_parts().await;
+        let (router, _, _, builds, _) = tracking_parts().await;
         tracked_and_requested(&builds, &router, "0123abc").await;
         let noisy = format!("{}the last line\n", "chatter\n".repeat(LOG_LINES * 2));
         builds
@@ -4424,7 +4682,7 @@ container:
     /// happened to it here.
     #[tokio::test]
     async fn shows_the_build_of_an_app_that_is_only_tracked() {
-        let (router, _, _, builds) = tracking_parts().await;
+        let (router, _, _, builds, _) = tracking_parts().await;
         track_app(
             &router,
             "echo",
@@ -4517,7 +4775,7 @@ container:
     /// they can be asking for without naming a revision.
     #[tokio::test]
     async fn deploys_the_newest_build_when_no_revision_is_named() {
-        let (store, router, _, _, _, connections, _, builds) = parts_on(OneContainer::default());
+        let (store, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
         connected_and_reaching(&router, &connections).await;
         tracked_app(&router, "echo").await;
         build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
@@ -4540,7 +4798,7 @@ container:
     /// is rather than being a hint towards it.
     #[tokio::test]
     async fn deploys_the_revision_it_was_given_rather_than_the_newest() {
-        let (_, router, _, _, _, connections, _, builds) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
         connected_and_reaching(&router, &connections).await;
         tracked_app(&router, "echo").await;
         build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
@@ -4558,7 +4816,7 @@ container:
     /// single build of this app is not a guess.
     #[tokio::test]
     async fn takes_an_abbreviated_revision_that_names_one_build() {
-        let (_, router, _, _, _, connections, _, builds) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
         connected_and_reaching(&router, &connections).await;
         tracked_app(&router, "echo").await;
         build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
@@ -4574,7 +4832,7 @@ container:
     /// them in it.
     #[tokio::test]
     async fn refuses_an_abbreviation_that_names_two_builds() {
-        let (_, router, _, _, _, connections, _, builds) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
         connected_and_reaching(&router, &connections).await;
         tracked_app(&router, "echo").await;
         build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
@@ -4594,7 +4852,7 @@ container:
     /// should not be told to run it again.
     #[tokio::test]
     async fn refuses_to_deploy_an_app_with_no_build() {
-        let (router, _, _, _) = tracking_parts().await;
+        let (router, _, _, _, _) = tracking_parts().await;
 
         let (untracked, body) = deploy_app(&router, "site", "").await;
         assert_eq!(untracked, StatusCode::NOT_FOUND);
@@ -4615,7 +4873,7 @@ container:
     /// be told to wait, not told there is no such commit.
     #[tokio::test]
     async fn says_a_revision_that_is_still_building_is_not_one_to_run() {
-        let (router, _, _, builds) = tracking_parts().await;
+        let (router, _, _, builds, _) = tracking_parts().await;
         tracked_and_requested(&builds, &router, "0123abc").await;
         builds
             .claim()
@@ -4634,7 +4892,7 @@ container:
     /// the reason in it: what an operator does next is push over it.
     #[tokio::test]
     async fn says_why_the_build_of_a_revision_failed() {
-        let (router, _, _, builds) = tracking_parts().await;
+        let (router, _, _, builds, _) = tracking_parts().await;
         tracked_and_requested(&builds, &router, "0123abc").await;
         builds
             .failed(
@@ -4660,7 +4918,7 @@ container:
     /// where an operator compares the two.
     #[tokio::test]
     async fn records_the_manifest_the_commit_carried() {
-        let (_, router, _, _, _, connections, _, builds) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
         connected_and_reaching(&router, &connections).await;
         tracked_app(&router, "echo").await;
         build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
@@ -4680,7 +4938,7 @@ container:
     /// same rule applying a manifest to a suspended app follows.
     #[tokio::test]
     async fn deploying_to_a_suspended_app_leaves_it_suspended() {
-        let (store, router, _, _, _, connections, _, builds) = parts_on(OneContainer::default());
+        let (store, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
         connected_and_reaching(&router, &connections).await;
         tracked_app(&router, "echo").await;
         build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
@@ -4701,7 +4959,7 @@ container:
     /// success.
     #[tokio::test]
     async fn shows_the_deployed_revision_against_the_newest_build() {
-        let (_, router, _, _, _, connections, _, builds) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
         connected_and_reaching(&router, &connections).await;
         tracked_app(&router, "echo").await;
         build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
@@ -4729,7 +4987,7 @@ container:
     /// say.
     #[tokio::test]
     async fn tells_a_tracked_app_with_an_image_to_deploy_it() {
-        let (_, router, _, _, _, connections, _, builds) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
         connected_and_reaching(&router, &connections).await;
         tracked_app(&router, "echo").await;
         build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
@@ -4749,7 +5007,7 @@ container:
     /// queue goes on offering for an app there is nothing left to build for.
     #[tokio::test]
     async fn destroying_an_app_forgets_the_builds_it_recorded() {
-        let (router, _, _, builds) = tracking_parts().await;
+        let (router, _, _, builds, _) = tracking_parts().await;
         tracked_and_requested(&builds, &router, "0123abc").await;
         builds.request(&build_of("site", "89abcde")).await.unwrap();
         builds.request(&build_of("echo", "0123abc")).await.unwrap();
@@ -4777,7 +5035,7 @@ container:
     /// connection is untouched.
     #[tokio::test]
     async fn forgetting_a_connection_forgets_the_builds_it_fetched() {
-        let (router, _, _, builds) = tracking_parts().await;
+        let (router, _, _, builds, _) = tracking_parts().await;
         tracked_and_requested(&builds, &router, "0123abc").await;
         builds
             .request(&Build {

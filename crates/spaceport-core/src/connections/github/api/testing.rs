@@ -2,7 +2,8 @@
 //!
 //! Enough of it for everything [`super::Client`] asks: the App record,
 //! the installations of an App — over as many pages as a test wants — the
-//! repositories of an installation, one repository read by name, and the mint
+//! repositories of an installation, one repository read by name, the commit a
+//! branch of it is at, and the mint
 //! that turns an installation into a token. Requests never leave the process; the client is handed this as
 //! its [`Transport`] and there is no socket anywhere.
 //!
@@ -35,6 +36,13 @@ use super::Transport;
 /// GitHub's own figure for an installation token, so a test that says nothing
 /// about expiry gets the behaviour production has.
 const TOKEN_LIFETIME: Duration = Duration::hours(1);
+
+/// The commit the fixture repository's `main` is at.
+///
+/// A whole sha rather than a short one, because everything that reads a head
+/// abbreviates it for a person and a fixture that was already short would hide
+/// whether it did.
+pub(crate) const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
 
 /// Which credential a request presented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +89,13 @@ struct State {
     /// different questions — a repository can be granted to an installation and
     /// still be one no test ever said anything about the branches of.
     default_branches: HashMap<String, String>,
+    /// The commit each branch `/repos/{owner}/{name}/branches/{branch}` knows
+    /// is at, by full name and branch. Seeded with the fixture repository's
+    /// `main`, because a tracking now resolves a head and a test that says
+    /// nothing about branches should still get the ordinary case; a branch
+    /// nothing has said this about is one this GitHub answers `404` for, which
+    /// is what a mistyped `--branch` really gets.
+    heads: HashMap<(String, String), String>,
     /// Where `/repos/{owner}/{name}/tarball/{revision}` redirects to, by full
     /// name and revision. Empty to begin with, because a redirect to nowhere is
     /// not a useful default and a test that cares about the download says so.
@@ -124,6 +139,10 @@ impl FakeGitHub {
                 default_branches: HashMap::from([(
                     "an-organisation/site".to_owned(),
                     "main".to_owned(),
+                )]),
+                heads: HashMap::from([(
+                    ("an-organisation/site".to_owned(), "main".to_owned()),
+                    HEAD.to_owned(),
                 )]),
                 archives: HashMap::new(),
                 token_lifetime: TOKEN_LIFETIME,
@@ -193,6 +212,20 @@ impl FakeGitHub {
             .unwrap()
             .default_branches
             .insert(full_name.to_owned(), branch.to_owned());
+    }
+
+    /// Say that `branch` of `full_name` exists and is at this commit.
+    ///
+    /// Apart from [`Self::repository_defaults_to`] for the reason that one is
+    /// apart from the listing: which branch an app tracks and where that branch
+    /// has got to are different facts, and a test about one should not have to
+    /// state the other.
+    pub(crate) fn branch_is_at(&self, full_name: &str, branch: &str, sha: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .heads
+            .insert((full_name.to_owned(), branch.to_owned()), sha.to_owned());
     }
 
     /// Say that the tarball of `revision` is downloadable from `location`.
@@ -357,6 +390,34 @@ impl FakeGitHub {
                     None => Response::builder()
                         .status(StatusCode::NOT_FOUND)
                         .body(Bytes::from_static(br#"{"message":"Not Found"}"#))
+                        .unwrap(),
+                }
+            }
+            // One branch by name, which is where the commit a tracking is built
+            // from comes from. The branch is the rest of the path joined back
+            // up, for the reason the tarball's revision is.
+            ["", "repos", owner, name, "branches", branch @ ..] => {
+                let full_name = format!("{owner}/{name}");
+                let branch = branch.join("/");
+
+                match state.heads.get(&(full_name.clone(), branch.clone())) {
+                    Some(sha) => ok(
+                        json!({
+                            "name": branch,
+                            "commit": {
+                                "sha": sha,
+                                // A field spaceport does not know, for the same
+                                // reason `/app` carries one.
+                                "url": format!("https://api.github.com/repos/{full_name}/commits/{sha}"),
+                            },
+                        }),
+                        None,
+                    ),
+                    // A branch this GitHub has never been told about, which is
+                    // what a mistyped `--branch` arrives as.
+                    None => Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Bytes::from_static(br#"{"message":"Branch not found"}"#))
                         .unwrap(),
                 }
             }

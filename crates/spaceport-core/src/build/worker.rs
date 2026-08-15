@@ -960,6 +960,13 @@ routing:
         }
 
         /// Track `id` against [`REPOSITORY`], at `revision` if there is one.
+        ///
+        /// The two writes `spaceport apps track` makes, in its order: the
+        /// tracking row, and then the head of the branch it bound. A push
+        /// writes the second of them too, so a tracking with a revision is the
+        /// same row whichever put it there — and the case with no revision at
+        /// all is the one that is now only reachable when a `record_revision`
+        /// failed.
         async fn track(&self, id: &str, revision: Option<&str>) {
             self.worker
                 .trackings
@@ -1007,6 +1014,11 @@ routing:
 
     /// A tracking with a revision is what says a commit is wanted, and the pass
     /// reads that rather than being told it.
+    ///
+    /// Which is what makes `spaceport apps track` build anything: it records
+    /// the head of the branch it bound, so this pass has work before any push
+    /// has arrived — a repository whose last commit is older than the tracking
+    /// would otherwise never be built at all.
     #[tokio::test]
     async fn a_tracked_revision_is_asked_for_as_a_build() {
         let fixture = Fixture::new("asks-for-a-build").await;

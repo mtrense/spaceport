@@ -124,10 +124,14 @@ enum AppsCommand {
     List(ListArgs),
     /// Report everything spaceport knows about one app.
     Show(ShowArgs),
-    /// Say which repository and branch an app's code lives on, so that a push
-    /// to it is built.
+    /// Say which repository and branch an app's code lives on, so that the
+    /// commit the branch is at now and every push to it after are built.
     ///
-    /// Built, and no more than that: what a push produces is an image, and
+    /// The current head and not only the pushes to come: a repository whose
+    /// last commit is older than the tracking would otherwise wait for a push
+    /// that may never arrive.
+    ///
+    /// Built, and no more than that: what a build produces is an image, and
     /// running it is `spaceport apps deploy` — a step an operator takes when
     /// they are ready for it rather than one a push takes for them.
     Track(TrackArgs),
@@ -725,7 +729,7 @@ async fn run(args: RunArgs) -> Result<()> {
         tracking: tracking.clone(),
         github: github.clone(),
         nudge: nudge.clone(),
-        builds: building,
+        builds: building.clone(),
         hostname: config.edge.hostname.as_ref().map(ToString::to_string),
     });
 
@@ -745,6 +749,10 @@ async fn run(args: RunArgs) -> Result<()> {
             github,
             attempts,
             nudge,
+            // The operator socket shoves this one too: `spaceport apps track`
+            // resolves the head of the branch it binds, and a commit written
+            // down with nothing woken would wait out the builder's interval.
+            building,
             db,
             certificates: certificates.clone(),
             reconciled: report,

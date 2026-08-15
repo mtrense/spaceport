@@ -75,6 +75,12 @@ pub struct Instance {
     /// The same one the edge and the reconciliation loop hold: connecting an
     /// App on this socket is one of the things that makes it so.
     pub nudge: github::Nudge,
+    /// How a handler tells the build worker that there is a revision to build.
+    /// The same one the worker itself and the edge that hears the pushes hold,
+    /// and deliberately not [`Instance::nudge`]: that one sends spaceport to
+    /// ask GitHub where its App is installed, which is a round trip per
+    /// connection and nothing a tracking has any use for.
+    pub building: github::Nudge,
     /// Absent when tls is self-signed: then nothing ever orders a certificate.
     pub certificates: Option<Arc<Certificates>>,
     /// What the reconciliation at startup did. Kept because it is the only
@@ -542,6 +548,7 @@ container:
             github: github::api::testing::FakeGitHub::new(),
             attempts: Arc::new(github::Attempts::new()),
             nudge: github::Nudge::new(),
+            building: github::Nudge::new(),
             db,
             certificates: None,
             reconciled,

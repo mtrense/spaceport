@@ -98,6 +98,10 @@ pub async fn resume(endpoint: &OperatorEndpoint, id: &AppId) -> Result<String> {
 /// then on rather than following whatever the default becomes. Without
 /// `manifest_path`, the manifest is looked for at the top of the repository.
 ///
+/// Whichever branch it settles on, the spaceport asks GitHub where that branch
+/// is and records the commit — so what comes back names a build that has been
+/// asked for, not only the pushes to come.
+///
 /// The values go into the query string as they are, which is what every other
 /// call here does and is enough for these: a full name and a slug are github's
 /// own characters, a path is a path, and a branch may hold `/`, which a query

@@ -292,6 +292,20 @@ mod wire {
         pub(super) full_name: String,
         pub(super) default_branch: String,
     }
+
+    /// One branch, of which spaceport reads exactly one thing: the commit it is
+    /// at. The rest of GitHub's branch object — the protection rules, the
+    /// commit's author, its tree — is left on the wire for the reason
+    /// [`RepositoryDetail`] leaves the repository's fields there.
+    #[derive(Deserialize)]
+    pub(super) struct Branch {
+        pub(super) commit: Commit,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct Commit {
+        pub(super) sha: String,
+    }
 }
 
 /// A freshly minted installation token, and when it stops working.
@@ -458,6 +472,54 @@ impl Client {
             default_branch: repository.default_branch,
             full_name: repository.full_name,
         })
+    }
+
+    /// The commit a branch is at, as GitHub has it now.
+    ///
+    /// The question `spaceport apps track` has no other way of answering. A
+    /// tracking is built from the revision written down beside it, and a
+    /// repository whose last push is older than the tracking will never produce
+    /// a delivery to write one — so the head is asked for at the moment the
+    /// branch is settled rather than waited for.
+    ///
+    /// Asked as the installation and through [`Self::installation_token`], like
+    /// every other repository call. The branch goes onto the path as it was
+    /// given, for the reason a revision does in [`Self::archive_location`]: a
+    /// branch may hold slashes, and those slashes are the path's.
+    ///
+    /// Not paginated, like [`Self::repository`] and for the same reason.
+    ///
+    /// A branch GitHub does not have comes back as `None` rather than as an
+    /// error, which is the one call here that steps around [`refusal`]'s `404`.
+    /// That sentence refuses to say whether a thing is missing or ungranted
+    /// because GitHub refuses to, and for a repository that is honest. Here it
+    /// is not: the repository was settled before this was asked, and what is in
+    /// doubt is a branch somebody typed. Handing the case back lets the caller
+    /// say so, under a status that means it.
+    pub async fn branch_head(
+        &self,
+        installation_id: i64,
+        full_name: &str,
+        branch: &str,
+    ) -> Result<Option<String>> {
+        let token = self.installation_token(installation_id).await?;
+        let what = format!("branch `{branch}` of `{full_name}`");
+        let response = self
+            .send(
+                Method::GET,
+                &format!("{API}/repos/{full_name}/branches/{branch}"),
+                Some(&Credential::Installation(token)),
+            )
+            .await
+            .with_context(|| format!("asking github about the {what}"))?;
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        let branch: wire::Branch = decode(&response, &what)?;
+
+        Ok(Some(branch.commit.sha))
     }
 
     /// Where GitHub says the tarball of `revision` may be downloaded from.
@@ -961,6 +1023,43 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("has been granted"), "{error}");
+    }
+
+    /// The head is what a tracking is built from, so this is the call that
+    /// gives a freshly tracked app something to build — as the installation,
+    /// since the App itself may not read a repository.
+    #[tokio::test]
+    async fn asks_what_commit_a_branch_is_at_with_an_installation_token() {
+        let github = FakeGitHub::new();
+        github.branch_is_at("an-organisation/site", "release/2026", "d34db33f");
+
+        let head = client(&github)
+            .branch_head(7, "an-organisation/site", "release/2026")
+            .await
+            .unwrap();
+
+        assert_eq!(head.as_deref(), Some("d34db33f"));
+        let read = github
+            .requests()
+            .into_iter()
+            .find(|request| request.path == "/repos/an-organisation/site/branches/release/2026")
+            .expect("the branch was read");
+        assert_eq!(read.authorization, Authorization::Token);
+    }
+
+    /// A mistyped `--branch` is the likeliest way anybody reaches this, which
+    /// is why it is not an error: the caller knows it asked about a branch, and
+    /// can say so far better than a sentence written for repositories.
+    #[tokio::test]
+    async fn answers_with_nothing_for_a_branch_github_does_not_have() {
+        let github = FakeGitHub::new();
+
+        let head = client(&github)
+            .branch_head(7, "an-organisation/site", "mian")
+            .await
+            .expect("a branch that is not there is an answer, not a failure");
+
+        assert_eq!(head, None);
     }
 
     /// The archive is read as the installation like every other repository
