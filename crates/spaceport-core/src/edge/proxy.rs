@@ -398,6 +398,7 @@ mod tests {
                     crate::state::Db::in_memory().unwrap(),
                 )),
                 github: crate::connections::github::api::testing::FakeGitHub::new(),
+                nudge: crate::connections::github::Nudge::new(),
                 hostname: None,
             })),
             apps,

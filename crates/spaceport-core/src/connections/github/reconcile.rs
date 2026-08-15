@@ -25,6 +25,14 @@
 //! What it deliberately does not do is act on what it finds. Discovering that an
 //! App has been installed on a repository is where this stops; deploying
 //! anything from that repository is a later step and lives nowhere yet.
+//!
+//! The two paths meet at [`Nudge`]. A webhook that says the installations
+//! changed, and connecting an App, both know something the cache does not, and
+//! an hour is a long time to sit on that: an operator who connects an App and
+//! immediately runs `spaceport connect show` should be told what GitHub says,
+//! not `not yet`. So the loop sleeps on its interval *or* until something shoves
+//! it, and the shove starts a pass that is the same pass the timer would have
+//! run — the fast path decides *when* to ask GitHub, never *what* to believe.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -32,6 +40,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -71,6 +80,20 @@ pub struct Policy {
     /// a row that can never match anything. A day is comfortably past the last
     /// retry and short enough that the table stays a window rather than a log.
     pub delivery_retention: Duration,
+
+    /// How long to let a nudge settle before acting on it.
+    ///
+    /// GitHub sends bursts: enabling two repositories on an installation
+    /// produces an `installation_repositories` `added` and a `removed` delivery
+    /// inside the same second, and each of them would otherwise be a pass. A
+    /// short wait turns a burst into one pass, and costs only that wait — the
+    /// pass reads the whole truth from GitHub either way, so the later delivery
+    /// of a burst is answered by the pass the earlier one started.
+    ///
+    /// Two seconds because the deadline is human: an operator who has just
+    /// connected an App types `spaceport connect show` in rather longer than
+    /// that, and the reconciled answer has to be there when they do.
+    pub settle: Duration,
 }
 
 impl Default for Policy {
@@ -79,7 +102,58 @@ impl Default for Policy {
             interval: Duration::hours(1),
             retry_after_failure: Duration::minutes(5),
             delivery_retention: Duration::hours(24),
+            settle: Duration::seconds(2),
         }
+    }
+}
+
+/// A shove that says the cached installations are stale.
+///
+/// Cheap to clone, and every clone is the same signal: the webhook handler, the
+/// two places an App is connected, and the loop that acts on it are in four
+/// different parts of the process, and each holds one of these rather than a
+/// channel of its own. Two `Nudge`s would be two signals nobody is listening to
+/// half of, which nothing would ever fail loudly about — so there is one, built
+/// at startup and handed out.
+///
+/// The channel is a [`watch`], and that is the whole design: a `watch`
+/// *coalesces*. Ten nudges arriving while a pass is running are one wake-up and
+/// not ten queued passes, which is exactly right, because a pass reads the whole
+/// truth from GitHub anyway — running it a second time immediately would learn
+/// nothing the first did not, at the price of another round trip per connection.
+#[derive(Debug, Clone)]
+pub struct Nudge {
+    /// Bumped by whoever learned something. The value is a counter and means
+    /// nothing on its own; what matters is that it moved, and that the loop
+    /// then goes and asks GitHub what it moved to.
+    generation: Arc<watch::Sender<u64>>,
+}
+
+impl Default for Nudge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Nudge {
+    pub fn new() -> Self {
+        Self {
+            generation: Arc::new(watch::Sender::new(0)),
+        }
+    }
+
+    /// Say that what GitHub would answer is no longer what is cached.
+    ///
+    /// Never fails and never blocks: a `watch` with no receiver — a spaceport
+    /// whose loop has already stopped for shutdown — takes the send and drops
+    /// it, which is the right outcome for a signal nobody is waiting on.
+    pub fn nudge(&self) {
+        self.generation.send_modify(|generation| *generation += 1);
+    }
+
+    /// A handle that resolves whenever something has been learned.
+    pub fn changed(&self) -> watch::Receiver<u64> {
+        self.generation.subscribe()
     }
 }
 
@@ -295,22 +369,33 @@ async fn prune(connections: &ConnectionRepository, cutoff: OffsetDateTime) -> us
 
 /// Keep asking GitHub what is true, until `shutdown` is cancelled.
 ///
-/// Wakes on two things only — the interval and shutdown. There is deliberately
-/// no wake on "a connection was made": a connection made a moment ago has
-/// nothing cached and nothing installed yet, and the pass it would trigger would
-/// ask GitHub a question whose answer is empty.
+/// Wakes on three things — the interval, a [`Nudge`], and shutdown. The interval
+/// is what makes the cache eventually right whatever was missed; the nudge is
+/// what makes it right in seconds when something did reach this spaceport, which
+/// is nearly always. Nothing here treats the two differently once it is awake:
+/// both run the same pass, because the pass is the only thing that knows
+/// anything, and a wake-up that acted on what it was told would be believing a
+/// webhook.
 pub async fn maintain(
     connections: Arc<ConnectionRepository>,
     transport: Arc<dyn Transport>,
     policy: Policy,
+    nudge: Nudge,
     shutdown: CancellationToken,
 ) {
     debug!(
         minutes = policy.interval.whole_minutes(),
         "keeping what github says current"
     );
+    let mut changed = nudge.changed();
 
     loop {
+        // Everything learned up to this point is what this pass is about to go
+        // and see for itself, so it is not also a reason to run again. Anything
+        // that arrives from here on is — it may have happened after GitHub
+        // answered, and this pass would not have it.
+        changed.mark_unchanged();
+
         let pass = reconcile(
             &connections,
             transport.clone(),
@@ -347,6 +432,25 @@ pub async fn maintain(
             // policy or a clock that has done something strange should cost a
             // busy loop at worst rather than a panic.
             () = tokio::time::sleep(sleep.unsigned_abs()) => {}
+            // Something learned that the cache is stale: a webhook that said
+            // the installations changed, or an App connected a moment ago.
+            result = changed.changed() => {
+                // Every sender has gone, so nothing can ever say so again. The
+                // acme loop stops for the same reason: a wake-up that can no
+                // longer happen is not worth a task.
+                if result.is_err() {
+                    break;
+                }
+
+                // Only on this arm. A burst is a property of what GitHub sends,
+                // and the interval has nothing to settle. Interruptible,
+                // because a settle that outlived a shutdown would be a
+                // shutdown that waits for it.
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(policy.settle.unsigned_abs()) => {}
+                }
+            }
         }
     }
 
@@ -565,6 +669,7 @@ mod tests {
             Arc::new(connections),
             github.clone(),
             Policy::default(),
+            Nudge::new(),
             shutdown.clone(),
         ));
         // Cancelled while the first pass is sleeping off the interval, which is
@@ -574,5 +679,141 @@ mod tests {
 
         running.await.unwrap();
         assert!(!github.requests().is_empty(), "the first pass ran");
+    }
+
+    /// How many passes have run, counted by the one request every pass over a
+    /// connection makes before any other.
+    fn passes(github: &Arc<FakeGitHub>) -> usize {
+        github
+            .requests()
+            .iter()
+            .filter(|request| request.path == "/app/installations")
+            .count()
+    }
+
+    /// Wait until `expected` passes have run, without letting the clock move.
+    ///
+    /// Yields rather than sleeps on purpose: the clock in these tests is paused
+    /// and only advances when nothing is ready to run, so a test that slept
+    /// would be a test that let the hourly interval elapse behind its own back —
+    /// which is the very thing the nudge is supposed to make unnecessary.
+    async fn until_passes(github: &Arc<FakeGitHub>, expected: usize) {
+        for _ in 0..10_000 {
+            if passes(github) >= expected {
+                return;
+            }
+
+            tokio::task::yield_now().await;
+        }
+
+        panic!("{} passes ran, and {expected} were wanted", passes(github));
+    }
+
+    /// Give the loop enough turns to have acted on what it has been told,
+    /// without moving the clock: a nudge wakes a task, and a task that has not
+    /// been polled yet has not started settling on it.
+    async fn let_the_loop_run() {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The whole point: spaceport is told, and acts on being told, instead of
+    /// sitting on what it knows until the hour is up.
+    #[tokio::test(start_paused = true)]
+    async fn a_nudge_wakes_a_pass_the_interval_would_have_left_an_hour_away() {
+        let (connections, github) = connected(&[("spaceport-for-acme", 42)]).await;
+        let policy = Policy::default();
+        let nudge = Nudge::new();
+        let shutdown = CancellationToken::new();
+        let running = tokio::spawn(maintain(
+            Arc::new(connections),
+            github.clone(),
+            policy.clone(),
+            nudge.clone(),
+            shutdown.clone(),
+        ));
+        until_passes(&github, 1).await;
+
+        let woken = tokio::time::Instant::now();
+        nudge.nudge();
+        let_the_loop_run().await;
+        tokio::time::advance(policy.settle.unsigned_abs()).await;
+        until_passes(&github, 2).await;
+
+        assert!(
+            woken.elapsed() < policy.interval.unsigned_abs(),
+            "the second pass waited out the interval"
+        );
+        shutdown.cancel();
+        running.await.unwrap();
+    }
+
+    /// Enabling two repositories sends an `added` and a `removed` inside the
+    /// same second. Both say the same thing — go and look — and one look is what
+    /// they are worth.
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_nudges_during_the_settle_costs_one_pass() {
+        let (connections, github) = connected(&[("spaceport-for-acme", 42)]).await;
+        let policy = Policy::default();
+        let nudge = Nudge::new();
+        let shutdown = CancellationToken::new();
+        let running = tokio::spawn(maintain(
+            Arc::new(connections),
+            github.clone(),
+            policy.clone(),
+            nudge.clone(),
+            shutdown.clone(),
+        ));
+        until_passes(&github, 1).await;
+
+        nudge.nudge();
+        let_the_loop_run().await;
+        // Halfway through the settle, and then twice more — a burst as GitHub
+        // sends one, all of it inside the wait the first shove started.
+        tokio::time::advance(Duration::milliseconds(500).unsigned_abs()).await;
+        nudge.nudge();
+        nudge.nudge();
+        tokio::time::advance(policy.settle.unsigned_abs()).await;
+        until_passes(&github, 2).await;
+        // And nothing follows it: the loop is back on its interval rather than
+        // working through a queue of shoves.
+        let_the_loop_run().await;
+
+        assert_eq!(passes(&github), 2);
+        shutdown.cancel();
+        running.await.unwrap();
+    }
+
+    /// A settle that outlived a shutdown would be a shutdown that waits for it,
+    /// and every process stopping this spaceport is holding a stopwatch.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_during_the_settle_does_not_wait_it_out() {
+        let (connections, github) = connected(&[("spaceport-for-acme", 42)]).await;
+        let policy = Policy::default();
+        let nudge = Nudge::new();
+        let shutdown = CancellationToken::new();
+        let running = tokio::spawn(maintain(
+            Arc::new(connections),
+            github.clone(),
+            policy.clone(),
+            nudge.clone(),
+            shutdown.clone(),
+        ));
+        until_passes(&github, 1).await;
+
+        nudge.nudge();
+        // The loop has taken the nudge and started settling on it, and the
+        // clock has not moved, so it is still settling.
+        let_the_loop_run().await;
+        let cancelled = tokio::time::Instant::now();
+        shutdown.cancel();
+        running.await.unwrap();
+
+        assert!(
+            cancelled.elapsed() < policy.settle.unsigned_abs(),
+            "the loop sat out the settle before stopping"
+        );
+        assert_eq!(passes(&github), 1, "the settling pass never ran");
     }
 }

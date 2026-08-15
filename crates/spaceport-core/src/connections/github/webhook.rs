@@ -8,12 +8,18 @@
 //! GitHub issued when the App was created came from GitHub; a body that does
 //! not is a stranger's, whatever its headers claim.
 //!
-//! What this module deliberately does not do is act. A verified delivery is
-//! recorded as an event and nothing else happens: no app is reconciled, no
-//! installation cache is refreshed, no container is touched. Watching before
-//! acting is worth a step of its own — an operator can point an App at a
-//! spaceport, run `spaceport stream --category connection.webhook`, and see
-//! exactly what GitHub sends before anything downstream can be got wrong.
+//! What this module does with a delivery is observe it, and — for the two
+//! events that say the installations are not what they were — shove the
+//! reconciler. It never applies what a delivery claims. A body is a story about
+//! the past that may arrive twice, late, or out of order, and the answer to all
+//! three is to go and ask GitHub outright; the delivery only decides *when* that
+//! happens. No app is deployed, no container is touched.
+//!
+//! The shove happens after verification and after deduplication, and that
+//! ordering is a security property rather than a tidiness one. This endpoint is
+//! reachable by anybody who can find the hostname, so a nudge a stranger could
+//! send would make an unauthenticated request into a GitHub API round trip per
+//! connection — an amplifier, and one that spends a rate limit spaceport needs.
 //!
 //! The rejected alternative was verifying a delivery against every secret this
 //! spaceport holds until one matched. That works, and it turns each stranger's
@@ -32,6 +38,7 @@ use ring::hmac;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
+use super::reconcile::Nudge;
 use super::repository::ConnectionRepository;
 use crate::connections::Secret;
 
@@ -78,6 +85,21 @@ const APP_TARGET_TYPE: &str = "integration";
 /// The prefix names the algorithm, so it is checked rather than skipped: a
 /// signature spelled any other way is one this module cannot say it verified.
 const SIGNATURE_PREFIX: &str = "sha256=";
+
+/// The events that mean the cached installations are stale.
+///
+/// `installation` is an App installed, uninstalled, suspended or unsuspended on
+/// an account; `installation_repositories` is a repository added to or removed
+/// from one. Between them they are every way the answer to "where is this App,
+/// and what can it see" changes, which is exactly what the cache holds.
+///
+/// Nothing else belongs here, and the discrimination is the point. A `push`
+/// says a commit happened and says nothing whatever about where the App is
+/// installed — waking the reconciler for one would spend a GitHub round trip
+/// per connection for every commit an organisation pushes, on a question whose
+/// answer has not moved. The same goes for `check_suite`, `pull_request` and
+/// every other event a busy repository generates all day.
+pub const EVENTS_THAT_STALE_THE_CACHE: [&str; 2] = ["installation", "installation_repositories"];
 
 /// What spaceport made of a delivery.
 ///
@@ -160,6 +182,7 @@ pub fn verify(secret: &Secret, signature: &str, body: &[u8]) -> Result<()> {
 /// GitHub rather than a fault of this spaceport's.
 pub async fn receive(
     connections: &ConnectionRepository,
+    nudge: &Nudge,
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<Outcome> {
@@ -248,6 +271,19 @@ pub async fn receive(
         installation = payload.installation,
         "a github webhook delivery arrived"
     );
+
+    // Here and nowhere earlier. Every return above this point is a delivery
+    // that did not prove it came from GitHub, or one that has already been
+    // acted on, and neither may make spaceport call GitHub: an endpoint a
+    // stranger can turn into an API request is an amplifier, and this one is
+    // open to the internet.
+    if EVENTS_THAT_STALE_THE_CACHE.contains(&event) {
+        debug!(
+            event,
+            delivery_id, app_id, "github says where this app is installed has changed"
+        );
+        nudge.nudge();
+    }
 
     Ok(Outcome::Accepted)
 }

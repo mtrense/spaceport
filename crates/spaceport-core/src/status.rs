@@ -60,6 +60,10 @@ pub struct Instance {
     /// different listeners — the operator socket issues the state, the edge
     /// answers for it — and this is the only thing both of them can see.
     pub attempts: Arc<github::Attempts>,
+    /// How a handler tells the reconciler that what it has cached is stale.
+    /// The same one the edge and the reconciliation loop hold: connecting an
+    /// App on this socket is one of the things that makes it so.
+    pub nudge: github::Nudge,
     /// Absent when tls is self-signed: then nothing ever orders a certificate.
     pub certificates: Option<Arc<Certificates>>,
     /// What the reconciliation at startup did. Kept because it is the only
@@ -524,6 +528,7 @@ container:
             connections: Arc::new(ConnectionRepository::new(db.clone())),
             github: github::api::testing::FakeGitHub::new(),
             attempts: Arc::new(github::Attempts::new()),
+            nudge: github::Nudge::new(),
             db,
             certificates: None,
             reconciled,
@@ -665,6 +670,7 @@ container:
                 "private_key": crate::connections::github::key::testing::PKCS1,
             }))
             .unwrap(),
+            &instance.nudge,
         )
         .await
         .unwrap();

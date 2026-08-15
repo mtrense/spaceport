@@ -29,7 +29,7 @@ use super::OperatorEndpoint;
 use crate::app::apply::{Applied, Applier, ApplyError, DestroyError, ResumeError, SuspendError};
 use crate::app::{App, AppId, AppManifest, AppRepository, DataDir, Pattern, health};
 use crate::connections::github::{
-    ConnectionRepository, Registration, Transport, manifest, register,
+    ConnectionRepository, Nudge, Registration, Transport, manifest, register,
 };
 use crate::events::{Event, EventBus, EventFilter, Level};
 use crate::runtime::Adopted;
@@ -171,6 +171,12 @@ impl FromRef<Operator> for Arc<ConnectionRepository> {
 impl FromRef<Operator> for Arc<dyn Transport> {
     fn from_ref(operator: &Operator) -> Self {
         operator.instance.github.clone()
+    }
+}
+
+impl FromRef<Operator> for Nudge {
+    fn from_ref(operator: &Operator) -> Self {
+        operator.instance.nudge.clone()
     }
 }
 
@@ -932,6 +938,7 @@ const INSTALL_URL: &str = "https://github.com/apps";
 async fn connect_github(
     State(connections): State<Arc<ConnectionRepository>>,
     State(github): State<Arc<dyn Transport>>,
+    State(nudge): State<Nudge>,
     body: String,
 ) -> Response {
     let registration: Registration = match serde_json::from_str(&body) {
@@ -944,7 +951,7 @@ async fn connect_github(
         }
     };
 
-    match register::connect(&connections, github, registration).await {
+    match register::connect(&connections, github, registration, &nudge).await {
         Ok(connection) => {
             let body = format!(
                 "connected `{}` as github app {}, owned by {}\n  install it on an account at {INSTALL_URL}/{}/installations/new\n",
@@ -1005,7 +1012,9 @@ async fn register_github(State(instance): State<Arc<Instance>>, body: String) ->
         );
     };
 
-    let name = request.name.unwrap_or_else(|| default_name(&hostname));
+    let name = request
+        .name
+        .unwrap_or_else(|| default_name(&hostname, request.org.as_deref()));
     let state = match instance.attempts.begin(
         request.org.clone(),
         name.clone(),
@@ -1040,17 +1049,51 @@ async fn register_github(State(instance): State<Arc<Instance>>, body: String) ->
 ///
 /// Built from the hostname because a GitHub App's name has to be unique across
 /// the whole of github.com, and a hostname is the one thing about a spaceport
-/// that is already unique — `spaceport` on its own is long taken. Trimmed to
-/// [`NAME_LIMIT`], and to no trailing hyphen, so what is left still reads as a
-/// name rather than as a cut-off one.
-fn default_name(hostname: &str) -> String {
-    let name: String = hostname
-        .replace('.', "-")
-        .chars()
-        .take(NAME_LIMIT)
-        .collect();
+/// that is already unique — `spaceport` on its own is long taken.
+///
+/// The organisation is in it for the same reason. A spaceport may hold one app
+/// per organisation, and a name built from the hostname alone is the same name
+/// every time: connecting a second organisation with defaults would ask GitHub
+/// to create an app called what the first one is already called, and GitHub
+/// refuses that on the form — after the operator has clicked through, with an
+/// error page spaceport never sees and cannot improve on. So the default is
+/// distinct per organisation before it is ever offered.
+///
+/// The organisation goes last and is kept whole when the two together are too
+/// long. Truncating the end is the obvious way to fit [`NAME_LIMIT`] and it is
+/// the wrong one here: the tail is the only part that distinguishes one of
+/// these names from another, and cutting it would reinstate exactly the
+/// collision this is here to avoid. So the hostname gives up its characters
+/// first, and only an organisation that fills the limit on its own truncates.
+fn default_name(hostname: &str, org: Option<&str>) -> String {
+    let host = hostname.replace('.', "-");
 
-    name.trim_end_matches('-').to_owned()
+    let Some(org) = org else {
+        return trimmed(&host, NAME_LIMIT);
+    };
+
+    // One character for the hyphen that joins them.
+    let Some(room) = NAME_LIMIT.checked_sub(org.chars().count() + 1) else {
+        return trimmed(org, NAME_LIMIT);
+    };
+
+    match trimmed(&host, room) {
+        // An organisation long enough to leave the hostname nothing is still an
+        // organisation, and its name alone is distinct — which is the property
+        // that matters.
+        host if host.is_empty() => trimmed(org, NAME_LIMIT),
+        host => format!("{host}-{org}"),
+    }
+}
+
+/// `text` cut to `limit` characters, and to no trailing hyphen, so what is left
+/// reads as a name rather than as a cut-off one.
+fn trimmed(text: &str, limit: usize) -> String {
+    text.chars()
+        .take(limit)
+        .collect::<String>()
+        .trim_end_matches('-')
+        .to_owned()
 }
 
 /// What an operator asks for when they ask GitHub to create the app.
@@ -1175,7 +1218,11 @@ async fn connection(
     // refreshed a minute ago call for quite different next steps.
     match connections.last_reconciled(held.app_id).await {
         Ok(Some(reconciled)) => out.field("refreshed", reconciled),
-        Ok(None) => out.field("refreshed", "not yet — the first pass is hourly".to_owned()),
+        Ok(None) => out.field(
+            "refreshed",
+            "not yet — a pass is due within seconds of connecting, and hourly after that"
+                .to_owned(),
+        ),
         Err(error) => out.field("refreshed", format!("could not be read: {error:#}")),
     }
 
@@ -1184,6 +1231,11 @@ async fn connection(
 
 /// `DELETE /connections/{slug}`: forget the app, and everything cached under
 /// it.
+///
+/// No nudge, unlike connecting: forgetting deletes the connection's own rows
+/// here and now, so the cache is already right when this answers. A pass would
+/// find one fewer connection to ask GitHub about and change nothing — an API
+/// round trip per remaining connection to confirm what is already true.
 async fn forget_connection(
     State(connections): State<Arc<ConnectionRepository>>,
     UrlPath(slug): UrlPath<String>,
@@ -1397,6 +1449,7 @@ container:
             connections: Arc::new(ConnectionRepository::new(db.clone())),
             github: github.clone(),
             attempts: Arc::new(crate::connections::github::Attempts::new()),
+            nudge: Nudge::new(),
             db,
             certificates: None,
             reconciled: crate::app::reconcile::Report::default(),
@@ -2286,6 +2339,82 @@ container:
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("spaceport-example-com"), "{body}");
         assert!(body.contains("your own github account"), "{body}");
+    }
+
+    /// The reason the organisation is in the default at all: one spaceport may
+    /// hold an app per organisation, and connecting the second one with
+    /// defaults must not ask github for a name the first one already has.
+    #[tokio::test]
+    async fn names_the_app_after_the_organisation_as_well() {
+        let router = router_answering_to_a_hostname();
+
+        let (_, first) = post_registration(&router, serde_json::json!({"org": "acme-inc"})).await;
+        let (_, second) =
+            post_registration(&router, serde_json::json!({"org": "beta-works"})).await;
+
+        assert!(
+            first.contains("`spaceport-example-com-acme-inc`"),
+            "{first}"
+        );
+        assert!(
+            second.contains("`spaceport-example-com-beta-works`"),
+            "{second}"
+        );
+    }
+
+    #[test]
+    fn a_default_name_is_the_hostname_when_there_is_no_organisation() {
+        assert_eq!(
+            default_name("spaceport.example.com", None),
+            "spaceport-example-com"
+        );
+    }
+
+    #[test]
+    fn a_default_name_carries_the_organisation_that_makes_it_distinct() {
+        assert_eq!(
+            default_name("spaceport.example.com", Some("acme-inc")),
+            "spaceport-example-com-acme-inc"
+        );
+    }
+
+    /// The hostname gives up its characters first. Cutting the tail instead
+    /// would fit the limit and lose the only part that tells two of these
+    /// names apart, which is the collision this default exists to avoid.
+    #[test]
+    fn a_default_name_too_long_to_fit_keeps_the_organisation_whole() {
+        let name = default_name(
+            "spaceport.a-rather-long-hostname.example.com",
+            Some("acme-inc"),
+        );
+
+        assert!(name.chars().count() <= NAME_LIMIT, "{name}");
+        assert!(name.ends_with("-acme-inc"), "{name}");
+    }
+
+    /// An organisation long enough to fill the limit on its own is still
+    /// distinct on its own, which is the property that matters.
+    #[test]
+    fn a_default_name_for_an_enormous_organisation_is_the_organisation() {
+        let org = "a".repeat(NAME_LIMIT + 10);
+        let name = default_name("spaceport.example.com", Some(&org));
+
+        assert_eq!(name.chars().count(), NAME_LIMIT);
+        assert!(name.starts_with("aaaa"), "{name}");
+    }
+
+    /// Whatever is cut, what is left has to read as a name rather than as a
+    /// name that ran out.
+    #[test]
+    fn a_default_name_never_ends_in_the_hyphen_it_was_cut_at() {
+        for hostname in ["a-very-long-hostname-indeed.example.com", "x.y.z"] {
+            for org in [None, Some("acme-inc"), Some(&"o".repeat(30)[..])] {
+                let name = default_name(hostname, org);
+
+                assert!(!name.ends_with('-'), "{name}");
+                assert!(name.chars().count() <= NAME_LIMIT, "{name}");
+            }
+        }
     }
 
     /// The whole flow is a redirect back to an address GitHub can reach, and

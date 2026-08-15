@@ -36,3 +36,12 @@ tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 x509-parser.workspace = true
+
+# No crate that is not already a dependency: this is `tokio` again, with the
+# one feature that lets a test hold the clock still. Loops here sleep for an
+# hour between passes, and a test that waited out an hour to prove a nudge cut
+# it short would never be run by anybody. Kept out of the dependencies above
+# because `tokio`'s own advice is that `test-util` has no business in a shipped
+# binary, and a dev-dependency is not compiled into one.
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

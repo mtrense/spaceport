@@ -37,7 +37,7 @@ use time::OffsetDateTime;
 use tracing::warn;
 
 use crate::connections::github::manifest::{self, Attempts, Manifest};
-use crate::connections::github::{ConnectionRepository, Transport, register, webhook};
+use crate::connections::github::{ConnectionRepository, Nudge, Transport, register, webhook};
 
 /// What the pages on spaceport's own host are served out of.
 ///
@@ -50,6 +50,10 @@ pub struct Home {
     pub connections: Arc<ConnectionRepository>,
     /// How the callback reaches GitHub to exchange the code it was handed.
     pub github: Arc<dyn Transport>,
+    /// How both handlers here tell the reconciler that what it has cached is
+    /// no longer what GitHub would say — a delivery about an installation, or
+    /// an App this spaceport has just been handed.
+    pub nudge: Nudge,
     /// The host these pages are being served on, which is also the host every
     /// url in the manifest is built from. Absent when the config named none —
     /// in which case nothing should ever have issued an attempt, and a page
@@ -178,8 +182,13 @@ async fn callback(
         }
     };
 
-    let connection = match register::connect(&home.connections, home.github.clone(), registration)
-        .await
+    let connection = match register::connect(
+        &home.connections,
+        home.github.clone(),
+        registration,
+        &home.nudge,
+    )
+    .await
     {
         Ok(connection) => connection,
         Err(error) => {
@@ -231,7 +240,7 @@ async fn callback(
 /// The answer is a status and no body: what is reading it is GitHub's delivery
 /// machinery, which records the status and nothing else.
 async fn deliver(State(home): State<Arc<Home>>, headers: HeaderMap, body: Bytes) -> Response {
-    match webhook::receive(&home.connections, &headers, &body).await {
+    match webhook::receive(&home.connections, &home.nudge, &headers, &body).await {
         Ok(outcome) => outcome.status().into_response(),
         Err(error) => {
             warn!(error = %format!("{error:#}"), "a github webhook delivery could not be handled");
@@ -355,6 +364,7 @@ mod tests {
             attempts: Arc::new(Attempts::new()),
             connections: Arc::new(ConnectionRepository::new(Db::in_memory().unwrap())),
             github: github.clone(),
+            nudge: Nudge::new(),
             hostname: Some(HOSTNAME.to_owned()),
         });
 
@@ -483,6 +493,7 @@ mod tests {
     async fn the_callback_records_the_app_and_says_where_to_install_it() {
         let (home, _) = home();
         let state = begin(&home, Some("an-organisation"));
+        let changed = home.nudge.changed();
 
         let (status, body) = get_path(
             home.clone(),
@@ -503,6 +514,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recorded.app_id, 42);
+        // And the reconciler has been told, which is what makes the app an
+        // operator has just installed show up in seconds.
+        assert!(changed.has_changed().unwrap());
     }
 
     /// Only GitHub completes a registration, and it always sends a code.
@@ -875,6 +889,147 @@ mod tests {
             deliver(home, 2, "alphas-secret", "push", "beta-2", PUSH).await,
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    const INSTALLATION: &str = r#"{"action":"created","installation":{"id":7}}"#;
+
+    /// The event the whole fast path exists for: an App installed on an
+    /// account, which is precisely what the cache is a copy of.
+    #[tokio::test]
+    async fn a_verified_installation_delivery_nudges_the_reconciler() {
+        let home = plain_home();
+        connect(&home, "spaceport-for-acme", 42, "a-webhook-secret").await;
+        let changed = home.nudge.changed();
+
+        let status = deliver(
+            home.clone(),
+            42,
+            "a-webhook-secret",
+            "installation",
+            "delivery-1",
+            INSTALLATION,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(changed.has_changed().unwrap());
+    }
+
+    /// A repository added to or removed from an installation changes what the
+    /// App can see without changing where it is installed, and the cache holds
+    /// both halves.
+    #[tokio::test]
+    async fn a_verified_installation_repositories_delivery_nudges_the_reconciler() {
+        let home = plain_home();
+        connect(&home, "spaceport-for-acme", 42, "a-webhook-secret").await;
+        let changed = home.nudge.changed();
+
+        let status = deliver(
+            home.clone(),
+            42,
+            "a-webhook-secret",
+            "installation_repositories",
+            "delivery-1",
+            r#"{"action":"added","installation":{"id":7}}"#,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(changed.has_changed().unwrap());
+    }
+
+    /// A commit says nothing about where the App is installed, and a busy
+    /// organisation pushes all day — a pass apiece would be a GitHub round trip
+    /// per connection per commit, asking a question whose answer has not moved.
+    #[tokio::test]
+    async fn a_verified_push_delivery_nudges_nothing() {
+        let home = plain_home();
+        connect(&home, "spaceport-for-acme", 42, "a-webhook-secret").await;
+        let changed = home.nudge.changed();
+
+        let status = deliver(
+            home.clone(),
+            42,
+            "a-webhook-secret",
+            "push",
+            "delivery-1",
+            PUSH,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(!changed.has_changed().unwrap());
+    }
+
+    /// The amplification guard, and the reason the nudge happens after
+    /// verification rather than before it: this endpoint is open to whoever can
+    /// find the hostname, and a delivery that proves nothing must never be able
+    /// to make spaceport call GitHub.
+    #[tokio::test]
+    async fn a_delivery_that_did_not_verify_nudges_nothing() {
+        let home = plain_home();
+        connect(&home, "spaceport-for-acme", 42, "a-webhook-secret").await;
+        let changed = home.nudge.changed();
+
+        let (unsigned, _) = deliver_headers(
+            home.clone(),
+            &[
+                ("x-github-event", "installation"),
+                ("x-github-delivery", "delivery-1"),
+                ("x-github-hook-installation-target-type", "integration"),
+                ("x-github-hook-installation-target-id", "42"),
+            ],
+            INSTALLATION,
+        )
+        .await;
+        let wrongly_signed = deliver(
+            home.clone(),
+            42,
+            "another-webhook-secret",
+            "installation",
+            "delivery-2",
+            INSTALLATION,
+        )
+        .await;
+
+        assert_eq!(unsigned, StatusCode::UNAUTHORIZED);
+        assert_eq!(wrongly_signed, StatusCode::UNAUTHORIZED);
+        assert!(!changed.has_changed().unwrap());
+    }
+
+    /// GitHub retries, and an operator redelivers by hand. The first delivery
+    /// already started the pass that read the whole truth, so the copy is not
+    /// news and must not cost a second one.
+    #[tokio::test]
+    async fn a_redelivery_nudges_nothing() {
+        let home = plain_home();
+        connect(&home, "spaceport-for-acme", 42, "a-webhook-secret").await;
+
+        let first = deliver(
+            home.clone(),
+            42,
+            "a-webhook-secret",
+            "installation",
+            "delivery-1",
+            INSTALLATION,
+        )
+        .await;
+        // Everything the first delivery said is now seen, so what the second
+        // one adds is all that is being measured.
+        let changed = home.nudge.changed();
+        let second = deliver(
+            home.clone(),
+            42,
+            "a-webhook-secret",
+            "installation",
+            "delivery-1",
+            INSTALLATION,
+        )
+        .await;
+
+        assert_eq!(first, StatusCode::ACCEPTED);
+        assert_eq!(second, StatusCode::OK);
+        assert!(!changed.has_changed().unwrap());
     }
 
     #[test]

@@ -7,12 +7,13 @@
 //! invisible in three weeks, when a webhook is quietly failing its signature
 //! check and nothing says why.
 //!
-//! Only the manual half lives here for now — an operator created the App by
-//! hand on github.com and types back what the settings page shows them. The
-//! other half, where spaceport hands GitHub an App manifest and GitHub creates
-//! the App and hands the secrets back, arrives with the next step and lands in
-//! this module beside it, because both flows end in the same place: a validated
-//! [`Registration`] recorded as a [`Connection`].
+//! Both ways in end here. An operator who created the App by hand types back
+//! what its settings page shows them; the manifest flow in [`super::manifest`]
+//! has GitHub create it and hand the same values over at a callback. They
+//! differ in where the [`Registration`] comes from and in nothing after that,
+//! which is why the checking and the recording live in one place rather than
+//! once per flow — a rule enforced on one path and not the other is a rule that
+//! holds until somebody uses the other path.
 //!
 //! Registering also talks to GitHub, once, to ask it a single question: is this
 //! really the app whose credentials these are? The local checks run first and a
@@ -36,6 +37,7 @@ use tracing::info;
 
 use super::api::{Client, Transport};
 use super::key;
+use super::reconcile::Nudge;
 use super::repository::{Connection, ConnectionRepository};
 use crate::connections::Secret;
 
@@ -123,10 +125,16 @@ fn is_slug_character(character: char) -> bool {
 /// credentials belong to. A connection that is recorded and does not work is
 /// worse than none at all: it looks connected in every listing, and the first
 /// sign that it is not is a reconciliation pass failing hours later.
+///
+/// `nudge` is taken rather than left to the caller because there are two callers
+/// — an operator registering an App by hand, and the manifest callback where
+/// GitHub created one — and a connection whose reconciliation waited an hour
+/// because one of them forgot is a bug nothing would ever point at.
 pub async fn connect(
     repository: &ConnectionRepository,
     transport: Arc<dyn Transport>,
     registration: Registration,
+    nudge: &Nudge,
 ) -> Result<Connection> {
     registration.validate()?;
 
@@ -206,6 +214,14 @@ pub async fn connect(
         "connected a github app",
     );
 
+    // After recording, because a pass that ran before the row existed would
+    // reconcile every connection but this one. An App connected a moment ago
+    // usually has nothing installed yet and the pass finds nothing — but an
+    // operator who created the App and installed it in the same visit to
+    // github.com has, and an hour is a long time to say `not yet` about
+    // something spaceport could have asked.
+    nudge.nudge();
+
     Ok(connection)
 }
 
@@ -232,7 +248,7 @@ mod tests {
         repository: &ConnectionRepository,
         registration: Registration,
     ) -> Result<Connection> {
-        connect(repository, github(), registration).await
+        connect(repository, github(), registration, &Nudge::new()).await
     }
 
     fn registration() -> Registration {
@@ -274,6 +290,46 @@ mod tests {
         assert_eq!(read.owner, "an-organisation");
         assert_eq!(read.client_secret, Secret::new("a-client-secret"));
         assert!(read.connected_at.ends_with('Z'), "{read:?}");
+    }
+
+    /// An App is connected and installed in the same visit to github.com, so
+    /// the reconciler has to hear about it now rather than within the hour —
+    /// otherwise `spaceport connect show` says `not yet` for as long as an
+    /// operator is willing to keep looking.
+    #[tokio::test]
+    async fn connecting_an_app_nudges_the_reconciler() {
+        let repository = repository();
+        let nudge = Nudge::new();
+        let changed = nudge.changed();
+
+        connect(&repository, github(), registration(), &nudge)
+            .await
+            .unwrap();
+
+        assert!(changed.has_changed().unwrap());
+    }
+
+    /// Nothing was recorded, so there is nothing for a pass to find — and a
+    /// mistyped key must not cost a round trip per connection on this host.
+    #[tokio::test]
+    async fn a_registration_that_was_refused_nudges_nothing() {
+        let repository = repository();
+        let nudge = Nudge::new();
+        let changed = nudge.changed();
+
+        connect(
+            &repository,
+            github(),
+            Registration {
+                private_key: Secret::new("hunter2"),
+                ..registration()
+            },
+            &nudge,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(!changed.has_changed().unwrap());
     }
 
     /// Rotating a secret is running the same command again, so the second
@@ -329,7 +385,7 @@ mod tests {
         let repository = repository();
         let github = github();
 
-        connect(&repository, github.clone(), registration())
+        connect(&repository, github.clone(), registration(), &Nudge::new())
             .await
             .unwrap();
 
@@ -351,7 +407,7 @@ mod tests {
 
         let error = format!(
             "{:#}",
-            connect(&repository, github, registration())
+            connect(&repository, github, registration(), &Nudge::new())
                 .await
                 .unwrap_err()
         );
@@ -430,7 +486,7 @@ mod tests {
 
         let error = format!(
             "{:#}",
-            connect(&repository, github, registration())
+            connect(&repository, github, registration(), &Nudge::new())
                 .await
                 .unwrap_err()
         );

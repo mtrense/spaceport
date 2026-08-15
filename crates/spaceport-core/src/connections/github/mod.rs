@@ -30,6 +30,6 @@ pub mod webhook;
 
 pub use api::{Client, Network, Transport};
 pub use manifest::{Attempt, Attempts};
-pub use reconcile::maintain;
+pub use reconcile::{Nudge, maintain};
 pub use register::{Registration, connect};
 pub use repository::{Connection, ConnectionRepository, Installation};

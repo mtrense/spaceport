@@ -561,6 +561,13 @@ async fn run(args: RunArgs) -> Result<()> {
     let github = Arc::new(github::Network::new()?);
     let connections = Arc::new(ConnectionRepository::new(db.clone()));
 
+    // One signal for the whole process, built here because everything that
+    // shoves it and the one thing that listens for it are assembled below: the
+    // reconciliation loop, the operator socket where an app is connected, and
+    // the edge where GitHub's webhooks land. Two of these would be a spaceport
+    // that reconciles on some of what it learns and silently not on the rest.
+    let nudge = github::Nudge::new();
+
     // Whatever webhooks missed, healed on a timer. Started unconditionally,
     // even on a host with no connections at all: a connection can be made while
     // spaceport is running, and a loop that was not started because there were
@@ -571,6 +578,7 @@ async fn run(args: RunArgs) -> Result<()> {
         connections.clone(),
         github.clone(),
         github::reconcile::Policy::default(),
+        nudge.clone(),
         shutdown.clone(),
     ));
 
@@ -586,6 +594,7 @@ async fn run(args: RunArgs) -> Result<()> {
         attempts: attempts.clone(),
         connections: connections.clone(),
         github: github.clone(),
+        nudge: nudge.clone(),
         hostname: config.edge.hostname.as_ref().map(ToString::to_string),
     });
 
@@ -602,6 +611,7 @@ async fn run(args: RunArgs) -> Result<()> {
             connections,
             github,
             attempts,
+            nudge,
             db,
             certificates: certificates.clone(),
             reconciled: report,
