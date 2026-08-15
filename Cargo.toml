@@ -45,10 +45,28 @@ libc = "0.2"
 ring = "0.17"
 
 axum = "0.8"
+# The three segments of a JSON Web Token, joined by dots. Base64url without
+# padding, which is a spelling of base64 rather than a different encoding, and
+# not one worth hand-rolling next to a signature. Already in the tree under
+# rustls-pemfile, so this costs nothing but the direct dependency.
+base64 = "0.22"
 bytes = "1"
 http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+# Outbound TLS, for the one thing spaceport calls that is not on this host:
+# GitHub's API. The edge terminates TLS and the proxy speaks plaintext to
+# containers, so until now nothing needed a client that could. `ring` and
+# `tls12` to match the server side; `native-tokio` for the trust anchors,
+# because the host already has a set and a second one would only ever disagree
+# with it.
+hyper-rustls = { version = "0.27", default-features = false, features = [
+  "ring",
+  "native-tokio",
+  "http1",
+  "http2",
+  "tls12",
+] }
 hyper-util = { version = "0.1", features = [
   "client",
   "client-legacy",
