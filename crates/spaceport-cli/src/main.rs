@@ -142,12 +142,28 @@ enum ConnectCommand {
 }
 
 #[derive(Debug, Args)]
+// Exactly one of the two flows, and saying which is not optional: they need
+// entirely different arguments, and a command that guessed would be guessing
+// whether to create an app on github.com.
+#[command(group = clap::ArgGroup::new("flow").args(["auto", "manual"]).required(true))]
 struct ConnectGithubArgs {
+    /// Have GitHub create the app, and print a link to open in a browser.
+    ///
+    /// Spaceport describes the app it wants and GitHub creates it, so there is
+    /// nothing to copy off a settings page. GitHub only accepts that from a
+    /// logged-in browser, which is why this prints a link rather than doing it.
+    #[arg(long)]
+    auto: bool,
+
+    /// The organisation the app should belong to, with `--auto`.
+    ///
+    /// Without it the app belongs to whichever account the browser is signed
+    /// in as, which is the right answer for a spaceport one person runs.
+    #[arg(long, value_name = "ORG")]
+    org: Option<String>,
+
     /// Register an app that was created by hand on github.com, with the
     /// details from its settings page.
-    ///
-    /// Required for now. Without it there is nothing to register from: the
-    /// flow that has GitHub create the app is not implemented yet.
     #[arg(long)]
     manual: bool,
 
@@ -161,6 +177,10 @@ struct ConnectGithubArgs {
     slug: Option<String>,
 
     /// The app's display name.
+    ///
+    /// With `--auto`, optional: spaceport names the app after its own hostname,
+    /// which is the one thing about it that is already unique across
+    /// github.com — where an app's name has to be.
     #[arg(long)]
     name: Option<String>,
 
@@ -539,6 +559,22 @@ async fn run(args: RunArgs) -> Result<()> {
     // One for the whole process, so every command that asks GitHub something
     // reuses the same TLS connections rather than handshaking per request.
     let github = Arc::new(github::Network::new()?);
+    let connections = Arc::new(ConnectionRepository::new(db.clone()));
+
+    // Shared between the two listeners on purpose: `spaceport connect github
+    // --auto` issues a state on the operator socket, and the browser that
+    // answers for it arrives at the edge.
+    let attempts = Arc::new(github::Attempts::new());
+
+    // The pages spaceport serves as itself. Built whether or not a hostname was
+    // configured — which host reaches them is the routing table's business, and
+    // a page that is never reached costs nothing to have made.
+    let home = Arc::new(edge::Home {
+        attempts: attempts.clone(),
+        connections: connections.clone(),
+        github: github.clone(),
+        hostname: config.edge.hostname.as_ref().map(ToString::to_string),
+    });
 
     let operator = args.operator.map(|endpoint| {
         // Everything a status report is made of, gathered while the things it
@@ -550,8 +586,9 @@ async fn run(args: RunArgs) -> Result<()> {
             config: config.clone(),
             operator: endpoint.clone(),
             applier,
-            connections: Arc::new(ConnectionRepository::new(db.clone())),
+            connections,
             github,
+            attempts,
             db,
             certificates: certificates.clone(),
             reconciled: report,
@@ -578,7 +615,7 @@ async fn run(args: RunArgs) -> Result<()> {
         tokio::spawn(acme::maintain(certificates, apps.clone(), shutdown.clone()));
     }
 
-    let served = edge::serve(&config, apps, acceptor, challenges, shutdown.clone()).await;
+    let served = edge::serve(&config, apps, home, acceptor, challenges, shutdown.clone()).await;
 
     // Whatever stopped the edge stops the operator interface too, so a failure
     // to bind one port does not leave the other half of spaceport running.
@@ -692,8 +729,21 @@ async fn stream(args: StreamArgs) -> Result<()> {
 /// talked to may be on another host, where the file an operator just downloaded
 /// does not exist.
 async fn connect_github(args: ConnectGithubArgs) -> Result<()> {
-    if !args.manual {
-        anyhow::bail!("`--auto` is not implemented yet; pass `--manual` with the app's details");
+    if args.auto {
+        let request = client::GithubAppRequest {
+            org: args.org,
+            name: args.name,
+        };
+
+        print!(
+            "{}",
+            client::register_github(&args.server.server, &request).await?
+        );
+
+        // No polling: what happens next is a person opening a link, and a
+        // command that sat waiting on that would be holding a terminal open for
+        // minutes to report something `spaceport connect list` says anyway.
+        return Ok(());
     }
 
     let private_key = required(args.private_key, "--private-key")?;

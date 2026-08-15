@@ -131,6 +131,35 @@ pub async fn connect_github(
     send_to(endpoint, request).await
 }
 
+/// Ask it to begin the flow that has GitHub create the app.
+///
+/// Comes back as prose holding a url, because that is all there is to hand
+/// over: the app is created by a browser posting a manifest to github.com, and
+/// nothing this side can do that. The command prints the url and exits — it
+/// does not wait, because what it would be waiting on is a person.
+pub async fn register_github(
+    endpoint: &OperatorEndpoint,
+    request: &GithubAppRequest,
+) -> Result<String> {
+    let body = serde_json::to_vec(request).context("writing the github app request")?;
+    let request = builder("POST", "/connections/github/register")
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(body)))?;
+
+    send_to(endpoint, request).await
+}
+
+/// What GitHub should be asked to create.
+///
+/// Both fields optional, and for different reasons: an app with no organisation
+/// belongs to whoever is logged in, and an app with no name is named after the
+/// spaceport's hostname — which only the spaceport knows.
+#[derive(Debug, Clone, Serialize)]
+pub struct GithubAppRequest {
+    pub org: Option<String>,
+    pub name: Option<String>,
+}
+
 /// Ask for the connections it holds.
 pub async fn connections(endpoint: &OperatorEndpoint) -> Result<String> {
     send_to(

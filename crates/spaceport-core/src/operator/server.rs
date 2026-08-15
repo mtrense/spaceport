@@ -28,7 +28,9 @@ use tracing::{info, warn};
 use super::OperatorEndpoint;
 use crate::app::apply::{Applied, Applier, ApplyError, DestroyError, ResumeError, SuspendError};
 use crate::app::{App, AppId, AppManifest, AppRepository, DataDir, Pattern, health};
-use crate::connections::github::{ConnectionRepository, Registration, Transport, register};
+use crate::connections::github::{
+    ConnectionRepository, Registration, Transport, manifest, register,
+};
 use crate::events::{Event, EventBus, EventFilter, Level};
 use crate::runtime::Adopted;
 use crate::status::Instance;
@@ -124,6 +126,7 @@ fn router(instance: Arc<Instance>, events: Arc<EventBus>, shutdown: Cancellation
         .route("/apps/{id}/resume", post(resume))
         .route("/connections", get(connections))
         .route("/connections/github", post(connect_github))
+        .route("/connections/github/register", post(register_github))
         .route(
             "/connections/{slug}",
             get(connection).delete(forget_connection),
@@ -959,6 +962,111 @@ async fn connect_github(
     }
 }
 
+/// The longest name GitHub will create an App under.
+///
+/// GitHub's rule rather than a choice, and it applies to the name a manifest
+/// asks for: a longer one is refused at the moment the browser posts the form,
+/// which is a page an operator reads on github.com rather than a message
+/// spaceport could improve on. So the derived default is kept inside it.
+const NAME_LIMIT: usize = 34;
+
+/// `POST /connections/github/register` with `{"org": …, "name": …}`: begin the
+/// flow that has GitHub create the app.
+///
+/// Answers with a url and not with a connection, because the middle of this
+/// flow is a person in a browser: GitHub will only take an App manifest as a
+/// form post from a logged-in session, so spaceport can prepare the form and
+/// nothing more. The command that called this exits here; whether an app is
+/// ever created is settled at the edge, minutes later.
+async fn register_github(State(instance): State<Arc<Instance>>, body: String) -> Response {
+    let request: RegisterRequest = match serde_json::from_str(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return refuse(
+                StatusCode::BAD_REQUEST,
+                &format!("that is not a github app registration request: {error}"),
+            );
+        }
+    };
+
+    // The whole flow is a redirect back to an address GitHub can reach, and
+    // without a hostname there is no such address — so this fails now, rather
+    // than as a manifest naming a url that goes nowhere.
+    let Some(hostname) = instance
+        .config
+        .edge
+        .hostname
+        .as_ref()
+        .map(ToString::to_string)
+    else {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "this spaceport has no hostname of its own, and github has to be able to reach one to hand the app back — set `edge.hostname` in its config and restart it, or register an app made by hand with `spaceport connect github --manual`",
+        );
+    };
+
+    let name = request.name.unwrap_or_else(|| default_name(&hostname));
+    let state = match instance.attempts.begin(
+        request.org.clone(),
+        name.clone(),
+        time::OffsetDateTime::now_utc(),
+    ) {
+        Ok(state) => state,
+        Err(error) => {
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not begin a registration: {error:#}"),
+            );
+        }
+    };
+
+    let owner = match &request.org {
+        Some(org) => format!("the `{org}` organisation"),
+        None => "your own github account".to_owned(),
+    };
+
+    (
+        StatusCode::OK,
+        format!(
+            "open this in a browser signed in to github as somebody who may create an app on {owner}:\n\n  {}\n\ngithub will create an app called `{name}` and send the browser back here, and spaceport records it then\nthe link is good for {} minutes\n",
+            manifest::setup_url(&hostname, &state),
+            manifest::LIFETIME.whole_minutes(),
+        ),
+    )
+        .into_response()
+}
+
+/// What to call an app nobody named.
+///
+/// Built from the hostname because a GitHub App's name has to be unique across
+/// the whole of github.com, and a hostname is the one thing about a spaceport
+/// that is already unique — `spaceport` on its own is long taken. Trimmed to
+/// [`NAME_LIMIT`], and to no trailing hyphen, so what is left still reads as a
+/// name rather than as a cut-off one.
+fn default_name(hostname: &str) -> String {
+    let name: String = hostname
+        .replace('.', "-")
+        .chars()
+        .take(NAME_LIMIT)
+        .collect();
+
+    name.trim_end_matches('-').to_owned()
+}
+
+/// What an operator asks for when they ask GitHub to create the app.
+///
+/// `name` is optional here and not on the command line's side of things,
+/// because the default is derived from this spaceport's hostname and the
+/// command has no idea what that is.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterRequest {
+    /// The organisation the app should belong to, or none for the operator's
+    /// own account.
+    org: Option<String>,
+    name: Option<String>,
+}
+
 /// `GET /connections`: the github apps this spaceport is, one per line.
 ///
 /// Never a secret, not even a redacted one: a listing is the response most
@@ -1224,6 +1332,27 @@ container:
         CancellationToken,
         Arc<FakeGitHub>,
     ) {
+        parts_configured(runtime, CONFIG)
+    }
+
+    /// A router over a spaceport that answers to a hostname of its own, which
+    /// is the only thing the manifest flow needs and nothing else here has.
+    fn router_answering_to_a_hostname() -> Router {
+        let config = CONFIG.replace("edge:\n", "edge:\n  hostname: spaceport.example.com\n");
+
+        parts_configured(OneContainer::default(), &config).1
+    }
+
+    fn parts_configured(
+        runtime: OneContainer,
+        config: &str,
+    ) -> (
+        Arc<AppStore>,
+        Router,
+        Arc<EventBus>,
+        CancellationToken,
+        Arc<FakeGitHub>,
+    ) {
         let store = Arc::new(AppStore::new());
         let db = Db::in_memory().unwrap();
         let applier = Arc::new(Applier::new(
@@ -1253,11 +1382,12 @@ container:
             version: "9.9.9".to_owned(),
             started_at: time::OffsetDateTime::now_utc(),
             config_path: "/etc/spaceport/spaceport.yaml".into(),
-            config: crate::Config::parse(CONFIG).unwrap(),
+            config: crate::Config::parse(config).unwrap(),
             operator: "/run/spaceport.sock".parse().unwrap(),
             applier,
             connections: Arc::new(ConnectionRepository::new(db.clone())),
             github: github.clone(),
+            attempts: Arc::new(crate::connections::github::Attempts::new()),
             db,
             certificates: None,
             reconciled: crate::app::reconcile::Report::default(),
@@ -2104,6 +2234,79 @@ container:
         assert_eq!(found, StatusCode::OK);
         let (missing, _) = get_connections(&router, "/spaceport-acmee").await;
         assert_eq!(missing, StatusCode::NOT_FOUND);
+    }
+
+    async fn post_registration(router: &Router, body: serde_json::Value) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/connections/github/register")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        call(router, request).await
+    }
+
+    #[tokio::test]
+    async fn hands_back_a_link_for_an_operator_to_open() {
+        let router = router_answering_to_a_hostname();
+
+        let (status, body) = post_registration(
+            &router,
+            serde_json::json!({"org": "an-organisation", "name": "Spaceport for Acme"}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("https://spaceport.example.com/connections/github/setup/"),
+            "{body}"
+        );
+        assert!(body.contains("open this in a browser"), "{body}");
+        assert!(body.contains("`an-organisation` organisation"), "{body}");
+        assert!(body.contains("30 minutes"), "{body}");
+    }
+
+    /// An app nobody named still has to be called something, and a name that
+    /// is already taken on github.com is refused at the far end.
+    #[tokio::test]
+    async fn names_the_app_after_the_hostname_when_nobody_named_it() {
+        let router = router_answering_to_a_hostname();
+
+        let (status, body) = post_registration(&router, serde_json::json!({})).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("spaceport-example-com"), "{body}");
+        assert!(body.contains("your own github account"), "{body}");
+    }
+
+    /// The whole flow is a redirect back to an address GitHub can reach, and
+    /// without a hostname there is none — so it fails here rather than as an
+    /// app whose webhooks go nowhere.
+    #[tokio::test]
+    async fn refuses_to_begin_without_a_hostname_of_its_own() {
+        let (router, _) = router_and_events();
+
+        let (status, body) =
+            post_registration(&router, serde_json::json!({"name": "Spaceport for Acme"})).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("no hostname of its own"), "{body}");
+        assert!(body.contains("edge.hostname"), "{body}");
+    }
+
+    /// Beginning a registration promises nothing: the app is created minutes
+    /// later, in a browser, or never.
+    #[tokio::test]
+    async fn beginning_a_registration_asks_github_nothing_and_records_nothing() {
+        let router = router_answering_to_a_hostname();
+
+        post_registration(&router, serde_json::json!({})).await;
+
+        let (_, listing) = get_connections(&router, "").await;
+        assert!(
+            listing.contains("no github apps are connected"),
+            "{listing}"
+        );
     }
 
     #[tokio::test]

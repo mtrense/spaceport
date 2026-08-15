@@ -389,7 +389,17 @@ mod tests {
     async fn edge(apps: Arc<AppStore>) -> SocketAddr {
         let state = Arc::new(EdgeState {
             router: routes::router(std::sync::Arc::new(crate::acme::Challenges::new())),
-            home: crate::edge::home::router(),
+            // Nothing here fetches a page spaceport serves as itself; the home
+            // router is present because the edge holds one, not because these
+            // tests ask it anything.
+            home: crate::edge::home::router(Arc::new(crate::edge::home::Home {
+                attempts: Arc::new(crate::connections::github::Attempts::new()),
+                connections: Arc::new(crate::connections::github::ConnectionRepository::new(
+                    crate::state::Db::in_memory().unwrap(),
+                )),
+                github: crate::connections::github::api::testing::FakeGitHub::new(),
+                hostname: None,
+            })),
             apps,
             upstreams: Upstreams::new(),
             https_port: 443,

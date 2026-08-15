@@ -47,7 +47,7 @@ use crate::connections::Secret;
 /// on the connection and a migration, not a constant. Written out rather than
 /// configurable so that nothing can point spaceport's credentials at another
 /// host by editing a config file.
-const API: &str = "https://api.github.com";
+pub(super) const API: &str = "https://api.github.com";
 
 /// The media type that selects GitHub's current REST responses.
 ///
@@ -280,7 +280,7 @@ struct MintedToken {
 /// nothing else, and an installation may read the repositories it was granted
 /// and knows nothing about the App. Presenting the wrong one is a `403` with a
 /// message about permissions, which is a confusing thing to read.
-enum Credential {
+pub(super) enum Credential {
     /// A JWT the App signed, presented as `Bearer`.
     App(String),
     /// A token GitHub minted for one installation, presented as `token`.
@@ -525,7 +525,7 @@ impl Client {
 /// because the calls that come before a connection exists — converting an App
 /// manifest into an App, which has no credentials and no private key to make
 /// one with — need the same headers and have no client to reach for.
-async fn request(
+pub(super) async fn request(
     transport: &dyn Transport,
     method: Method,
     url: &str,

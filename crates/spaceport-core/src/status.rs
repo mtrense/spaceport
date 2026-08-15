@@ -55,6 +55,11 @@ pub struct Instance {
     /// whole process, so every connection shares the connection pool rather
     /// than opening a TLS session per operator command.
     pub github: Arc<dyn github::Transport>,
+    /// The App Manifest registrations an operator has begun and not yet
+    /// finished. Held here because the two halves of that flow arrive at two
+    /// different listeners — the operator socket issues the state, the edge
+    /// answers for it — and this is the only thing both of them can see.
+    pub attempts: Arc<github::Attempts>,
     /// Absent when tls is self-signed: then nothing ever orders a certificate.
     pub certificates: Option<Arc<Certificates>>,
     /// What the reconciliation at startup did. Kept because it is the only
@@ -518,6 +523,7 @@ container:
             applier,
             connections: Arc::new(ConnectionRepository::new(db.clone())),
             github: github::api::testing::FakeGitHub::new(),
+            attempts: Arc::new(github::Attempts::new()),
             db,
             certificates: None,
             reconciled,

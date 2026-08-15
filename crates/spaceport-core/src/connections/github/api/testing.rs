@@ -83,6 +83,9 @@ struct State {
     refusal_headers: Vec<(String, String)>,
     /// Offer a next page for ever, however many have been served.
     endless: bool,
+    /// The app a manifest conversion hands back, for the tests that create one
+    /// the way GitHub's manifest flow does.
+    converted: Option<Value>,
     requests: Vec<Recorded>,
 }
 
@@ -110,6 +113,7 @@ impl FakeGitHub {
                 refusal: None,
                 refusal_headers: Vec::new(),
                 endless: false,
+                converted: None,
                 requests: Vec::new(),
             }),
         })
@@ -173,6 +177,30 @@ impl FakeGitHub {
             ("x-ratelimit-remaining".to_owned(), "0".to_owned()),
             ("x-ratelimit-reset".to_owned(), reset.to_string()),
         ];
+    }
+
+    /// Create this app out of any manifest conversion, and answer `/app` as it
+    /// from then on — which is what GitHub does, since the app now exists.
+    ///
+    /// The secrets are the fixture ones every other test uses, so a connection
+    /// made this way and one registered by hand are the same connection.
+    pub(crate) fn converts_manifests_into(&self, id: i64, slug: &str, name: &str) {
+        let mut state = self.state.lock().unwrap();
+
+        state.converted = Some(json!({
+            "id": id,
+            "slug": slug,
+            "name": name,
+            "owner": {"login": "an-organisation", "type": "Organization"},
+            "client_id": "Iv1.0123456789abcdef",
+            "client_secret": "a-client-secret",
+            "webhook_secret": "a-webhook-secret",
+            "pem": super::super::key::testing::PKCS1,
+            // A field spaceport does not know, for the same reason `/app`
+            // carries one.
+            "html_url": format!("https://github.com/apps/{slug}"),
+        }));
+        state.apps = vec![app(id, slug, name, "an-organisation")];
     }
 
     /// Offer a next page for ever — a `Link` header that points at itself.
@@ -255,6 +283,15 @@ impl FakeGitHub {
                     None,
                 )
             }
+            // The manifest conversion, which carries no credential at all: the
+            // one-time code in the path is the whole of it.
+            ["", "app-manifests", _code, "conversions"] => match state.converted.clone() {
+                Some(converted) => ok(converted, None),
+                None => Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Bytes::from_static(br#"{"message":"Not Found"}"#))
+                    .unwrap(),
+            },
             _ => Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Bytes::from_static(br#"{"message":"Not Found"}"#))

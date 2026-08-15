@@ -11,6 +11,7 @@ pub(crate) mod routes;
 mod service;
 pub mod tls;
 
+pub use home::Home;
 pub use service::{ConnInfo, Scheme};
 
 use std::sync::Arc;
@@ -54,13 +55,16 @@ pub struct EdgeState {
 /// `acceptor` decides which certificate each TLS connection is served, and
 /// `challenges` is what the plaintext listener answers an ACME CA out of. Both
 /// are built by the caller: what certificates spaceport has is not the edge's
-/// business, and serving them is not [`crate::acme`]'s.
+/// business, and serving them is not [`crate::acme`]'s. `home` is the same
+/// arrangement for the pages spaceport serves as itself — the state store and
+/// the way out to GitHub belong to the process, not to the edge.
 ///
 /// Returns once every in-flight connection has finished, so the caller can
 /// treat a normal return as "nothing is still being served".
 pub async fn serve(
     config: &Config,
     apps: Arc<AppStore>,
+    home: Arc<home::Home>,
     acceptor: TlsAcceptor,
     challenges: Arc<Challenges>,
     shutdown: CancellationToken,
@@ -69,7 +73,7 @@ pub async fn serve(
 
     let state = Arc::new(EdgeState {
         router: routes::router(challenges),
-        home: home::router(),
+        home: home::router(home),
         apps,
         upstreams: proxy::Upstreams::new(),
         https_port: listen.https.port(),
