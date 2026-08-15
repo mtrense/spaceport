@@ -14,16 +14,27 @@
 //! this module beside it, because both flows end in the same place: a validated
 //! [`Registration`] recorded as a [`Connection`].
 //!
-//! Nothing here talks to GitHub, and that limits what "valid" can mean.
-//! Whether the app id is really this operator's app, whether the client secret
-//! was rotated an hour ago, whether anybody has installed it — none of that can
-//! be known without the network, and reconciliation is what finds it out. What
-//! can be checked locally is checked locally, and the rest waits.
+//! Registering also talks to GitHub, once, to ask it a single question: is this
+//! really the app whose credentials these are? The local checks run first and a
+//! malformed registration never gets that far, because a key that is not a key
+//! should not cost a round trip. What the round trip settles is the mistake no
+//! local check can see — an app id typed with two digits transposed is a
+//! perfectly well-formed number that names somebody else's app or none at all.
+//!
+//! What is still left to reconciliation is everything about the world rather
+//! than the credentials: who has installed the app, what they granted it,
+//! whether a webhook is reaching this host. None of that is knowable at the
+//! moment an operator is standing there, and refusing to record a connection
+//! because nobody has installed it yet would refuse every first connection
+//! there has ever been.
 
-use anyhow::{Result, bail};
+use std::sync::Arc;
+
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use tracing::info;
 
+use super::api::{Client, Transport};
 use super::key;
 use super::repository::{Connection, ConnectionRepository};
 use crate::connections::Secret;
@@ -100,14 +111,21 @@ fn is_slug_character(character: char) -> bool {
     character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
 }
 
-/// Check `registration` and remember it as a connection of this spaceport's.
+/// Check `registration` against GitHub and remember it as a connection of this
+/// spaceport's.
 ///
 /// Recording is an upsert on the slug, so connecting an app that is already
 /// connected replaces its secrets rather than refusing. That is the supported
 /// way to rotate one: generate a new secret on GitHub, run the same command
 /// again, and the next request uses the new value.
+///
+/// Nothing is written unless GitHub answers `/app` with the app these
+/// credentials belong to. A connection that is recorded and does not work is
+/// worse than none at all: it looks connected in every listing, and the first
+/// sign that it is not is a reconciliation pass failing hours later.
 pub async fn connect(
     repository: &ConnectionRepository,
+    transport: Arc<dyn Transport>,
     registration: Registration,
 ) -> Result<Connection> {
     registration.validate()?;
@@ -126,6 +144,59 @@ pub async fn connect(
         connected_at: String::new(),
     };
 
+    let confirmed = Client::new(&connection, transport)?
+        .app()
+        .await
+        .context("the credentials for this app were not accepted")?;
+
+    // GitHub answers `/app` for whichever app signed the request, so an id that
+    // disagrees means the key and the id in this registration belong to two
+    // different apps — which no amount of reconciliation would ever untangle.
+    if confirmed.id != connection.app_id {
+        bail!(
+            "the private key belongs to github app {}, and the app id given is {} — the key and the `App ID` were taken from two different apps' settings pages",
+            confirmed.id,
+            connection.app_id
+        );
+    }
+
+    // The slug, the display name and the owner are all things an operator read
+    // off a page and typed back, and GitHub is the only authority on all three.
+    // Refusing over one would be refusing a registration whose secrets are
+    // every one of them correct because a word is misspelled, so the spelling
+    // is corrected instead — and said out loud, because the corrected slug is
+    // what every later command has to be given.
+    //
+    // The secrets are never second-guessed this way. GitHub does not say what
+    // they are, and a client secret that is wrong is wrong.
+    let mistyped: Vec<&str> = [
+        ("slug", &connection.slug, &confirmed.slug),
+        ("name", &connection.name, &confirmed.name),
+        ("owner", &connection.owner, &confirmed.owner),
+    ]
+    .into_iter()
+    .filter(|(_, typed, confirmed)| typed != confirmed)
+    .map(|(field, _, _)| field)
+    .collect();
+
+    let connection = if mistyped.is_empty() {
+        connection
+    } else {
+        info!(
+            fields = mistyped.join(", "),
+            typed = %connection.slug,
+            corrected = %confirmed.slug,
+            "github spells this app differently, and github's spelling is the one that counts",
+        );
+
+        Connection {
+            slug: confirmed.slug,
+            name: confirmed.name,
+            owner: confirmed.owner,
+            ..connection
+        }
+    };
+
     repository.record(&connection).await?;
 
     info!(
@@ -141,17 +212,34 @@ pub async fn connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connections::github::api::testing::FakeGitHub;
     use crate::connections::github::key::testing;
     use crate::state::Db;
+    use http::StatusCode;
 
     fn repository() -> ConnectionRepository {
         ConnectionRepository::new(Db::in_memory().unwrap())
     }
 
+    /// A GitHub that answers as the app [`registration`] describes.
+    fn github() -> Arc<FakeGitHub> {
+        FakeGitHub::new()
+    }
+
+    /// `connect` against a GitHub that agrees with the registration, which is
+    /// the case every test that is not about verification wants.
+    async fn connect_to(
+        repository: &ConnectionRepository,
+        registration: Registration,
+    ) -> Result<Connection> {
+        connect(repository, github(), registration).await
+    }
+
     fn registration() -> Registration {
         Registration {
+            // The fixture GitHub answers as app 42, `spaceport-for-acme`.
             slug: "spaceport-for-acme".to_owned(),
-            app_id: 1_234_567,
+            app_id: 42,
             name: "Spaceport for Acme".to_owned(),
             owner: "an-organisation".to_owned(),
             client_id: "Iv1.0123456789abcdef".to_owned(),
@@ -174,7 +262,7 @@ mod tests {
     async fn records_a_registration_and_reads_it_back() {
         let repository = repository();
 
-        let connected = connect(&repository, registration()).await.unwrap();
+        let connected = connect_to(&repository, registration()).await.unwrap();
 
         assert_eq!(connected.slug, "spaceport-for-acme");
         let read = repository
@@ -182,7 +270,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(read.app_id, 1_234_567);
+        assert_eq!(read.app_id, 42);
         assert_eq!(read.owner, "an-organisation");
         assert_eq!(read.client_secret, Secret::new("a-client-secret"));
         assert!(read.connected_at.ends_with('Z'), "{read:?}");
@@ -193,9 +281,9 @@ mod tests {
     #[tokio::test]
     async fn re_connecting_the_same_slug_replaces_the_secrets() {
         let repository = repository();
-        connect(&repository, registration()).await.unwrap();
+        connect_to(&repository, registration()).await.unwrap();
 
-        connect(
+        connect_to(
             &repository,
             Registration {
                 webhook_secret: Secret::new("a-rotated-webhook-secret"),
@@ -221,7 +309,7 @@ mod tests {
     async fn a_refused_registration_records_nothing() {
         let repository = repository();
 
-        let result = connect(
+        let result = connect_to(
             &repository,
             Registration {
                 private_key: Secret::new("hunter2"),
@@ -231,6 +319,123 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+        assert!(repository.all().await.unwrap().is_empty());
+    }
+
+    /// The whole reason registering costs a round trip: nothing is written
+    /// down until GitHub has answered as the app these credentials belong to.
+    #[tokio::test]
+    async fn asks_github_who_the_app_is_before_recording_it() {
+        let repository = repository();
+        let github = github();
+
+        connect(&repository, github.clone(), registration())
+            .await
+            .unwrap();
+
+        let paths: Vec<String> = github
+            .requests()
+            .into_iter()
+            .map(|request| request.path)
+            .collect();
+        assert_eq!(paths, ["/app"]);
+    }
+
+    /// An app id with two digits transposed passes every local check there is,
+    /// and used to be recorded as happily as a correct one.
+    #[tokio::test]
+    async fn a_credential_github_rejects_records_nothing() {
+        let repository = repository();
+        let github = github();
+        github.refuse_with(StatusCode::UNAUTHORIZED, "Bad credentials");
+
+        let error = format!(
+            "{:#}",
+            connect(&repository, github, registration())
+                .await
+                .unwrap_err()
+        );
+
+        assert!(error.contains("not accepted"), "{error}");
+        assert!(
+            error.contains("does not accept this app's credentials"),
+            "{error}"
+        );
+        assert!(repository.all().await.unwrap().is_empty());
+    }
+
+    /// A slug is a word an operator read off a page and typed back, so getting
+    /// it wrong is a spelling mistake rather than a wrong credential — and
+    /// GitHub is the authority on the spelling.
+    #[tokio::test]
+    async fn a_mistyped_slug_is_corrected_to_the_one_github_uses() {
+        let repository = repository();
+
+        let connected = connect_to(
+            &repository,
+            Registration {
+                slug: "spaceport-for-acmee".to_owned(),
+                ..registration()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(connected.slug, "spaceport-for-acme");
+        assert!(
+            repository
+                .by_slug("spaceport-for-acmee")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repository
+                .by_slug("spaceport-for-acme")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// The display name and the owner are read off the same page as the slug
+    /// and mistyped the same way, and GitHub answers for all three — so a
+    /// listing shows what GitHub shows rather than what was typed.
+    #[tokio::test]
+    async fn a_mistyped_name_and_owner_are_corrected_too() {
+        let repository = repository();
+
+        let connected = connect_to(
+            &repository,
+            Registration {
+                name: "Spaceport for Acmee".to_owned(),
+                owner: "an-organistion".to_owned(),
+                ..registration()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(connected.name, "Spaceport for Acme");
+        assert_eq!(connected.owner, "an-organisation");
+    }
+
+    /// A key from one app's settings page and an id from another's: both are
+    /// real, and together they are a connection that could never work.
+    #[tokio::test]
+    async fn refuses_a_key_and_an_app_id_that_belong_to_different_apps() {
+        let repository = repository();
+        let github = github();
+        github.app_is(43, "some-other-app", "Some Other App", "an-organisation");
+
+        let error = format!(
+            "{:#}",
+            connect(&repository, github, registration())
+                .await
+                .unwrap_err()
+        );
+
+        assert!(error.contains("belongs to github app 43"), "{error}");
         assert!(repository.all().await.unwrap().is_empty());
     }
 

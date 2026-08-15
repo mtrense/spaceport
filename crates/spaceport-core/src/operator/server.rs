@@ -28,7 +28,7 @@ use tracing::{info, warn};
 use super::OperatorEndpoint;
 use crate::app::apply::{Applied, Applier, ApplyError, DestroyError, ResumeError, SuspendError};
 use crate::app::{App, AppId, AppManifest, AppRepository, DataDir, Pattern, health};
-use crate::connections::github::{ConnectionRepository, Registration, register};
+use crate::connections::github::{ConnectionRepository, Registration, Transport, register};
 use crate::events::{Event, EventBus, EventFilter, Level};
 use crate::runtime::Adopted;
 use crate::status::Instance;
@@ -162,6 +162,12 @@ impl FromRef<Operator> for Arc<Instance> {
 impl FromRef<Operator> for Arc<ConnectionRepository> {
     fn from_ref(operator: &Operator) -> Self {
         operator.instance.connections.clone()
+    }
+}
+
+impl FromRef<Operator> for Arc<dyn Transport> {
+    fn from_ref(operator: &Operator) -> Self {
+        operator.instance.github.clone()
     }
 }
 
@@ -916,8 +922,13 @@ const INSTALL_URL: &str = "https://github.com/apps";
 /// The body is JSON rather than a manifest because it is a handful of fields an
 /// operator typed, three of which are secrets — and nothing about them wants to
 /// go through a file on disk.
+///
+/// The transport comes along because connecting asks GitHub to confirm the
+/// credentials before anything is written down, and the answer to that is what
+/// the operator is really waiting for.
 async fn connect_github(
     State(connections): State<Arc<ConnectionRepository>>,
+    State(github): State<Arc<dyn Transport>>,
     body: String,
 ) -> Response {
     let registration: Registration = match serde_json::from_str(&body) {
@@ -930,7 +941,7 @@ async fn connect_github(
         }
     };
 
-    match register::connect(&connections, registration).await {
+    match register::connect(&connections, github, registration).await {
         Ok(connection) => {
             let body = format!(
                 "connected `{}` as github app {}, owned by {}\n  install it on an account at {INSTALL_URL}/{}/installations/new\n",
@@ -939,8 +950,11 @@ async fn connect_github(
 
             (StatusCode::OK, body).into_response()
         }
-        // Everything `connect` refuses is something about the registration, and
-        // the message says which part of it.
+        // Almost everything `connect` refuses is something about the
+        // registration, and the message says which part of it. The exception is
+        // GitHub having a bad minute, which the message says too — and which is
+        // still an operator retrying the same command, so it is not worth a
+        // second status code to tell them apart.
         Err(error) => refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
     }
 }
@@ -1091,6 +1105,7 @@ fn refuse(status: StatusCode, message: &str) -> Response {
 mod tests {
     use super::*;
     use crate::app::{App, AppRepository, AppStore};
+    use crate::connections::github::api::testing::FakeGitHub;
     use crate::events::Level;
     use crate::runtime::{Container, ContainerId, ContainerRuntime, Managed};
     use crate::state::Db;
@@ -1180,13 +1195,21 @@ container:
     }
 
     fn router_and_events() -> (Router, Arc<EventBus>) {
-        let (_, router, events, _) = parts_on(OneContainer::default());
+        let (_, router, events, _, _) = parts_on(OneContainer::default());
 
         (router, events)
     }
 
+    /// A router and the GitHub behind it, for the connection tests — which are
+    /// the only ones that care what GitHub answers.
+    fn router_and_github() -> (Router, Arc<FakeGitHub>) {
+        let (_, router, _, _, github) = parts_on(OneContainer::default());
+
+        (router, github)
+    }
+
     fn store_router_and_events_on(runtime: OneContainer) -> (Arc<AppStore>, Router, Arc<EventBus>) {
-        let (store, router, events, _) = parts_on(runtime);
+        let (store, router, events, _, _) = parts_on(runtime);
 
         (store, router, events)
     }
@@ -1194,7 +1217,13 @@ container:
     /// Everything a test might want a hand on, shutdown token included.
     fn parts_on(
         runtime: OneContainer,
-    ) -> (Arc<AppStore>, Router, Arc<EventBus>, CancellationToken) {
+    ) -> (
+        Arc<AppStore>,
+        Router,
+        Arc<EventBus>,
+        CancellationToken,
+        Arc<FakeGitHub>,
+    ) {
         let store = Arc::new(AppStore::new());
         let db = Db::in_memory().unwrap();
         let applier = Arc::new(Applier::new(
@@ -1204,6 +1233,21 @@ container:
         ));
         let events = Arc::new(EventBus::new());
         let shutdown = CancellationToken::new();
+        let github = FakeGitHub::new();
+        // The two apps the connection tests register, so that `/app` can answer
+        // as whichever of them signed.
+        github.app_is(
+            42,
+            "spaceport-acme",
+            "Spaceport for Acme",
+            "an-organisation",
+        );
+        github.also_hosts(
+            43,
+            "spaceport-other",
+            "Spaceport for Acme",
+            "an-organisation",
+        );
 
         let instance = Arc::new(Instance {
             version: "9.9.9".to_owned(),
@@ -1213,6 +1257,7 @@ container:
             operator: "/run/spaceport.sock".parse().unwrap(),
             applier,
             connections: Arc::new(ConnectionRepository::new(db.clone())),
+            github: github.clone(),
             db,
             certificates: None,
             reconciled: crate::app::reconcile::Report::default(),
@@ -1223,6 +1268,7 @@ container:
             router(instance, events.clone(), shutdown.clone()),
             events,
             shutdown,
+            github,
         )
     }
 
@@ -1898,7 +1944,7 @@ container:
     /// for as long as anyone was watching it.
     #[tokio::test]
     async fn a_watcher_is_let_go_when_spaceport_shuts_down() {
-        let (_, router, _, shutdown) = parts_on(OneContainer::default());
+        let (_, router, _, shutdown, _) = parts_on(OneContainer::default());
         let mut stream = watch(&router, "").await;
 
         shutdown.cancel();
@@ -2004,6 +2050,60 @@ container:
             body.contains("https://github.com/apps/spaceport-acme/installations/new"),
             "{body}"
         );
+    }
+
+    /// Connecting is the one operator command that goes out to the internet,
+    /// and it goes out before anything is written down.
+    #[tokio::test]
+    async fn connecting_asks_github_to_confirm_the_credentials_first() {
+        let (router, github) = router_and_github();
+
+        post_connection(&router, registration("spaceport-acme", 42)).await;
+
+        let paths: Vec<String> = github
+            .requests()
+            .into_iter()
+            .map(|request| request.path)
+            .collect();
+        assert_eq!(paths, ["/app"]);
+    }
+
+    /// A connection that is recorded and does not work looks connected in
+    /// every listing, and the first sign that it is not comes hours later.
+    #[tokio::test]
+    async fn a_registration_github_rejects_is_not_recorded() {
+        let (router, github) = router_and_github();
+        github.refuse_with(StatusCode::UNAUTHORIZED, "Bad credentials");
+
+        let (status, body) = post_connection(&router, registration("spaceport-acme", 42)).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.contains("does not accept this app's credentials"),
+            "{body}"
+        );
+        let (_, listing) = get_connections(&router, "").await;
+        assert!(
+            listing.contains("no github apps are connected"),
+            "{listing}"
+        );
+    }
+
+    /// GitHub is the authority on how its own slug is spelled, and the
+    /// corrected one is what every later command has to be given — so the
+    /// response has to say it.
+    #[tokio::test]
+    async fn a_mistyped_slug_is_recorded_as_the_one_github_uses() {
+        let (router, _) = router_and_github();
+
+        let (status, body) = post_connection(&router, registration("spaceport-acmee", 42)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("connected `spaceport-acme`"), "{body}");
+        let (found, _) = get_connections(&router, "/spaceport-acme").await;
+        assert_eq!(found, StatusCode::OK);
+        let (missing, _) = get_connections(&router, "/spaceport-acmee").await;
+        assert_eq!(missing, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

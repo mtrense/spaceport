@@ -13,7 +13,7 @@ use spaceport_core::app::{
     AppId, AppRepository, AppStore, Applier, DataDir, Pattern, reconcile, supervise,
 };
 use spaceport_core::config::TlsProvider;
-use spaceport_core::connections::github::ConnectionRepository;
+use spaceport_core::connections::github::{self, ConnectionRepository};
 use spaceport_core::events::{self, Category, Event, EventBus, Level};
 use spaceport_core::operator::client::Watch;
 use spaceport_core::operator::{DEFAULT_OPERATOR_ENDPOINT, client, server};
@@ -536,6 +536,10 @@ async fn run(args: RunArgs) -> Result<()> {
 
     // Without `--operator` there is no way to tell spaceport what to run, which
     // is a legitimate way to start it: the edge still serves, and still says so.
+    // One for the whole process, so every command that asks GitHub something
+    // reuses the same TLS connections rather than handshaking per request.
+    let github = Arc::new(github::Network::new()?);
+
     let operator = args.operator.map(|endpoint| {
         // Everything a status report is made of, gathered while the things it
         // is made of are still in scope.
@@ -547,6 +551,7 @@ async fn run(args: RunArgs) -> Result<()> {
             operator: endpoint.clone(),
             applier,
             connections: Arc::new(ConnectionRepository::new(db.clone())),
+            github,
             db,
             certificates: certificates.clone(),
             reconciled: report,

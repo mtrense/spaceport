@@ -11,14 +11,18 @@
 //! What lives here for now is the persistence — the connection an operator
 //! registered, the installations reconciliation has discovered, and the recent
 //! webhook deliveries that let a redelivery be recognised as one — together
-//! with registering an App an operator created by hand and reading the key it
-//! signs with. Minting installation tokens, verifying signatures and serving
-//! the webhook route are each their own module, and each arrives with the step
-//! that needs it.
+//! with registering an App an operator created by hand, reading the key it
+//! signs with, and the client that asks GitHub what the App is and mints the
+//! tokens that act as its installations. Verifying webhook signatures and
+//! serving the webhook route are each their own module, and each arrives with
+//! the step that needs it.
 
+pub mod api;
+pub mod jwt;
 pub mod key;
 pub mod register;
 pub mod repository;
 
+pub use api::{Client, Network, Transport};
 pub use register::{Registration, connect};
 pub use repository::{Connection, ConnectionRepository, Installation};

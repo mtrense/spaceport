@@ -24,7 +24,7 @@ use crate::acme::{CertificateRepository, Certificates};
 use crate::app::reconcile::Report;
 use crate::app::{AppId, Applier, health};
 use crate::config::{Config, TlsProvider};
-use crate::connections::github::ConnectionRepository;
+use crate::connections::github::{self, ConnectionRepository};
 use crate::operator::OperatorEndpoint;
 use crate::state::Db;
 
@@ -51,6 +51,10 @@ pub struct Instance {
     /// rather than made on demand so that every handler which needs one gets
     /// the same one, over the same database.
     pub connections: Arc<ConnectionRepository>,
+    /// How anything that has to ask GitHub something reaches it. One for the
+    /// whole process, so every connection shares the connection pool rather
+    /// than opening a TLS session per operator command.
+    pub github: Arc<dyn github::Transport>,
     /// Absent when tls is self-signed: then nothing ever orders a certificate.
     pub certificates: Option<Arc<Certificates>>,
     /// What the reconciliation at startup did. Kept because it is the only
@@ -513,6 +517,7 @@ container:
             operator: "/run/spaceport.sock".parse().unwrap(),
             applier,
             connections: Arc::new(ConnectionRepository::new(db.clone())),
+            github: github::api::testing::FakeGitHub::new(),
             db,
             certificates: None,
             reconciled,
@@ -641,8 +646,10 @@ container:
 
         crate::connections::github::connect(
             &instance.connections,
+            instance.github.clone(),
             serde_json::from_value(serde_json::json!({
-                "slug": "spaceport-acme",
+                // The slug and id the fixture github answers as.
+                "slug": "spaceport-for-acme",
                 "app_id": 42,
                 "name": "Spaceport for Acme",
                 "owner": "an-organisation",

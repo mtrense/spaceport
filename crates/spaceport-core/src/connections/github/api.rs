@@ -1,0 +1,946 @@
+//! Asking GitHub things, as the App an operator connected.
+//!
+//! This is the only file in spaceport that makes an outbound request to
+//! something that is not on this host. What it offers is the four questions a
+//! connection is actually for: what does GitHub say this App is, where has it
+//! been installed, what can each installation see, and — the one everything
+//! else is built on — a token that acts as an installation for the next hour.
+//!
+//! Every one of those goes through [`Transport`], which exists so the tests can
+//! answer in-process. That seam is the same shape as the ACME one: a trait with
+//! a single method, a real implementation that owns a connection pool, and a
+//! fake that records what it was asked. Without it the only way to test the
+//! error sentences an operator reads would be to make GitHub produce them.
+//!
+//! What this deliberately does not do is persist. An installation token lasts
+//! an hour and can always be minted again from the private key, so writing one
+//! to the state database would be storing a credential in order to save a
+//! single request. The cache lives in the client, the client lives as long as
+//! the piece of work that made it, and both go away together.
+//!
+//! Nor does it retry, rate-limit itself, or hold a registry of clients. A
+//! caller that gets "worth trying again" is a caller with a reconciliation loop
+//! that will come round anyway, and inventing a backoff here would be inventing
+//! a second schedule that disagrees with that one.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
+use bytes::Bytes;
+use http::{HeaderName, Method, Request, Response, StatusCode, header};
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use time::format_description::well_known::Rfc3339;
+use time::{Duration, OffsetDateTime};
+
+use super::jwt;
+use super::key;
+use super::repository::Connection;
+use crate::connections::Secret;
+
+/// Where GitHub's REST API lives.
+///
+/// The public one, and only the public one: GitHub Enterprise Server answers on
+/// an operator's own host under a different path, and supporting it is a field
+/// on the connection and a migration, not a constant. Written out rather than
+/// configurable so that nothing can point spaceport's credentials at another
+/// host by editing a config file.
+const API: &str = "https://api.github.com";
+
+/// The media type that selects GitHub's current REST responses.
+///
+/// GitHub's rule, not a choice: `application/json` still works but is
+/// documented as the older behaviour, and the `+json` form is what every
+/// current endpoint is specified against.
+const ACCEPT: &str = "application/vnd.github+json";
+
+/// The header naming which dated version of the API to answer with.
+const API_VERSION_HEADER: HeaderName = HeaderName::from_static("x-github-api-version");
+
+/// The dated API version spaceport is written against.
+///
+/// Pinned rather than omitted on purpose. Leaving it out means GitHub picks,
+/// and GitHub picking means a breaking change to a response arrives on a day
+/// nobody deployed anything. This value moves when somebody has read the
+/// changelog for the version they are moving to.
+const API_VERSION: &str = "2022-11-28";
+
+/// What spaceport calls itself to GitHub.
+///
+/// GitHub requires a user agent and refuses requests without one. The version
+/// is in it because the first question about a misbehaving client is which one
+/// it is.
+const USER_AGENT: &str = concat!("spaceport/", env!("CARGO_PKG_VERSION"));
+
+/// How many items to ask for per page.
+///
+/// GitHub's maximum, so this is the fewest round trips a listing can take. A
+/// smaller page would only mean more requests against the same rate limit.
+const PER_PAGE: usize = 100;
+
+/// How many pages a listing may run to before spaceport gives up on it.
+///
+/// At [`PER_PAGE`] this is fifty thousand repositories under one App, which is
+/// past anything an operator is running a spaceport for. The cap is not really
+/// about size, though: a `Link` header that points at the page it came from is
+/// a loop, and a loop inside a reconciliation pass is a spaceport that never
+/// reconciles anything again. Failing loudly at some number beats that.
+const PAGE_LIMIT: usize = 500;
+
+/// How long before a token expires to mint a new one instead of reusing it.
+///
+/// Two reasons, and the same five minutes covers both. A request that starts
+/// just before expiry may well arrive after it, and GitHub's clock is not this
+/// host's — so a token that looks good for another thirty seconds here may be
+/// already dead there. An hour's token spent five minutes early costs nothing.
+const REFRESH_BEFORE: Duration = Duration::minutes(5);
+
+/// How much of an unrecognised error body to put in the message.
+///
+/// Enough for GitHub's `message` field, which is the part worth reading, and
+/// not enough for an HTML error page. A whole body in a log line is a denial of
+/// service on whoever has to read the log.
+const BODY_LIMIT: usize = 400;
+
+/// How spaceport reaches GitHub.
+///
+/// One method, because one method is all the API needs: every call is a request
+/// with no body or an empty one, and a response small enough to hold whole.
+/// Streaming would matter for downloading a tarball, and downloading a tarball
+/// is not something this module does.
+#[async_trait]
+pub trait Transport: Send + Sync {
+    async fn send(&self, request: Request<Bytes>) -> Result<Response<Bytes>>;
+}
+
+/// The transport that actually goes out to the internet.
+///
+/// This is the first outbound HTTPS spaceport has ever made — the edge
+/// *terminates* TLS and the proxy speaks plaintext to containers on loopback,
+/// so until GitHub there was nothing on the other side of this host to talk to.
+/// The trust anchors are the host's own, because the host already maintains a
+/// set and a second one compiled into spaceport could only ever disagree with
+/// it: an operator behind a corporate root, or one whose distribution has
+/// distrusted a CA this morning, is right and spaceport would be wrong.
+///
+/// Held so the connection pool is reused. A reconciliation pass makes one call
+/// per installation and a fresh TLS handshake for each of them is a handshake
+/// spent on nothing.
+pub struct Network {
+    client: hyper_util::client::legacy::Client<
+        hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+        http_body_util::Full<Bytes>,
+    >,
+}
+
+impl Network {
+    pub fn new() -> Result<Self> {
+        // rustls needs a process-wide crypto provider, and a spaceport that
+        // serves TLS has already installed one. Losing that race is not an
+        // error: both calls install the same provider.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .context(
+                "reading this host's certificate authorities, which github is verified against",
+            )?
+            // Plaintext to api.github.com is a request that has handed the
+            // App's credentials to whoever answered.
+            .https_only()
+            .enable_http1()
+            .enable_http2()
+            .build();
+
+        Ok(Self {
+            client: hyper_util::client::legacy::Client::builder(
+                hyper_util::rt::TokioExecutor::new(),
+            )
+            .build(connector),
+        })
+    }
+}
+
+#[async_trait]
+impl Transport for Network {
+    /// One request, one response, and no redirect ever followed.
+    ///
+    /// hyper's client does not follow redirects and nothing here adds it.
+    /// GitHub's API does not redirect any of the calls made from this module,
+    /// and a client that quietly follows one is a client that can be pointed
+    /// somewhere else — by anybody who can answer as `api.github.com` for one
+    /// response, with the App's credentials replayed to wherever they said.
+    async fn send(&self, request: Request<Bytes>) -> Result<Response<Bytes>> {
+        use http_body_util::BodyExt;
+
+        let (parts, body) = request.into_parts();
+        let request = Request::from_parts(parts, http_body_util::Full::new(body));
+
+        let response = self
+            .client
+            .request(request)
+            .await
+            .context("github could not be reached")?;
+
+        let (parts, body) = response.into_parts();
+        let body = body
+            .collect()
+            .await
+            .context("reading github's answer")?
+            .to_bytes();
+
+        Ok(Response::from_parts(parts, body))
+    }
+}
+
+/// What GitHub says the App is.
+///
+/// `owner` is flattened out of the response's `owner.login`, because the only
+/// thing spaceport wants from that object is the name an operator would
+/// recognise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppRecord {
+    pub id: i64,
+    pub slug: String,
+    pub name: String,
+    pub owner: String,
+}
+
+/// One place the App is installed, as GitHub reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallationRecord {
+    pub id: i64,
+    /// The user or organisation that installed the App.
+    pub account: String,
+    /// `User` or `Organization`, in GitHub's own spelling — see
+    /// [`super::Installation`] for why it is not an enum.
+    pub account_type: String,
+}
+
+/// The wire shapes GitHub answers with.
+///
+/// None of these carries `deny_unknown_fields`, which is the deliberate
+/// opposite of the rule the config and registration structs follow. There, an
+/// unknown field is an operator's typo and a secret that silently did not
+/// arrive. Here it is GitHub shipping something on a Tuesday, and a spaceport
+/// that refused to parse a response because it grew a field would stop
+/// reconciling for a reason that has nothing to do with this host.
+mod wire {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    pub(super) struct App {
+        pub(super) id: i64,
+        pub(super) slug: String,
+        pub(super) name: String,
+        pub(super) owner: Account,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct Account {
+        pub(super) login: String,
+        #[serde(rename = "type")]
+        pub(super) account_type: String,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct Installation {
+        pub(super) id: i64,
+        pub(super) account: Account,
+    }
+
+    /// `GET /installation/repositories` wraps its page in an object, unlike
+    /// every other listing here, which is why it needs a type of its own.
+    #[derive(Deserialize)]
+    pub(super) struct RepositoryPage {
+        pub(super) repositories: Vec<Repository>,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct Repository {
+        pub(super) full_name: String,
+    }
+}
+
+/// A freshly minted installation token, and when it stops working.
+#[derive(Deserialize)]
+struct MintedToken {
+    token: Secret,
+    /// RFC 3339, and GitHub's word on the matter — never computed from this
+    /// host's clock plus an hour.
+    expires_at: String,
+}
+
+/// How a request says who is making it.
+///
+/// The two levels of a GitHub App's authentication, and the distinction matters
+/// at every call site: the App itself may read `/app` and mint tokens and
+/// nothing else, and an installation may read the repositories it was granted
+/// and knows nothing about the App. Presenting the wrong one is a `403` with a
+/// message about permissions, which is a confusing thing to read.
+enum Credential {
+    /// A JWT the App signed, presented as `Bearer`.
+    App(String),
+    /// A token GitHub minted for one installation, presented as `token`.
+    Installation(Secret),
+}
+
+impl Credential {
+    fn header(&self) -> String {
+        match self {
+            Self::App(token) => format!("Bearer {token}"),
+            Self::Installation(token) => format!("token {}", token.expose()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for Credential {
+    /// Only ever formatted by the test that proves a credential cannot give
+    /// its token away — the production paths never print one at all.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::App(_) => f.write_str("Credential::App(…)"),
+            Self::Installation(token) => write!(f, "Credential::Installation({token:?})"),
+        }
+    }
+}
+
+/// A conversation with GitHub as one connected App.
+///
+/// Made for a piece of work — a registration, a reconciliation pass — and
+/// dropped when it is done. There is deliberately no registry of clients kept
+/// across requests: the only thing a shared one would save is the token
+/// minting, and with reconciliation an hour apart and tokens good for an hour,
+/// that is one request per installation per hour. A cache with a lifetime, an
+/// eviction rule and a lock that outlives every caller does not pay for that.
+pub struct Client {
+    app_id: i64,
+    /// Parsed once here rather than at every signature, so a connection holding
+    /// a key that cannot sign fails when the client is made rather than in the
+    /// middle of a pass.
+    key: ring::signature::RsaKeyPair,
+    transport: Arc<dyn Transport>,
+    /// Installation tokens, by installation id, with the moment GitHub said
+    /// each stops working.
+    tokens: Mutex<HashMap<i64, (Secret, OffsetDateTime)>>,
+}
+
+impl Client {
+    pub fn new(connection: &Connection, transport: Arc<dyn Transport>) -> Result<Self> {
+        Ok(Self {
+            app_id: connection.app_id,
+            key: key::parse(connection.private_key.expose())
+                .with_context(|| format!("the private key of `{}`", connection.slug))?,
+            transport,
+            tokens: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// What GitHub says this App is.
+    ///
+    /// The cheapest question there is, and the one that answers "are these
+    /// credentials real": nothing but the App's own key gets an answer.
+    pub async fn app(&self) -> Result<AppRecord> {
+        let app: wire::App = self
+            .fetch("/app", &self.app_credential()?, "app with that id")
+            .await?;
+
+        Ok(AppRecord {
+            id: app.id,
+            slug: app.slug,
+            name: app.name,
+            owner: app.owner.login,
+        })
+    }
+
+    /// Every account this App has been installed on.
+    pub async fn installations(&self) -> Result<Vec<InstallationRecord>> {
+        let pages: Vec<Vec<wire::Installation>> = self
+            .paginate(
+                "/app/installations",
+                &self.app_credential()?,
+                "installations of that app",
+            )
+            .await?;
+
+        Ok(pages
+            .into_iter()
+            .flatten()
+            .map(|installation| InstallationRecord {
+                id: installation.id,
+                account: installation.account.login,
+                account_type: installation.account.account_type,
+            })
+            .collect())
+    }
+
+    /// The repositories an installation grants, as `owner/name`.
+    ///
+    /// Asked as the installation rather than as the App: the App may know that
+    /// an installation exists, and only the installation may see what is in it.
+    pub async fn repositories(&self, installation_id: i64) -> Result<Vec<String>> {
+        let token = self.installation_token(installation_id).await?;
+        let pages: Vec<wire::RepositoryPage> = self
+            .paginate(
+                "/installation/repositories",
+                &Credential::Installation(token),
+                &format!("repositories of installation {installation_id}"),
+            )
+            .await?;
+
+        Ok(pages
+            .into_iter()
+            .flat_map(|page| page.repositories)
+            .map(|repository| repository.full_name)
+            .collect())
+    }
+
+    /// A token that acts as installation `installation_id`, minting one only if
+    /// the one in hand is not good for long enough.
+    pub async fn installation_token(&self, installation_id: i64) -> Result<Secret> {
+        let now = OffsetDateTime::now_utc();
+        if let Some(token) = self.cached(installation_id, now) {
+            return Ok(token);
+        }
+
+        let minted: MintedToken = self
+            .call(
+                Method::POST,
+                &format!("{API}/app/installations/{installation_id}/access_tokens"),
+                Some(&self.app_credential()?),
+                &format!("installation {installation_id}"),
+            )
+            .await?;
+        let expires_at = OffsetDateTime::parse(&minted.expires_at, &Rfc3339).with_context(|| {
+            format!(
+                "github said installation {installation_id}'s token expires at `{}`, which is not a timestamp",
+                minted.expires_at
+            )
+        })?;
+
+        self.tokens
+            .lock()
+            .expect("the token cache is never held across a panic")
+            .insert(installation_id, (minted.token.clone(), expires_at));
+
+        Ok(minted.token)
+    }
+
+    /// The token in hand for `installation_id`, if it has more than
+    /// [`REFRESH_BEFORE`] left on it.
+    fn cached(&self, installation_id: i64, now: OffsetDateTime) -> Option<Secret> {
+        let tokens = self
+            .tokens
+            .lock()
+            .expect("the token cache is never held across a panic");
+        let (token, expires_at) = tokens.get(&installation_id)?;
+
+        (*expires_at - now > REFRESH_BEFORE).then(|| token.clone())
+    }
+
+    /// A JWT signed as this App, good for the next few minutes.
+    fn app_credential(&self) -> Result<Credential> {
+        jwt::app_jwt(self.app_id, &self.key, OffsetDateTime::now_utc()).map(Credential::App)
+    }
+
+    /// One `GET` under [`API`], decoded.
+    async fn fetch<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        credential: &Credential,
+        what: &str,
+    ) -> Result<T> {
+        self.call(Method::GET, &format!("{API}{path}"), Some(credential), what)
+            .await
+    }
+
+    /// Every page of a listing, in order, each decoded whole.
+    ///
+    /// Pages come back as themselves rather than flattened because GitHub does
+    /// not agree with itself about what a page is: a listing is usually a bare
+    /// array and sometimes an object with the array inside it. Deciding which
+    /// belongs to the caller who knows the endpoint.
+    async fn paginate<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        credential: &Credential,
+        what: &str,
+    ) -> Result<Vec<T>> {
+        let mut url = format!("{API}{path}?per_page={PER_PAGE}");
+        let mut pages = Vec::new();
+
+        loop {
+            let response = self
+                .send(Method::GET, &url, Some(credential))
+                .await
+                .with_context(|| format!("asking github for the {what}"))?;
+            let next = next_page(&response);
+            pages.push(decode(&response, what)?);
+
+            let Some(next) = next else {
+                return Ok(pages);
+            };
+            if pages.len() >= PAGE_LIMIT {
+                bail!(
+                    "github is still offering more pages of the {what} after {PAGE_LIMIT} of them, which is more than spaceport will follow — this is either an implausible number of them or a `link` header that points at itself"
+                );
+            }
+
+            url = next;
+        }
+    }
+
+    /// One request, decoded, with the status turned into a sentence first.
+    async fn call<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        url: &str,
+        credential: Option<&Credential>,
+        what: &str,
+    ) -> Result<T> {
+        let response = self
+            .send(method, url, credential)
+            .await
+            .with_context(|| format!("asking github about the {what}"))?;
+
+        decode(&response, what)
+    }
+
+    async fn send(
+        &self,
+        method: Method,
+        url: &str,
+        credential: Option<&Credential>,
+    ) -> Result<Response<Bytes>> {
+        request(self.transport.as_ref(), method, url, credential).await
+    }
+}
+
+/// One request to GitHub, with the headers every call carries.
+///
+/// A free function taking the transport rather than a method on [`Client`],
+/// because the calls that come before a connection exists — converting an App
+/// manifest into an App, which has no credentials and no private key to make
+/// one with — need the same headers and have no client to reach for.
+async fn request(
+    transport: &dyn Transport,
+    method: Method,
+    url: &str,
+    credential: Option<&Credential>,
+) -> Result<Response<Bytes>> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(url)
+        .header(header::ACCEPT, ACCEPT)
+        .header(API_VERSION_HEADER, API_VERSION)
+        .header(header::USER_AGENT, USER_AGENT);
+
+    if let Some(credential) = credential {
+        builder = builder.header(header::AUTHORIZATION, credential.header());
+    }
+
+    // Never a request body: every call here says everything it has to say in
+    // the method and the path.
+    let request = builder
+        .body(Bytes::new())
+        .with_context(|| format!("preparing a request to `{url}`"))?;
+
+    transport.send(request).await
+}
+
+/// Read a response as `T`, or say what GitHub answered instead.
+fn decode<T: DeserializeOwned>(response: &Response<Bytes>, what: &str) -> Result<T> {
+    if !response.status().is_success() {
+        return Err(refusal(response, what));
+    }
+
+    serde_json::from_slice(response.body()).with_context(|| {
+        format!("github's answer about the {what} is not what spaceport expected it to be")
+    })
+}
+
+/// What to tell an operator about a status GitHub answered with.
+///
+/// Every arm is a sentence about what went wrong and what to do next, because
+/// this is the text that ends up in the terminal of somebody who has just typed
+/// `spaceport connect github`.
+fn refusal(response: &Response<Bytes>, what: &str) -> anyhow::Error {
+    let status = response.status();
+
+    match status {
+        StatusCode::UNAUTHORIZED => anyhow!(
+            "github does not accept this app's credentials — the app id or the private key is wrong, so check the `App ID` on the app's settings page and generate a fresh key there"
+        ),
+        StatusCode::FORBIDDEN if exhausted(response) => anyhow!(
+            "github is rate limiting this app and is refusing requests until {} — nothing is wrong with the connection, and the next pass will pick up where this one stopped",
+            resets_at(response)
+        ),
+        StatusCode::NOT_FOUND => anyhow!(
+            "github knows no {what} — the app this connection names does not exist there, so check the `App ID` on the app's settings page"
+        ),
+        _ if status.is_server_error() => anyhow!(
+            "github answered {status} when asked about the {what}, which is github's own trouble rather than this spaceport's — it is worth trying again"
+        ),
+        _ => anyhow!(
+            "github answered {status} when asked about the {what}: {}",
+            truncated(response.body())
+        ),
+    }
+}
+
+/// Whether a `403` is the rate limiter rather than a permission.
+fn exhausted(response: &Response<Bytes>) -> bool {
+    response
+        .headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|remaining| remaining.trim() == "0")
+}
+
+/// When GitHub says the rate limit refills, in words.
+fn resets_at(response: &Response<Bytes>) -> String {
+    response
+        .headers()
+        .get("x-ratelimit-reset")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .and_then(|seconds| OffsetDateTime::from_unix_timestamp(seconds).ok())
+        .and_then(|moment| moment.format(&Rfc3339).ok())
+        // GitHub always sends the header; if it has not, saying so beats
+        // printing a moment nobody knows.
+        .unwrap_or_else(|| "some point it did not say".to_owned())
+}
+
+/// The beginning of a response body, as much of it as is worth reading.
+fn truncated(body: &Bytes) -> String {
+    let text = String::from_utf8_lossy(body);
+    let kept: String = text.chars().take(BODY_LIMIT).collect();
+
+    if kept.chars().count() < text.chars().count() {
+        format!("{kept}…")
+    } else {
+        kept
+    }
+}
+
+/// The url of the next page of a listing, if GitHub offered one.
+///
+/// GitHub paginates by `Link` header rather than by a page number spaceport
+/// counts up, and following the url it gives is the only way that stays correct
+/// when the collection changes underneath the walk.
+fn next_page(response: &Response<Bytes>) -> Option<String> {
+    let link = response.headers().get(header::LINK)?.to_str().ok()?;
+
+    link.split(',').find_map(|part| {
+        let (url, relation) = part.split_once('>')?;
+
+        relation
+            .contains(r#"rel="next""#)
+            .then(|| url.trim().trim_start_matches('<').to_owned())
+    })
+}
+
+/// A GitHub the whole crate's tests can answer with.
+///
+/// Not private to this module's tests, because everything above it — the
+/// registration flow, the operator handler that drives it — now has to hand a
+/// transport down, and a second fake for each of them would be a second set of
+/// canned responses to keep true to GitHub.
+#[cfg(test)]
+pub(crate) mod testing;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use testing::{Authorization, FakeGitHub};
+
+    /// A connection as one is read back out of the state store, with the
+    /// fixture key so the client can be built and can sign.
+    fn connection() -> Connection {
+        Connection {
+            slug: "spaceport-for-acme".to_owned(),
+            app_id: 42,
+            name: "Spaceport for Acme".to_owned(),
+            owner: "an-organisation".to_owned(),
+            client_id: "Iv1.0123456789abcdef".to_owned(),
+            client_secret: Secret::new("a-client-secret"),
+            webhook_secret: Secret::new("a-webhook-secret"),
+            private_key: Secret::new(key::testing::PKCS1),
+            connected_at: String::new(),
+        }
+    }
+
+    fn client(github: &Arc<FakeGitHub>) -> Client {
+        Client::new(&connection(), github.clone()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn reads_the_app_github_says_this_is() {
+        let github = FakeGitHub::new();
+
+        let app = client(&github).app().await.unwrap();
+
+        assert_eq!(
+            app,
+            AppRecord {
+                id: 42,
+                slug: "spaceport-for-acme".to_owned(),
+                name: "Spaceport for Acme".to_owned(),
+                owner: "an-organisation".to_owned(),
+            }
+        );
+    }
+
+    /// `/app` is about the App itself, so only the App's own signature opens
+    /// it — an installation token is refused there.
+    #[tokio::test]
+    async fn reads_the_app_with_the_signed_token_rather_than_an_installation_one() {
+        let github = FakeGitHub::new();
+
+        client(&github).app().await.unwrap();
+
+        let requests = github.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/app");
+        assert_eq!(requests[0].authorization, Authorization::Jwt);
+    }
+
+    #[tokio::test]
+    async fn lists_the_installations_across_every_page() {
+        let github = FakeGitHub::new();
+        github.installations_in_pages(&[&[(1, "alpha", "Organization")], &[(2, "beta", "User")]]);
+
+        let installations = client(&github).installations().await.unwrap();
+
+        assert_eq!(
+            installations,
+            [
+                InstallationRecord {
+                    id: 1,
+                    account: "alpha".to_owned(),
+                    account_type: "Organization".to_owned(),
+                },
+                InstallationRecord {
+                    id: 2,
+                    account: "beta".to_owned(),
+                    account_type: "User".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(github.requests().len(), 2);
+    }
+
+    /// The App may know an installation exists; only the installation may see
+    /// what is in it. Presenting the wrong credential here is a `403` about
+    /// permissions that reads like a misconfigured app.
+    #[tokio::test]
+    async fn reads_repositories_as_the_installation_and_not_as_the_app() {
+        let github = FakeGitHub::new();
+        github.repositories_in_pages(&[&["an-organisation/site"], &["an-organisation/api"]]);
+
+        let repositories = client(&github).repositories(7).await.unwrap();
+
+        assert_eq!(
+            repositories,
+            ["an-organisation/site", "an-organisation/api"]
+        );
+        let listings: Vec<Authorization> = github
+            .requests()
+            .into_iter()
+            .filter(|request| request.path == "/installation/repositories")
+            .map(|request| request.authorization)
+            .collect();
+        assert_eq!(listings, [Authorization::Token, Authorization::Token]);
+        // And the mint itself is the App speaking, since an installation
+        // cannot mint its own token.
+        assert_eq!(github.requests()[0].authorization, Authorization::Jwt);
+    }
+
+    #[tokio::test]
+    async fn mints_a_token_once_and_uses_it_again() {
+        let github = FakeGitHub::new();
+        let client = client(&github);
+
+        let first = client.installation_token(7).await.unwrap();
+        let second = client.installation_token(7).await.unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(github.minted(), 1);
+    }
+
+    #[tokio::test]
+    async fn mints_a_new_token_when_the_one_in_hand_has_expired() {
+        let github = FakeGitHub::new();
+        github.tokens_expiring_in(Duration::minutes(-1));
+        let client = client(&github);
+
+        client.installation_token(7).await.unwrap();
+        client.installation_token(7).await.unwrap();
+
+        assert_eq!(github.minted(), 2);
+    }
+
+    /// A token good for another two minutes is a token a request may well
+    /// outlive, so it is spent rather than used.
+    #[tokio::test]
+    async fn mints_a_new_token_when_the_one_in_hand_is_about_to_expire() {
+        let github = FakeGitHub::new();
+        github.tokens_expiring_in(REFRESH_BEFORE - Duration::minutes(3));
+        let client = client(&github);
+
+        client.installation_token(7).await.unwrap();
+        client.installation_token(7).await.unwrap();
+
+        assert_eq!(github.minted(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_separate_installation_gets_a_token_of_its_own() {
+        let github = FakeGitHub::new();
+        let client = client(&github);
+
+        let seven = client.installation_token(7).await.unwrap();
+        let eight = client.installation_token(8).await.unwrap();
+
+        assert_ne!(seven, eight);
+        assert_eq!(github.minted(), 2);
+    }
+
+    #[tokio::test]
+    async fn says_that_the_credentials_are_not_accepted() {
+        let github = FakeGitHub::new();
+        github.refuse_with(StatusCode::UNAUTHORIZED, "Bad credentials");
+
+        let error = format!("{:#}", client(&github).app().await.unwrap_err());
+
+        assert!(
+            error.contains("does not accept this app's credentials"),
+            "{error}"
+        );
+        assert!(error.contains("App ID"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn says_when_the_app_id_names_no_app() {
+        let github = FakeGitHub::new();
+        github.refuse_with(StatusCode::NOT_FOUND, "Not Found");
+
+        let error = format!("{:#}", client(&github).app().await.unwrap_err());
+
+        assert!(error.contains("knows no app with that id"), "{error}");
+    }
+
+    /// A `403` is a permission problem *unless* the rate limit headers say it
+    /// is not, and the two want quite different reactions.
+    #[tokio::test]
+    async fn says_when_the_rate_limit_is_spent_and_when_it_refills() {
+        let github = FakeGitHub::new();
+        github.refuse_with(StatusCode::FORBIDDEN, "API rate limit exceeded");
+        github.exhaust_the_rate_limit(1_800_000_000);
+
+        let error = format!("{:#}", client(&github).app().await.unwrap_err());
+
+        assert!(error.contains("rate limiting"), "{error}");
+        assert!(error.contains("2027-01-15"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn says_that_a_server_error_is_githubs_own_trouble() {
+        let github = FakeGitHub::new();
+        github.refuse_with(StatusCode::BAD_GATEWAY, "<html>");
+
+        let error = format!("{:#}", client(&github).app().await.unwrap_err());
+
+        assert!(error.contains("github's own trouble"), "{error}");
+        assert!(error.contains("worth trying again"), "{error}");
+    }
+
+    /// An unrecognised status has to carry the status and something of the
+    /// body, and the body has to stop: a whole error page in a log line is a
+    /// denial of service on whoever reads it.
+    #[tokio::test]
+    async fn reports_an_unknown_status_with_a_truncated_body() {
+        let github = FakeGitHub::new();
+        github.refuse_with(StatusCode::IM_A_TEAPOT, &"x".repeat(BODY_LIMIT * 3));
+
+        let error = format!("{:#}", client(&github).app().await.unwrap_err());
+
+        assert!(error.contains("418"), "{error}");
+        assert!(error.contains('…'), "{error}");
+        assert!(error.len() < BODY_LIMIT * 2, "{}", error.len());
+    }
+
+    /// A `Link` header that points at the page it came from is a loop, and a
+    /// loop inside a reconciliation pass is a spaceport that never finishes
+    /// one again.
+    #[tokio::test]
+    async fn refuses_to_follow_pages_for_ever() {
+        let github = FakeGitHub::new();
+        github.paginate_endlessly();
+
+        let error = format!("{:#}", client(&github).installations().await.unwrap_err());
+
+        assert!(error.contains("more than spaceport will follow"), "{error}");
+        assert_eq!(github.requests().len(), PAGE_LIMIT);
+    }
+
+    /// GitHub requires the user agent and answers the wrong shape without the
+    /// accept header, and neither failure would be obvious from the response.
+    #[tokio::test]
+    async fn every_request_says_what_it_accepts_which_version_and_who_it_is() {
+        let github = FakeGitHub::new();
+        let client = client(&github);
+        client.app().await.unwrap();
+        client.repositories(7).await.unwrap();
+
+        let requests = github.requests();
+        assert!(requests.len() >= 3);
+        for request in requests {
+            assert_eq!(request.accept.as_deref(), Some(ACCEPT), "{}", request.path);
+            assert_eq!(
+                request.api_version.as_deref(),
+                Some(API_VERSION),
+                "{}",
+                request.path
+            );
+            assert_eq!(
+                request.user_agent.as_deref(),
+                Some(USER_AGENT),
+                "{}",
+                request.path
+            );
+        }
+    }
+
+    /// The whole point of [`Secret`]: a token spaceport is holding must not
+    /// reach an error message or a debug line, however the error was made.
+    #[tokio::test]
+    async fn never_puts_an_installation_token_in_an_error_or_a_debug_line() {
+        let github = FakeGitHub::new();
+        let client = client(&github);
+        let token = client.installation_token(7).await.unwrap();
+        let plaintext = token.expose().to_owned();
+        assert!(!plaintext.is_empty());
+
+        github.refuse_with(StatusCode::IM_A_TEAPOT, &plaintext);
+        let error = format!("{:#}", client.repositories(7).await.unwrap_err());
+        let cache = format!(
+            "{:?}",
+            client
+                .tokens
+                .lock()
+                .expect("nothing else holds the cache")
+                .get(&7)
+        );
+
+        // The body is echoed back, so the message may hold the plaintext GitHub
+        // said — what must not appear is spaceport's own copy of it, which is
+        // what the cache formats.
+        assert!(!cache.contains(&plaintext), "{cache}");
+        assert!(!format!("{:?}", Credential::Installation(token)).contains(&plaintext));
+        assert!(error.contains("418"), "{error}");
+    }
+}
