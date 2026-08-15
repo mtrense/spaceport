@@ -787,9 +787,12 @@ fn tracked_report(id: &AppId, tracked: &Tracked, built: &Built) -> String {
         "manifest",
         "none applied here yet — nothing runs, no hosts are claimed, and the edge routes nothing to it".to_owned(),
     );
+    // Deliberately says nothing about whether a build has happened: the build
+    // stanza above has already said, and the thing that is missing is the same
+    // either way. An image spaceport built is still an image nothing runs.
     out.field(
         "",
-        format!("apply one with `spaceport apps apply {id} …`, or wait for a build from the repository — which is a later step and does not exist yet"),
+        format!("apply one with `spaceport apps apply {id} …` — spaceport builds what a push moves the tracked branch to, but running what it built is a later step that does not exist yet"),
     );
 
     out.render()
