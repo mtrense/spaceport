@@ -1202,12 +1202,26 @@ async fn connection(
                 out.field(
                     if index == 0 { "installed" } else { "" },
                     format!(
-                        "{} ({}), {} repositories",
+                        "{} ({}), {}",
                         installation.account,
                         installation.account_type.to_lowercase(),
-                        installation.repositories.len(),
+                        counted(installation.repositories.len()),
                     ),
                 );
+
+                // Named rather than counted, because the count answers a
+                // question nobody has. What an operator wants off this command
+                // is whether one particular repository is in reach, and a
+                // number cannot answer that — and the names are already in
+                // hand, cached by the same pass that counted them.
+                //
+                // Every one of them, however many there are. Printing the
+                // first few and a "and 40 more" reads as an answer while being
+                // one only when the repository being looked for happens to
+                // sort early, which is the worst of both.
+                for repository in &installation.repositories {
+                    out.field("", format!("  {repository}"));
+                }
             }
         }
         Err(error) => out.field("installed", format!("could not be read: {error:#}")),
@@ -1227,6 +1241,20 @@ async fn connection(
     }
 
     (StatusCode::OK, out.render()).into_response()
+}
+
+/// How many repositories an installation reaches, said in English.
+///
+/// An installation with none is a real state and not an empty list to be
+/// printed as nothing: somebody installed the app and granted it no
+/// repository, and "0 repositories" reads as a failure to look rather than as
+/// what was found.
+fn counted(repositories: usize) -> String {
+    match repositories {
+        0 => "no repositories".to_owned(),
+        1 => "1 repository".to_owned(),
+        many => format!("{many} repositories"),
+    }
 }
 
 /// `DELETE /connections/{slug}`: forget the app, and everything cached under
@@ -1274,6 +1302,7 @@ fn refuse(status: StatusCode, message: &str) -> Response {
 mod tests {
     use super::*;
     use crate::app::{App, AppRepository, AppStore};
+    use crate::connections::github::Installation;
     use crate::connections::github::api::testing::FakeGitHub;
     use crate::events::Level;
     use crate::runtime::{Container, ContainerId, ContainerRuntime, Managed};
@@ -1364,7 +1393,7 @@ container:
     }
 
     fn router_and_events() -> (Router, Arc<EventBus>) {
-        let (_, router, events, _, _) = parts_on(OneContainer::default());
+        let (_, router, events, _, _, _) = parts_on(OneContainer::default());
 
         (router, events)
     }
@@ -1372,13 +1401,13 @@ container:
     /// A router and the GitHub behind it, for the connection tests — which are
     /// the only ones that care what GitHub answers.
     fn router_and_github() -> (Router, Arc<FakeGitHub>) {
-        let (_, router, _, _, github) = parts_on(OneContainer::default());
+        let (_, router, _, _, github, _) = parts_on(OneContainer::default());
 
         (router, github)
     }
 
     fn store_router_and_events_on(runtime: OneContainer) -> (Arc<AppStore>, Router, Arc<EventBus>) {
-        let (store, router, events, _, _) = parts_on(runtime);
+        let (store, router, events, _, _, _) = parts_on(runtime);
 
         (store, router, events)
     }
@@ -1392,6 +1421,7 @@ container:
         Arc<EventBus>,
         CancellationToken,
         Arc<FakeGitHub>,
+        Arc<ConnectionRepository>,
     ) {
         parts_configured(runtime, CONFIG)
     }
@@ -1413,6 +1443,7 @@ container:
         Arc<EventBus>,
         CancellationToken,
         Arc<FakeGitHub>,
+        Arc<ConnectionRepository>,
     ) {
         let store = Arc::new(AppStore::new());
         let db = Db::in_memory().unwrap();
@@ -1439,6 +1470,7 @@ container:
             "an-organisation",
         );
 
+        let connections = Arc::new(ConnectionRepository::new(db.clone()));
         let instance = Arc::new(Instance {
             version: "9.9.9".to_owned(),
             started_at: time::OffsetDateTime::now_utc(),
@@ -1446,7 +1478,7 @@ container:
             config: crate::Config::parse(config).unwrap(),
             operator: "/run/spaceport.sock".parse().unwrap(),
             applier,
-            connections: Arc::new(ConnectionRepository::new(db.clone())),
+            connections: connections.clone(),
             github: github.clone(),
             attempts: Arc::new(crate::connections::github::Attempts::new()),
             nudge: Nudge::new(),
@@ -1461,6 +1493,7 @@ container:
             events,
             shutdown,
             github,
+            connections,
         )
     }
 
@@ -2136,7 +2169,7 @@ container:
     /// for as long as anyone was watching it.
     #[tokio::test]
     async fn a_watcher_is_let_go_when_spaceport_shuts_down() {
-        let (_, router, _, shutdown, _) = parts_on(OneContainer::default());
+        let (_, router, _, shutdown, _, _) = parts_on(OneContainer::default());
         let mut stream = watch(&router, "").await;
 
         shutdown.cancel();
@@ -2511,6 +2544,74 @@ container:
         assert!(body.contains("app        spaceport-acme"), "{body}");
         assert!(body.contains("Iv1.0123456789abcdef"), "{body}");
         assert!(body.contains("nowhere yet"), "{body}");
+    }
+
+    /// What an operator actually wants off this command is whether one
+    /// particular repository is in reach, and a count cannot answer that.
+    #[tokio::test]
+    async fn shows_the_repositories_each_installation_reaches() {
+        let (_, router, _, _, _, connections) = parts_on(OneContainer::default());
+        post_connection(&router, registration("spaceport-acme", 42)).await;
+        connections
+            .record_installations(
+                42,
+                &[
+                    Installation {
+                        installation_id: 100,
+                        account: "mtrense".to_owned(),
+                        account_type: "User".to_owned(),
+                        repositories: vec![
+                            "mtrense/spaceport-test1".to_owned(),
+                            "mtrense/spaceport-test2".to_owned(),
+                        ],
+                    },
+                    Installation {
+                        installation_id: 200,
+                        account: "acme-inc".to_owned(),
+                        account_type: "Organization".to_owned(),
+                        repositories: vec!["acme-inc/the-only-one".to_owned()],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let (status, body) = get_connections(&router, "/spaceport-acme").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("mtrense (user), 2 repositories"), "{body}");
+        assert!(body.contains("mtrense/spaceport-test1"), "{body}");
+        assert!(body.contains("mtrense/spaceport-test2"), "{body}");
+        // One is a repository, not 1 repositories.
+        assert!(
+            body.contains("acme-inc (organization), 1 repository\n"),
+            "{body}"
+        );
+        assert!(body.contains("acme-inc/the-only-one"), "{body}");
+    }
+
+    /// An installation somebody granted nothing is a real state, and reads as
+    /// a failure to look if it is printed as an empty list.
+    #[tokio::test]
+    async fn says_when_an_installation_reaches_no_repository_at_all() {
+        let (_, router, _, _, _, connections) = parts_on(OneContainer::default());
+        post_connection(&router, registration("spaceport-acme", 42)).await;
+        connections
+            .record_installations(
+                42,
+                &[Installation {
+                    installation_id: 100,
+                    account: "mtrense".to_owned(),
+                    account_type: "User".to_owned(),
+                    repositories: Vec::new(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let (_, body) = get_connections(&router, "/spaceport-acme").await;
+
+        assert!(body.contains("mtrense (user), no repositories"), "{body}");
     }
 
     /// The one thing a connection must never do: an operator asking what is
