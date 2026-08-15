@@ -234,6 +234,31 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (spaceport_app, revision)
     ) STRICT;
     CREATE INDEX app_builds_by_state ON app_builds (state, started_at);",
+    // 7 — the manifest a build was made from, and the revision an app is
+    // actually running.
+    //
+    // `app_builds.manifest` is the document as it was read out of the commit,
+    // byte for byte, and not a re-serialisation of what parsing made of it. The
+    // unpacked tree is swept once a few newer revisions exist, so the commit's
+    // own copy is gone from this host long before an operator asks what it said;
+    // and a re-serialisation would answer with this build's idea of the schema
+    // rather than with what somebody wrote. Nullable, because a row written by
+    // an earlier spaceport has none, and a build that failed before it got as
+    // far as reading the manifest never had one.
+    //
+    // `apps.revision` is the deployed one — the revision whose build produced
+    // the image the stored manifest is running. It is recorded rather than
+    // re-derived, and that is the whole point of the column. Re-deriving it
+    // would mean asking "which is the newest built revision of this app?" at
+    // every restart, and answering that question a week later gives a different
+    // revision from the one the operator deployed: a spaceport that restarted
+    // overnight would come back running a commit nobody asked for, because
+    // somebody merged in the meantime. What an operator deployed is a decision,
+    // not a derivation, and a decision has to be written down to survive. NULL
+    // means no build is involved at all — the manifest names its own image, and
+    // there is no revision to remember.
+    "ALTER TABLE app_builds ADD COLUMN manifest TEXT;
+    ALTER TABLE apps ADD COLUMN revision TEXT;",
 ];
 
 /// The schema version this build writes.
@@ -339,7 +364,8 @@ mod tests {
                 "schema_version",
                 "manifest",
                 "applied_at",
-                "suspended"
+                "suspended",
+                "revision"
             ]
         );
     }
@@ -438,8 +464,34 @@ mod tests {
                 "reason",
                 "log",
                 "started_at",
-                "finished_at"
+                "finished_at",
+                "manifest"
             ]
+        );
+    }
+
+    /// What the deployed revision is for: a restart re-resolves the revision an
+    /// operator deployed, and a row from before the column says "no build is
+    /// involved" rather than pointing at whatever has been built since.
+    #[test]
+    fn the_seventh_migration_records_the_manifest_and_the_deployed_revision() {
+        let connection = empty();
+        migrate(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO apps (id, schema_version, manifest, applied_at)
+                 VALUES ('hello', 1, 'schema_version: 1', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            connection
+                .query_row("SELECT revision FROM apps WHERE id = 'hello'", [], |row| {
+                    row.get::<_, Option<String>>(0)
+                })
+                .unwrap(),
+            None
         );
     }
 

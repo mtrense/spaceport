@@ -46,6 +46,27 @@ pub async fn apply(
     send_to(endpoint, request).await
 }
 
+/// Ask it to run what it built for the app named `id`.
+///
+/// Without `revision`, it runs the newest image it has finished building.
+///
+/// A commit sha is hex and needs no encoding, which is the same argument
+/// [`list`] makes for a pattern: nothing here can carry a character a query
+/// string would swallow, and a spaceport asked for a revision that is not one
+/// answers that it has no build of it.
+pub async fn deploy(
+    endpoint: &OperatorEndpoint,
+    id: &AppId,
+    revision: Option<&str>,
+) -> Result<String> {
+    let uri = match revision {
+        Some(revision) => format!("/apps/{id}/deployment?revision={revision}"),
+        None => format!("/apps/{id}/deployment"),
+    };
+
+    send_to(endpoint, builder("POST", &uri).body(Full::default())?).await
+}
+
 /// Ask it to stop serving the app named `id`, keeping everything about it.
 ///
 /// With `stop_container`, its container is stopped and kept rather than left

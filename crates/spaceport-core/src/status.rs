@@ -554,6 +554,7 @@ container:
             Arc::new(AppStore::new()),
             Arc::new(Absent),
             AppRepository::new(db.clone()),
+            BuildRepository::new(db.clone()),
         ));
 
         (db, applier)
@@ -596,7 +597,7 @@ container:
         let (db, applier) = empty();
         applier
             .repository()
-            .record_applied(&"ghost".parse().unwrap(), MANIFEST, false)
+            .record_applied(&"ghost".parse().unwrap(), MANIFEST, None, false)
             .await
             .unwrap();
 

@@ -133,6 +133,18 @@ pub struct Build {
     pub started_at: String,
     /// When it reached a terminal state, RFC 3339.
     pub finished_at: Option<String>,
+    /// The manifest document that was read out of the commit, exactly as it was
+    /// written there.
+    ///
+    /// Kept on the row rather than re-read off disk, because by the time it is
+    /// wanted there is nothing to re-read: the unpacked tree is swept once
+    /// `keep` newer revisions exist, and a deploy of this revision days later
+    /// still has to be able to say what the commit asked for. Storing what
+    /// parsing made of it would answer with this build's idea of the schema
+    /// instead of with the document, which is the one thing an operator can
+    /// compare against their repository. `None` for a row an earlier spaceport
+    /// wrote, and for a build that failed before it read one.
+    pub manifest: Option<String>,
 }
 
 /// The columns of `app_builds`, in the order [`build_from`] reads them.
@@ -140,7 +152,7 @@ pub struct Build {
 /// Written once so the `SELECT`s and the row mapping cannot drift apart.
 const BUILD_COLUMNS: &str = "spaceport_app, revision, connection, repository, branch, \
                              manifest_path, state, image_tag, image_id, reason, log, \
-                             started_at, finished_at";
+                             started_at, finished_at, manifest";
 
 /// The builds table, in the vocabulary of requesting, claiming and finishing.
 #[derive(Debug, Clone)]
@@ -250,18 +262,23 @@ impl BuildRepository {
     /// afterwards. The tag and the id are both kept because they answer
     /// different questions — the tag is what a container is asked to run, the
     /// id is what is still true after somebody has moved the tag.
+    ///
+    /// `manifest` is the document the commit carried, written down here because
+    /// this is the only moment it is in hand — see [`Build::manifest`].
     pub async fn succeeded(
         &self,
         app: &AppId,
         revision: &str,
         image_tag: &str,
         image_id: &str,
+        manifest: &str,
         log: &str,
     ) -> Result<()> {
         let app = app.to_string();
         let revision = revision.to_owned();
         let image_tag = image_tag.to_owned();
         let image_id = image_id.to_owned();
+        let manifest = manifest.to_owned();
         let log = tail(log);
         let finished_at = crate::state::now();
 
@@ -271,9 +288,17 @@ impl BuildRepository {
                     .execute(
                         "UPDATE app_builds
                          SET state = 'built', image_tag = ?3, image_id = ?4,
-                             reason = NULL, log = ?5, finished_at = ?6
+                             reason = NULL, log = ?5, finished_at = ?6, manifest = ?7
                          WHERE spaceport_app = ?1 AND revision = ?2",
-                        rusqlite::params![app, revision, image_tag, image_id, log, finished_at],
+                        rusqlite::params![
+                            app,
+                            revision,
+                            image_tag,
+                            image_id,
+                            log,
+                            finished_at,
+                            manifest
+                        ],
                     )
                     .context("recording a finished build")?;
 
@@ -364,6 +389,43 @@ impl BuildRepository {
                     )
                     .optional()
                     .context("reading the latest build of an app")
+            })
+            .await
+    }
+
+    /// The most recently finished successful build of `app`, if there is one.
+    ///
+    /// What an operator means by `spaceport apps deploy site` with no
+    /// `--revision`: the newest thing that actually exists as an image.
+    /// Deliberately not [`BuildRepository::latest`], which answers "how is it
+    /// going?" and so includes the failure and the commit still in the queue —
+    /// deploying either of those would point an app at an image nothing ever
+    /// produced.
+    ///
+    /// Ordered by `finished_at` and not by `started_at`, because that is the
+    /// order the images came into existence: a long build of an older commit
+    /// can finish after a quick build of a newer one, and the deploy that
+    /// follows should land on whichever image was ready last rather than on the
+    /// one whose request was typed last. Ties fall back to the revision, so a
+    /// deploy issued twice deploys the same thing twice.
+    pub async fn latest_built(&self, app: &AppId) -> Result<Option<Build>> {
+        let app = app.to_string();
+
+        self.db
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        &format!(
+                            "SELECT {BUILD_COLUMNS} FROM app_builds
+                             WHERE spaceport_app = ?1 AND state = 'built'
+                             ORDER BY finished_at DESC, revision DESC
+                             LIMIT 1"
+                        ),
+                        [app],
+                        build_from,
+                    )
+                    .optional()
+                    .context("reading the latest successful build of an app")
             })
             .await
     }
@@ -512,6 +574,7 @@ fn build_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<Build> {
         log: row.get(10)?,
         started_at: row.get(11)?,
         finished_at: row.get(12)?,
+        manifest: row.get(13)?,
     })
 }
 
@@ -569,8 +632,19 @@ mod tests {
             log: None,
             started_at: String::new(),
             finished_at: None,
+            manifest: None,
         }
     }
+
+    /// A manifest as one comes out of a commit.
+    const MANIFEST: &str = "\
+schema_version: 1
+source:
+  type: build
+  dockerfile: Dockerfile
+routing:
+  hosts: [site.example.com]
+";
 
     /// The queue orders by `started_at`, and two requests made in the same
     /// test can land on the same instant. Where an order is what is under
@@ -683,7 +757,14 @@ mod tests {
         repository.request(&build("site", "abc")).await.unwrap();
         repository.claim().await.unwrap();
         repository
-            .succeeded(&app("site"), "abc", "spaceport/site:abc", "sha256:1", "")
+            .succeeded(
+                &app("site"),
+                "abc",
+                "spaceport/site:abc",
+                "sha256:1",
+                MANIFEST,
+                "",
+            )
             .await
             .unwrap();
 
@@ -702,6 +783,7 @@ mod tests {
                 "abc",
                 "spaceport/site:abc",
                 "sha256:0123",
+                MANIFEST,
                 "step 1/2\nstep 2/2\n",
             )
             .await
@@ -714,6 +796,140 @@ mod tests {
         assert_eq!(read.reason, None);
         assert_eq!(read.log.as_deref(), Some("step 1/2\nstep 2/2\n"));
         assert!(read.finished_at.unwrap().ends_with('Z'));
+    }
+
+    /// The tree the document was read out of is swept a few revisions later, so
+    /// the row is the only thing that can still say what the commit asked for.
+    #[tokio::test]
+    async fn a_successful_build_remembers_the_manifest_it_was_built_from() {
+        let repository = repository();
+        repository.request(&build("site", "abc")).await.unwrap();
+        repository.claim().await.unwrap();
+
+        repository
+            .succeeded(
+                &app("site"),
+                "abc",
+                "spaceport/site:abc",
+                "sha256:0123",
+                MANIFEST,
+                "",
+            )
+            .await
+            .unwrap();
+
+        // Byte for byte, and through every way of reading the row back.
+        for read in [
+            repository.get(&app("site"), "abc").await.unwrap().unwrap(),
+            repository
+                .built(&app("site"), "abc")
+                .await
+                .unwrap()
+                .unwrap(),
+            repository.latest(&app("site")).await.unwrap().unwrap(),
+            repository
+                .latest_built(&app("site"))
+                .await
+                .unwrap()
+                .unwrap(),
+            repository.by_app(&app("site")).await.unwrap().remove(0),
+        ] {
+            assert_eq!(read.manifest.as_deref(), Some(MANIFEST));
+        }
+    }
+
+    /// A deploy with no revision named wants the newest image that exists, and
+    /// a commit that is queued or broken is not one.
+    #[tokio::test]
+    async fn the_latest_built_revision_ignores_a_failed_or_pending_one() {
+        let repository = repository();
+        requested_at(&repository, "site", "built", "2026-01-01T00:00:00Z").await;
+        requested_at(&repository, "site", "broken", "2026-02-01T00:00:00Z").await;
+        requested_at(&repository, "site", "queued", "2026-03-01T00:00:00Z").await;
+        repository
+            .succeeded(
+                &app("site"),
+                "built",
+                "spaceport/site:built",
+                "sha256:1",
+                MANIFEST,
+                "",
+            )
+            .await
+            .unwrap();
+        repository
+            .failed(&app("site"), "broken", "the build refused", "")
+            .await
+            .unwrap();
+
+        // `latest` answers "how is it going?" and so sees the one still queued.
+        assert_eq!(
+            repository
+                .latest(&app("site"))
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            "queued"
+        );
+        assert_eq!(
+            repository
+                .latest_built(&app("site"))
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            "built"
+        );
+        // An app nothing has ever been built for has no answer to give, and
+        // another app's image is not this one's.
+        assert!(
+            repository
+                .latest_built(&app("docs"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A build recorded before this column existed says nothing about the
+    /// manifest, which is a different answer from an empty document.
+    #[tokio::test]
+    async fn a_build_written_before_the_manifest_was_kept_reads_back_as_none() {
+        let repository = repository();
+        repository.request(&build("site", "abc")).await.unwrap();
+        // Exactly the row an older spaceport left behind: built, with an image,
+        // and no manifest.
+        repository
+            .db
+            .call(move |connection| {
+                connection
+                    .execute(
+                        "UPDATE app_builds
+                         SET state = 'built', image_tag = 'spaceport/site:abc',
+                             image_id = 'sha256:1', finished_at = '2026-01-01T00:00:00Z'
+                         WHERE spaceport_app = 'site' AND revision = 'abc'",
+                        [],
+                    )
+                    .context("writing a build as an older spaceport did")?;
+
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let read = repository.get(&app("site"), "abc").await.unwrap().unwrap();
+        assert_eq!(read.state, BuildState::Built);
+        assert_eq!(read.manifest, None);
+        assert_eq!(
+            repository
+                .latest_built(&app("site"))
+                .await
+                .unwrap()
+                .unwrap()
+                .manifest,
+            None
+        );
     }
 
     #[tokio::test]
@@ -754,7 +970,14 @@ mod tests {
         repository.claim().await.unwrap();
         repository.claim().await.unwrap();
         repository
-            .succeeded(&app("site"), "done", "spaceport/site:done", "sha256:1", "")
+            .succeeded(
+                &app("site"),
+                "done",
+                "spaceport/site:done",
+                "sha256:1",
+                MANIFEST,
+                "",
+            )
             .await
             .unwrap();
 
@@ -796,7 +1019,14 @@ mod tests {
             .await
             .unwrap();
         repository
-            .succeeded(&app("site"), "good", "spaceport/site:good", "sha256:1", "")
+            .succeeded(
+                &app("site"),
+                "good",
+                "spaceport/site:good",
+                "sha256:1",
+                MANIFEST,
+                "",
+            )
             .await
             .unwrap();
 
@@ -867,7 +1097,14 @@ mod tests {
         let repository = repository();
         repository.request(&build("site", "abc")).await.unwrap();
         repository
-            .succeeded(&app("site"), "abc", "spaceport/site:abc", "sha256:1", "")
+            .succeeded(
+                &app("site"),
+                "abc",
+                "spaceport/site:abc",
+                "sha256:1",
+                MANIFEST,
+                "",
+            )
             .await
             .unwrap();
 

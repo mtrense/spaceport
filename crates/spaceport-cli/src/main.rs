@@ -125,13 +125,14 @@ enum AppsCommand {
     /// Report everything spaceport knows about one app.
     Show(ShowArgs),
     /// Say which repository and branch an app's code lives on, so that a push
-    /// to it is noticed.
+    /// to it is built.
     ///
-    /// Noticed, and no more than that: nothing is built and nothing is deployed,
-    /// now or when the push arrives. Doing something about a push is a later
-    /// step, and until it exists this is a note spaceport keeps rather than a
-    /// pipeline it runs.
+    /// Built, and no more than that: what a push produces is an image, and
+    /// running it is `spaceport apps deploy` — a step an operator takes when
+    /// they are ready for it rather than one a push takes for them.
     Track(TrackArgs),
+    /// Run what spaceport built from the app's repository.
+    Deploy(DeployArgs),
     /// Stop serving an app, keeping everything about it.
     Suspend(SuspendArgs),
     /// Serve a suspended app again.
@@ -369,6 +370,29 @@ struct TrackArgs {
 }
 
 #[derive(Debug, Args)]
+struct DeployArgs {
+    /// The app to deploy.
+    app_id: AppId,
+
+    /// The commit to run, in full or abbreviated to anything that names one
+    /// build of this app.
+    ///
+    /// Without it, spaceport runs the newest image it has finished building —
+    /// which is what somebody who has just pushed is asking for. Naming one is
+    /// how a deploy is repeated on another host, and how an app is put back on
+    /// the revision it was running before the last one.
+    ///
+    /// The manifest that comes with it is the one that commit carried, so the
+    /// app is configured as its repository says at that revision rather than as
+    /// it says today.
+    #[arg(short, long, value_name = "SHA")]
+    revision: Option<String>,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
 struct DestroyArgs {
     /// The app to stop and remove.
     app_id: AppId,
@@ -464,6 +488,7 @@ async fn main() -> Result<()> {
             AppsCommand::List(args) => list(args).await,
             AppsCommand::Show(args) => show(args).await,
             AppsCommand::Track(args) => track(args).await,
+            AppsCommand::Deploy(args) => deploy(args).await,
             AppsCommand::Suspend(args) => suspend(args).await,
             AppsCommand::Resume(args) => resume(args).await,
             AppsCommand::Destroy(args) => destroy(args).await,
@@ -563,6 +588,7 @@ async fn run(args: RunArgs) -> Result<()> {
         apps.clone(),
         runtime.clone(),
         AppRepository::new(db.clone()),
+        BuildRepository::new(db.clone()),
     ));
 
     // Ahead of the listeners, so a restart does not answer 404 for apps it is
@@ -815,6 +841,15 @@ async fn track(args: TrackArgs) -> Result<()> {
             Some(&args.manifest_path),
         )
         .await?
+    );
+
+    Ok(())
+}
+
+async fn deploy(args: DeployArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::deploy(&args.server.server, &args.app_id, args.revision.as_deref()).await?
     );
 
     Ok(())

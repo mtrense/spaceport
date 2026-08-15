@@ -76,7 +76,12 @@ pub async fn reconcile(applier: &Arc<Applier>) -> Result<Report> {
         };
 
         match applier
-            .restore(record.id.clone(), manifest.clone(), record.suspended)
+            .restore(
+                record.id.clone(),
+                manifest.clone(),
+                record.revision.as_deref(),
+                record.suspended,
+            )
             .await
         {
             Ok(restored) if restored.was_suspended() => {
@@ -162,6 +167,7 @@ mod tests {
     use super::*;
     use crate::app::AppStore;
     use crate::app::repository::AppRepository;
+    use crate::build::repository::BuildRepository;
     use crate::runtime::{Adopted, Container, ContainerId, ContainerRuntime, Managed};
     use crate::state::Db;
     use anyhow::bail;
@@ -298,8 +304,13 @@ container:
         db: Db,
     ) -> (Arc<Applier>, Arc<AppStore>, AppRepository) {
         let store = Arc::new(AppStore::new());
-        let repository = AppRepository::new(db);
-        let applier = Arc::new(Applier::new(store.clone(), runtime, repository.clone()));
+        let repository = AppRepository::new(db.clone());
+        let applier = Arc::new(Applier::new(
+            store.clone(),
+            runtime,
+            repository.clone(),
+            BuildRepository::new(db),
+        ));
 
         (applier, store, repository)
     }
@@ -323,11 +334,11 @@ container:
         let runtime = Arc::new(FakeRuntime::default());
         let (applier, store, repository) = restarted(runtime, Db::in_memory().unwrap());
         repository
-            .record_applied(&id("hello"), &manifest("alpha.test"), false)
+            .record_applied(&id("hello"), &manifest("alpha.test"), None, false)
             .await
             .unwrap();
         repository
-            .record_applied(&id("other"), &manifest("beta.test"), false)
+            .record_applied(&id("other"), &manifest("beta.test"), None, false)
             .await
             .unwrap();
 
@@ -349,11 +360,11 @@ container:
         });
         let (applier, store, repository) = restarted(runtime, Db::in_memory().unwrap());
         repository
-            .record_applied(&id("broken"), &manifest("alpha.test"), false)
+            .record_applied(&id("broken"), &manifest("alpha.test"), None, false)
             .await
             .unwrap();
         repository
-            .record_applied(&id("healthy"), &manifest("beta.test"), false)
+            .record_applied(&id("healthy"), &manifest("beta.test"), None, false)
             .await
             .unwrap();
 
@@ -373,7 +384,7 @@ container:
         let runtime = Arc::new(FakeRuntime::default());
         let (applier, store, repository) = restarted(runtime, Db::in_memory().unwrap());
         repository
-            .record_applied(&id("future"), "schema_version: 99\n", false)
+            .record_applied(&id("future"), "schema_version: 99\n", None, false)
             .await
             .unwrap();
 
@@ -398,7 +409,7 @@ container:
         });
         let (applier, _, repository) = restarted(runtime.clone(), Db::in_memory().unwrap());
         repository
-            .record_applied(&id("hello"), &manifest("alpha.test"), false)
+            .record_applied(&id("hello"), &manifest("alpha.test"), None, false)
             .await
             .unwrap();
 

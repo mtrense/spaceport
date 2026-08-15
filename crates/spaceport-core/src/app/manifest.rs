@@ -705,6 +705,33 @@ impl AppManifest {
         &self.source_text
     }
 
+    /// This manifest as this spaceport can run it: the same document, with the
+    /// image a build produced in place of the build that produced it.
+    ///
+    /// The copy's parsed source and its text disagree on purpose. The text is
+    /// the document the repository holds — `type: build`, a Dockerfile and a
+    /// context — and it is what an operator wrote and what a later spaceport
+    /// reads back, so it is left exactly as it was. The parsed source is what
+    /// this spaceport can run today: one image, resolved from one revision, on
+    /// the way to the runtime and never on the way to the store. A resolved tag
+    /// written down would be a fact about a single build frozen into the record
+    /// of an app, and a restart would run it long after the revision it belonged
+    /// to had been replaced.
+    ///
+    /// Validated as though it had been parsed, so an image a manifest would be
+    /// refused for cannot arrive by this door instead.
+    pub fn built_as(&self, image: &str) -> Result<Self> {
+        let manifest = Self {
+            source: Source::Image {
+                image: image.to_owned(),
+            },
+            ..self.clone()
+        };
+        manifest.validate().context("resolving a built image")?;
+
+        Ok(manifest)
+    }
+
     /// What serde cannot express: the rules that span more than one field.
     fn validate(&self) -> Result<()> {
         self.source.validate()?;
@@ -899,6 +926,28 @@ routing:
                 context: "services/a..b".into(),
             }
         );
+    }
+
+    /// What a build resolves to on the way to the runtime: the image, and the
+    /// document the operator's repository still holds.
+    #[test]
+    fn runs_a_built_manifest_as_the_image_the_build_produced() {
+        let manifest = AppManifest::parse(&with_build("")).unwrap();
+
+        let built = manifest.built_as("spaceport/site:abc1234").unwrap();
+
+        assert_eq!(
+            built.source,
+            Source::Image {
+                image: "spaceport/site:abc1234".into()
+            }
+        );
+        // The text is the repository's, and says what it always said.
+        assert_eq!(built.source_text(), manifest.source_text());
+        assert!(built.source_text().contains("type: build"));
+        // And nothing else about the app moved with the source.
+        assert_eq!(built.routing.hosts, manifest.routing.hosts);
+        assert_eq!(built.container, manifest.container);
     }
 
     #[test]

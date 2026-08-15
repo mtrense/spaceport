@@ -505,6 +505,7 @@ mod tests {
     use super::*;
     use crate::app::repository::AppRepository;
     use crate::app::{AppManifest, AppStore};
+    use crate::build::repository::BuildRepository;
     use crate::runtime::{Container, ContainerId, ContainerRuntime, Managed};
     use crate::state::Db;
     use anyhow::{Result, bail};
@@ -646,10 +647,12 @@ container:
     async fn supervising(manifest: AppManifest) -> (Supervisor, Arc<AppStore>, Arc<FakeRuntime>) {
         let runtime = Arc::new(FakeRuntime::default());
         let store = Arc::new(AppStore::new());
+        let db = Db::in_memory().unwrap();
         let applier = Arc::new(Applier::new(
             store.clone(),
             runtime.clone(),
-            AppRepository::new(Db::in_memory().unwrap()),
+            AppRepository::new(db.clone()),
+            BuildRepository::new(db),
         ));
         applier
             .apply(id("hello"), manifest, false)
@@ -859,10 +862,12 @@ container:
             ..FakeRuntime::default()
         });
         let store = Arc::new(AppStore::new());
+        let db = Db::in_memory().unwrap();
         let applier = Arc::new(Applier::new(
             store.clone(),
             runtime.clone(),
-            AppRepository::new(Db::in_memory().unwrap()),
+            AppRepository::new(db.clone()),
+            BuildRepository::new(db),
         ));
         applier
             .apply(id("hello"), manifest(""), false)

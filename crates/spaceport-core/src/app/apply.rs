@@ -22,9 +22,11 @@ use std::time::Instant;
 use anyhow::anyhow;
 use tracing::{debug, info, warn};
 
+use super::manifest::Source;
 use super::repository::AppRepository;
 use super::store::{Removed, Suspended};
 use super::{App, AppId, AppManifest, AppStore, health};
+use crate::build::repository::BuildRepository;
 use crate::runtime::{Adopted, Container, ContainerRuntime};
 
 /// Why an apply did not happen. The distinction is worth keeping because the
@@ -196,6 +198,10 @@ pub struct Applier {
     store: Arc<AppStore>,
     runtime: Arc<dyn ContainerRuntime>,
     repository: AppRepository,
+    /// What spaceport has built, and so what a `type: build` manifest can be
+    /// run as. Read on the way in to every verb that starts an app, and never
+    /// written to from here — building is somebody else's business.
+    builds: BuildRepository,
     /// The apps something is in the middle of doing something to.
     ///
     /// Every verb here takes containers down and puts them up, and the engine
@@ -215,11 +221,13 @@ impl Applier {
         store: Arc<AppStore>,
         runtime: Arc<dyn ContainerRuntime>,
         repository: AppRepository,
+        builds: BuildRepository,
     ) -> Self {
         Self {
             store,
             runtime,
             repository,
+            builds,
             settling: Mutex::default(),
         }
     }
@@ -513,6 +521,31 @@ impl Applier {
         manifest: AppManifest,
         suspend: bool,
     ) -> Result<Applied, ApplyError> {
+        self.deploy(id, manifest, None, suspend).await
+    }
+
+    /// Apply `manifest` as the app named `id`, running the image spaceport
+    /// built from `revision`.
+    ///
+    /// A verb of its own rather than a longer `apply`, because the two are
+    /// asked by different people. An operator applies a document they wrote and
+    /// have in front of them; a deploy replays a document that came out of a
+    /// commit, and the commit is the other half of what it is asking for.
+    /// Keeping them apart leaves the operator's verb reading exactly as it did,
+    /// and makes the revision impossible to forget where one is meant.
+    ///
+    /// The revision is resolved to an image here and now, before anything is
+    /// started and for the suspended path as much as the running one, so that a
+    /// manifest which reaches the runtime is always one the runtime can run.
+    /// What is *recorded* is the revision, never the image it resolved to — see
+    /// [`AppManifest::built_as`].
+    pub async fn deploy(
+        &self,
+        id: AppId,
+        manifest: AppManifest,
+        revision: Option<&str>,
+        suspend: bool,
+    ) -> Result<Applied, ApplyError> {
         let _settling = self.settling(&id);
 
         // Refused here rather than while parsing, so that a manifest written
@@ -527,7 +560,12 @@ impl Applier {
             )));
         }
 
+        // The document, taken before anything is resolved: what is recorded is
+        // what the operator or the repository wrote, and resolving a build
+        // deliberately leaves that text alone.
         let recorded = manifest.source_text().to_owned();
+        let manifest = self.resolved(&id, manifest, revision).await?;
+
         let held = self.store.suspended(&id);
         let suspend = suspend || held.is_some();
 
@@ -543,7 +581,7 @@ impl Applier {
         // a crash, and the answer to that is to apply it again.
         if let Err(error) = self
             .repository
-            .record_applied(applied.id(), &recorded, suspend)
+            .record_applied(applied.id(), &recorded, revision, suspend)
             .await
         {
             warn!(app = %applied.id(), %error, "the app was not recorded, so it will not survive a restart");
@@ -604,13 +642,21 @@ impl Applier {
     /// has to be found, checked and routed to. Everything that is not that —
     /// no container, the wrong container, or one that has stopped answering —
     /// is a relaunch, which is what a restart used to cost every app.
+    ///
+    /// `revision` is the one the record carries, and it is resolved again here
+    /// rather than being taken as an image from anywhere. That is the whole
+    /// point of recording a commit instead of a tag: a spaceport that restarts
+    /// a week later runs the revision somebody deployed, not whatever has been
+    /// built for the app since.
     pub async fn restore(
         &self,
         id: AppId,
         manifest: AppManifest,
+        revision: Option<&str>,
         suspended: bool,
     ) -> Result<Restored, ApplyError> {
         let _settling = self.settling(&id);
+        let manifest = self.resolved(&id, manifest, revision).await?;
         self.free_of_conflict(&id, &manifest)?;
 
         if suspended {
@@ -684,6 +730,62 @@ impl Applier {
             .map_err(ApplyError::Conflict)?;
 
         Ok(Restored::Suspended(id))
+    }
+
+    /// The manifest as this spaceport can run it, at the revision it was
+    /// deployed from.
+    ///
+    /// A manifest that names its image is already runnable and is handed back
+    /// untouched, without the build store being asked anything: an app pulled
+    /// from a registry has no commit behind it, and looking one up would invent
+    /// a relationship it does not have.
+    ///
+    /// A manifest that is built is not runnable as written — `type: build`
+    /// describes a Dockerfile in somebody's repository, and what a container
+    /// runs is an image — so the successful build of that revision is what
+    /// stands in for it. Both ways of having no image are refusals rather than
+    /// substitutions: an app that cannot be run at the revision it was deployed
+    /// at stays down, saying which revision, which is the one answer that lets
+    /// an operator go and look. Running the newest image lying about instead
+    /// would deploy a commit nobody asked for, silently.
+    ///
+    /// Done here, in memory, on the way in to every verb that starts an app,
+    /// which is why the runtime's own refusal of `Source::Build` is now
+    /// unreachable — where a last line of defence belongs.
+    async fn resolved(
+        &self,
+        id: &AppId,
+        manifest: AppManifest,
+        revision: Option<&str>,
+    ) -> Result<AppManifest, ApplyError> {
+        if !matches!(manifest.source, Source::Build { .. }) {
+            return Ok(manifest);
+        }
+
+        let Some(revision) = revision else {
+            return Err(ApplyError::Failed(anyhow!(
+                "app `{id}` is built from its repository, and spaceport has not built it yet"
+            )));
+        };
+
+        let build = self
+            .builds
+            .built(id, revision)
+            .await
+            .map_err(ApplyError::Failed)?
+            .ok_or_else(|| {
+                ApplyError::Failed(anyhow!(
+                    "app `{id}` cannot run revision `{revision}`, because spaceport has no finished build of it"
+                ))
+            })?;
+
+        let image = build.image_tag.ok_or_else(|| {
+            ApplyError::Failed(anyhow!(
+                "the build of revision `{revision}` of app `{id}` recorded no image to run"
+            ))
+        })?;
+
+        manifest.built_as(&image).map_err(ApplyError::Failed)
     }
 
     /// Everything an apply does except remember it.
@@ -787,6 +889,7 @@ impl Drop for Settling<'_> {
 mod tests {
     use super::*;
     use crate::app::store::Downed;
+    use crate::build::repository::{Build, BuildState};
     use crate::runtime::{Container, ContainerId, Managed};
     use crate::state::Db;
     use anyhow::{Result, bail};
@@ -800,6 +903,10 @@ mod tests {
     #[derive(Default)]
     struct FakeRuntime {
         launched: Mutex<Vec<AppId>>,
+        /// What each launch was asked to run, so a test can tell which image a
+        /// manifest resolved to — and, for a manifest that builds, that it was
+        /// resolved at all before it got this far.
+        images: Mutex<Vec<String>>,
         removed: Mutex<Vec<ContainerId>>,
         /// Containers this runtime has been asked to stop and keep, and the
         /// ones it has been asked to start again.
@@ -864,10 +971,17 @@ mod tests {
             })
         }
 
-        async fn launch(&self, app: &AppId, _manifest: &AppManifest) -> Result<Container> {
+        async fn launch(&self, app: &AppId, manifest: &AppManifest) -> Result<Container> {
             if self.refuse {
                 bail!("no image for you");
             }
+            // What the real runtime does with a manifest that still says
+            // `build`, and the reason nothing may reach it saying so.
+            let Source::Image { image } = &manifest.source else {
+                bail!("app `{app}` builds its own image, which spaceport cannot do yet");
+            };
+            self.images.lock().unwrap().push(image.clone());
+
             let mut launched = self.launched.lock().unwrap();
             launched.push(app.clone());
 
@@ -940,10 +1054,27 @@ container:
     }
 
     fn applier(runtime: Arc<FakeRuntime>) -> (Applier, Arc<AppStore>) {
-        let store = Arc::new(AppStore::new());
-        let repository = AppRepository::new(Db::in_memory().unwrap());
+        let (applier, store, _) = applier_over(runtime, Db::in_memory().unwrap());
 
-        (Applier::new(store.clone(), runtime, repository), store)
+        (applier, store)
+    }
+
+    /// The same, over a database the test keeps hold of: for the tests that
+    /// record a build first, or that restart a spaceport over what the last one
+    /// wrote down.
+    fn applier_over(
+        runtime: Arc<FakeRuntime>,
+        db: Db,
+    ) -> (Applier, Arc<AppStore>, BuildRepository) {
+        let store = Arc::new(AppStore::new());
+        let repository = AppRepository::new(db.clone());
+        let builds = BuildRepository::new(db);
+
+        (
+            Applier::new(store.clone(), runtime, repository, builds.clone()),
+            store,
+            builds,
+        )
     }
 
     #[tokio::test]
@@ -1177,10 +1308,12 @@ container:
             refuse_removal: true,
             ..Default::default()
         });
+        let db = Db::in_memory().unwrap();
         let applier = Applier::new(
             store.clone(),
             runtime,
-            AppRepository::new(Db::in_memory().unwrap()),
+            AppRepository::new(db.clone()),
+            BuildRepository::new(db),
         );
 
         let error = applier
@@ -1258,7 +1391,12 @@ container:
             .clone();
 
         applier
-            .restore("hello".parse().unwrap(), manifest("alpha.test"), false)
+            .restore(
+                "hello".parse().unwrap(),
+                manifest("alpha.test"),
+                None,
+                false,
+            )
             .await
             .unwrap();
 
@@ -1284,7 +1422,12 @@ container:
         let (applier, store) = applier(runtime.clone());
 
         let restored = applier
-            .restore("hello".parse().unwrap(), manifest("alpha.test"), false)
+            .restore(
+                "hello".parse().unwrap(),
+                manifest("alpha.test"),
+                None,
+                false,
+            )
             .await
             .unwrap();
 
@@ -1305,7 +1448,12 @@ container:
         let (applier, store) = applier(runtime.clone());
 
         let restored = applier
-            .restore("hello".parse().unwrap(), manifest("alpha.test"), false)
+            .restore(
+                "hello".parse().unwrap(),
+                manifest("alpha.test"),
+                None,
+                false,
+            )
             .await
             .unwrap();
 
@@ -1334,6 +1482,7 @@ container:
             .restore(
                 "hello".parse().unwrap(),
                 manifest_awaiting_readiness("alpha.test"),
+                None,
                 false,
             )
             .await
@@ -1827,10 +1976,12 @@ container:
             refuse: true,
             ..Default::default()
         });
+        let db = Db::in_memory().unwrap();
         let applier = Applier::new(
             store.clone(),
             runtime,
-            AppRepository::new(Db::in_memory().unwrap()),
+            AppRepository::new(db.clone()),
+            BuildRepository::new(db),
         );
 
         let error = applier
@@ -1937,5 +2088,259 @@ container:
         let _held = applier.settling(&"hello".parse().unwrap());
 
         assert!(!applier.is_settling(&"other".parse().unwrap()));
+    }
+
+    // Deploying an app spaceport builds itself.
+
+    /// A manifest that is built rather than pulled, and so says nothing about
+    /// what image to run.
+    fn built_manifest(hosts: &str) -> AppManifest {
+        AppManifest::parse(&format!(
+            "schema_version: 1
+source:
+  type: build
+  dockerfile: Dockerfile
+  context: .
+routing:
+  hosts: [{hosts}]
+container:
+  health:
+    readiness:
+      type: none
+"
+        ))
+        .unwrap()
+    }
+
+    /// A build of `revision` that produced `image`, exactly as the worker would
+    /// have left it behind.
+    async fn record_build(builds: &BuildRepository, app: &str, revision: &str, image: &str) {
+        let id: AppId = app.parse().unwrap();
+        builds
+            .request(&Build {
+                app: id.clone(),
+                revision: revision.to_owned(),
+                connection: "spaceport".to_owned(),
+                repository: "an-organisation/site".to_owned(),
+                branch: "main".to_owned(),
+                manifest_path: "spaceport.yaml".to_owned(),
+                state: BuildState::Pending,
+                image_tag: None,
+                image_id: None,
+                reason: None,
+                log: None,
+                started_at: String::new(),
+                finished_at: None,
+                manifest: None,
+            })
+            .await
+            .unwrap();
+        // The document the commit carried, which is the one these tests deploy.
+        let manifest = built_manifest("alpha.test");
+        builds
+            .succeeded(
+                &id,
+                revision,
+                image,
+                "sha256:0123",
+                manifest.source_text(),
+                "",
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The whole point: a manifest that describes a Dockerfile reaches the
+    /// runtime describing an image, and it is the image that revision's build
+    /// produced.
+    #[tokio::test]
+    async fn deploying_a_revision_runs_the_image_its_build_produced() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store, builds) = applier_over(runtime.clone(), Db::in_memory().unwrap());
+        record_build(&builds, "hello", "abc1234", "spaceport/hello:abc1234").await;
+
+        let app = started(
+            applier
+                .deploy(
+                    "hello".parse().unwrap(),
+                    built_manifest("alpha.test"),
+                    Some("abc1234"),
+                    false,
+                )
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(
+            *runtime.images.lock().unwrap(),
+            ["spaceport/hello:abc1234".to_owned()]
+        );
+        assert_eq!(store.routes().serving("alpha.test").unwrap().id, app.id);
+    }
+
+    /// The resolved image is this spaceport's answer for today; the document is
+    /// the repository's, and it is the document that is written down.
+    #[tokio::test]
+    async fn deploying_records_the_document_and_the_revision_it_came_from() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _, builds) = applier_over(runtime, Db::in_memory().unwrap());
+        record_build(&builds, "hello", "abc1234", "spaceport/hello:abc1234").await;
+        let manifest = built_manifest("alpha.test");
+
+        applier
+            .deploy(
+                "hello".parse().unwrap(),
+                manifest.clone(),
+                Some("abc1234"),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let desired = applier.repository().desired().await.unwrap();
+        assert_eq!(desired[0].manifest, manifest.source_text());
+        assert!(desired[0].manifest.contains("type: build"));
+        assert!(!desired[0].manifest.contains("spaceport/hello:abc1234"));
+        // And the revision, which is what a restart resolves again.
+        assert_eq!(desired[0].revision.as_deref(), Some("abc1234"));
+    }
+
+    /// Running something else would be running a commit nobody deployed, so the
+    /// app stays down — saying which revision has no image, which is what sends
+    /// an operator to the build that failed.
+    #[tokio::test]
+    async fn refuses_a_revision_that_was_never_built() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store, builds) = applier_over(runtime.clone(), Db::in_memory().unwrap());
+        record_build(&builds, "hello", "abc1234", "spaceport/hello:abc1234").await;
+
+        let error = applier
+            .deploy(
+                "hello".parse().unwrap(),
+                built_manifest("alpha.test"),
+                Some("def5678"),
+                false,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ApplyError::Failed(_)));
+        assert!(error.to_string().contains("def5678"), "{error}");
+        assert!(error.to_string().contains("no finished build"), "{error}");
+        // Nothing was started, and the older build was not run in its place.
+        assert!(runtime.launched.lock().unwrap().is_empty());
+        assert!(store.apps().is_empty());
+        assert!(applier.repository().desired().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn refuses_a_built_manifest_that_names_no_revision() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _) = applier(runtime.clone());
+
+        let error = applier
+            .apply(
+                "hello".parse().unwrap(),
+                built_manifest("alpha.test"),
+                false,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ApplyError::Failed(_)));
+        assert!(
+            error.to_string().contains("has not built it yet"),
+            "{error}"
+        );
+        assert!(runtime.launched.lock().unwrap().is_empty());
+    }
+
+    /// A suspended deploy is resolved on the way in as much as a running one:
+    /// staging a manifest nothing could ever run would leave the refusal for
+    /// the resume, hours later and to somebody else.
+    #[tokio::test]
+    async fn refuses_an_unbuilt_revision_even_when_it_is_only_being_staged() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime);
+
+        let error = applier
+            .deploy(
+                "hello".parse().unwrap(),
+                built_manifest("alpha.test"),
+                Some("def5678"),
+                true,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ApplyError::Failed(_)));
+        assert!(store.suspended_apps().is_empty());
+        assert!(store.routes().lookup("alpha.test").is_none());
+    }
+
+    /// What recording the revision rather than the tag is for: the restart runs
+    /// the commit that was deployed, however many newer images exist by then.
+    #[tokio::test]
+    async fn a_restart_re_resolves_the_revision_that_was_deployed() {
+        let db = Db::in_memory().unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _, builds) = applier_over(runtime.clone(), db.clone());
+        record_build(&builds, "hello", "abc1234", "spaceport/hello:abc1234").await;
+        applier
+            .deploy(
+                "hello".parse().unwrap(),
+                built_manifest("alpha.test"),
+                Some("abc1234"),
+                false,
+            )
+            .await
+            .unwrap();
+        // A push nobody has deployed, built while this spaceport was down.
+        record_build(&builds, "hello", "def5678", "spaceport/hello:def5678").await;
+
+        // A new spaceport over the same records and a runtime with nothing left
+        // in it, so the app has to be started again from what was written down.
+        let restarted = Arc::new(FakeRuntime::default());
+        let (applier, store, _) = applier_over(restarted.clone(), db);
+        let record = applier.repository().desired().await.unwrap().remove(0);
+        applier
+            .restore(
+                record.id.clone(),
+                AppManifest::parse(&record.manifest).unwrap(),
+                record.revision.as_deref(),
+                record.suspended,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *restarted.images.lock().unwrap(),
+            ["spaceport/hello:abc1234".to_owned()]
+        );
+        assert!(store.routes().serving("alpha.test").is_some());
+    }
+
+    /// An app that names its image has no commit behind it, and asking the
+    /// build store about one would invent a relationship it does not have.
+    #[tokio::test]
+    async fn an_app_that_names_its_image_runs_it_whatever_was_built() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _, builds) = applier_over(runtime.clone(), Db::in_memory().unwrap());
+        record_build(&builds, "hello", "abc1234", "spaceport/hello:abc1234").await;
+
+        applier
+            .deploy(
+                "hello".parse().unwrap(),
+                manifest("alpha.test"),
+                Some("abc1234"),
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *runtime.images.lock().unwrap(),
+            ["strm/helloworld-http:latest".to_owned()]
+        );
     }
 }

@@ -124,6 +124,7 @@ fn router(instance: Arc<Instance>, events: Arc<EventBus>, shutdown: Cancellation
     Router::new()
         .route("/apps", get(list))
         .route("/apps/{id}", get(show).put(apply).delete(destroy))
+        .route("/apps/{id}/deployment", post(deploy))
         .route("/apps/{id}/tracking", put(track))
         .route("/apps/{id}/suspend", post(suspend))
         .route("/apps/{id}/resume", post(resume))
@@ -501,8 +502,23 @@ async fn show(
                 }
 
                 let built = built(&builds, &id).await;
+                // Nothing is applied under this name, so nothing here was ever
+                // deployed — but there may well be an image waiting, and this
+                // report is where an operator would look for it.
+                let deployment = deployment(&builds, &id, None).await;
 
-                return (StatusCode::OK, tracked_report(&id, &tracked, &built)).into_response();
+                return (
+                    StatusCode::OK,
+                    tracked_report(
+                        &id,
+                        &Origin {
+                            tracked: &tracked,
+                            built: &built,
+                            deployment: &deployment,
+                        },
+                    ),
+                )
+                    .into_response();
             }
             Err(error) => {
                 return refuse(
@@ -517,15 +533,15 @@ async fn show(
         return manifest_response(held.manifest().source_text());
     }
 
-    // Only for the timestamp: everything else is already in hand, and an app
-    // that is running is worth reporting on even if the state store has since
-    // become unreadable.
-    let applied_at = AppRepository::new(instance.db.clone())
+    // Only for the timestamp and the revision: everything else is already in
+    // hand, and an app that is running is worth reporting on even if the state
+    // store has since become unreadable.
+    let record = AppRepository::new(instance.db.clone())
         .recorded(&id)
         .await
         .ok()
-        .flatten()
-        .map(|record| record.applied_at);
+        .flatten();
+    let applied_at = record.as_ref().map(|record| record.applied_at.clone());
 
     let status = match &held {
         Held::Running(app) => statuses(std::slice::from_ref(app)).await[0].to_owned(),
@@ -538,23 +554,23 @@ async fn show(
     // Only asked for when there is a tracking, because the answer is only about
     // one: an app somebody applied an image to has no revision this could be
     // reporting on.
-    let built = match &tracked {
-        Some(_) => built(&builds, &id).await,
-        None => Built::None,
+    let (built, deployment) = match &tracked {
+        Some(_) => (
+            built(&builds, &id).await,
+            deployment(&builds, &id, record.and_then(|record| record.revision)).await,
+        ),
+        None => (Built::None, Deployment::default()),
     };
     let data = DataDir::new(instance.config.data.directory.clone());
+    let origin = tracked.as_ref().map(|tracked| Origin {
+        tracked,
+        built: &built,
+        deployment: &deployment,
+    });
 
     (
         StatusCode::OK,
-        report(
-            &id,
-            &held,
-            &status,
-            applied_at.as_deref(),
-            &data,
-            tracked.as_ref(),
-            &built,
-        ),
+        report(&id, &held, &status, applied_at.as_deref(), &data, origin),
     )
         .into_response()
 }
@@ -570,6 +586,18 @@ struct Tracked {
     /// able to leave behind, since forgetting a connection forgets what it
     /// reached, and which is still worth reporting rather than hiding.
     connection: Option<String>,
+}
+
+/// Everything a report says about where an app came from: the repository its
+/// code is in, what became of the last build, and which revision is running.
+///
+/// One subject and so one argument. The three stanzas are only ever present or
+/// absent together — an app somebody applied an image to has none of them — and
+/// each is nearly meaningless without the two beside it.
+struct Origin<'a> {
+    tracked: &'a Tracked,
+    built: &'a Built,
+    deployment: &'a Deployment,
 }
 
 /// Where the app's code lives, if an operator has said.
@@ -615,6 +643,38 @@ async fn built(builds: &BuildRepository, id: &AppId) -> Built {
         Ok(Some(build)) => Built::Latest(Box::new(build)),
         Ok(None) => Built::None,
         Err(error) => Built::Unreadable(format!("{error:#}")),
+    }
+}
+
+/// What the app is running, against what it could be.
+///
+/// Two revisions and not one, because the interesting thing about either of
+/// them is the other: an operator asking why their change is not live is asking
+/// whether an image exists that nothing has deployed, and neither number
+/// answers that alone.
+#[derive(Default)]
+struct Deployment {
+    /// The revision the applied manifest was deployed from, for an app that was
+    /// deployed rather than applied by hand.
+    deployed: Option<String>,
+    /// The newest revision there is an image for.
+    built: Option<String>,
+}
+
+/// What is deployed against what is waiting, for one app's report.
+///
+/// A read that fails is answered as nothing waiting, on [`built`]'s reasoning:
+/// the rest of the report is still worth having, and the build stanza above
+/// this one has already said that the store would not answer.
+async fn deployment(builds: &BuildRepository, id: &AppId, deployed: Option<String>) -> Deployment {
+    Deployment {
+        deployed,
+        built: builds
+            .latest_built(id)
+            .await
+            .ok()
+            .flatten()
+            .map(|build| build.revision),
     }
 }
 
@@ -678,8 +738,7 @@ fn report(
     status: &str,
     applied_at: Option<&str>,
     data: &DataDir,
-    tracked: Option<&Tracked>,
-    built: &Built,
+    origin: Option<Origin<'_>>,
 ) -> String {
     let manifest = held.manifest();
     let container = &manifest.container;
@@ -761,12 +820,20 @@ fn report(
     // gets no stanza at all, like every other section here: most apps are an
     // image somebody applied, and a line saying they track nothing would be a
     // line about a thing they are not doing.
-    if let Some(tracked) = tracked {
-        tracks(&mut out, tracked);
-        builds(&mut out, built);
+    if let Some(origin) = origin {
+        came_from(&mut out, id, &origin);
     }
 
     out.render()
+}
+
+/// The three stanzas about where an app came from, in the order they answer an
+/// operator's questions: where the code is, what became of the last push, and
+/// whether the app is running it.
+fn came_from(out: &mut Report, id: &AppId, origin: &Origin<'_>) {
+    tracks(out, origin.tracked);
+    builds(out, origin.built);
+    deploys(out, id, origin.deployment);
 }
 
 /// Everything known about an app that is only tracked.
@@ -776,23 +843,26 @@ fn report(
 /// hosts, no port and no probes. Reporting those as empty would describe a
 /// container that does not exist, so what is said instead is the one thing that
 /// is true — spaceport knows where the code is and has nothing to run.
-fn tracked_report(id: &AppId, tracked: &Tracked, built: &Built) -> String {
+fn tracked_report(id: &AppId, origin: &Origin<'_>) -> String {
     let mut out = Report::default();
 
     out.field("app", id.to_string());
     out.field("status", TRACKED.to_owned());
-    tracks(&mut out, tracked);
-    builds(&mut out, built);
+    came_from(&mut out, id, origin);
     out.field(
         "manifest",
         "none applied here yet — nothing runs, no hosts are claimed, and the edge routes nothing to it".to_owned(),
     );
-    // Deliberately says nothing about whether a build has happened: the build
-    // stanza above has already said, and the thing that is missing is the same
-    // either way. An image spaceport built is still an image nothing runs.
+    // The two ways out of this state, in the order an operator reaches them: a
+    // tracked app is one whose manifest is in its repository, so deploying a
+    // build is the ordinary answer and writing a manifest by hand is the other
+    // one. The deploy stanza above has already named the revision if there is
+    // one, so this says nothing about which.
     out.field(
         "",
-        format!("apply one with `spaceport apps apply {id} …` — spaceport builds what a push moves the tracked branch to, but running what it built is a later step that does not exist yet"),
+        format!(
+            "run what a build produced with `spaceport apps deploy {id}`, which applies the manifest the commit carried — or apply one of your own with `spaceport apps apply {id} …`"
+        ),
     );
 
     out.render()
@@ -884,6 +954,47 @@ fn builds(out: &mut Report, built: &Built) {
         for line in &lines[from..] {
             out.field("", format!("    {line}"));
         }
+    }
+}
+
+/// Which revision the app is running, against the newest one it could be.
+///
+/// A stanza of its own under the build, because the build stanza answers "did
+/// it build?" and this answers "is it live?" — and an operator watching a
+/// change reach production is asking the second one. A build that says `built`
+/// looks like an answer to it and is not: spaceport builds every push and
+/// deploys none of them, so an image finishing is exactly the moment at which
+/// the two numbers part company.
+///
+/// Nothing at all when neither is known, like every other section here: an app
+/// tracked a minute ago has nothing to say on this and should not be given a
+/// line saying so.
+fn deploys(out: &mut Report, id: &AppId, deployment: &Deployment) {
+    match (&deployment.deployed, &deployment.built) {
+        (Some(deployed), Some(built)) if deployed == built => out.field(
+            "deployed",
+            format!("{deployed}, which is the newest build there is"),
+        ),
+        (Some(deployed), Some(built)) => {
+            out.field("deployed", deployed.clone());
+            out.field(
+                "",
+                format!(
+                    "  a newer build is waiting at {built} — run it with `spaceport apps deploy {id}`"
+                ),
+            );
+        }
+        // A deployed revision whose build the store would not say anything
+        // about. Worth reporting on its own: what is running is what was asked
+        // for, and only the comparison is missing.
+        (Some(deployed), None) => out.field("deployed", deployed.clone()),
+        (None, Some(built)) => out.field(
+            "deployed",
+            format!(
+                "nothing built here is running — {built} is waiting, run it with `spaceport apps deploy {id}`"
+            ),
+        ),
+        (None, None) => {}
     }
 }
 
@@ -1211,6 +1322,339 @@ struct ApplyQuery {
     suspended: bool,
 }
 
+/// `POST /apps/{id}/deployment?revision=`: run what spaceport built.
+///
+/// A `POST` and a noun, where applying is a `PUT`, because the two say
+/// different things about repetition. An apply is the app *being* the document
+/// in the body, and running it twice leaves the same app; a deploy adds one
+/// deployment to an app's history, and which revision it lands on is a decision
+/// taken here and now out of what has been built since. The revision an
+/// operator does not name is the newest image there is, and that is a different
+/// answer this afternoon than it was this morning.
+///
+/// The manifest is the one the commit carried, taken off the build row rather
+/// than fetched again: the checkout it was read from is swept once newer
+/// revisions exist, and a deploy of a fortnight-old revision has to be able to
+/// say what that commit asked for. So this never reads github, and works on a
+/// host that cannot reach it at all.
+///
+/// Deploying to a suspended app records and claims without starting it, exactly
+/// as applying to one does — the rule belongs to [`Applier::deploy`] and is not
+/// restated here. Deciding what an app runs and deciding whether it is being
+/// run stay two decisions.
+async fn deploy(
+    State(instance): State<Arc<Instance>>,
+    State(applier): State<Arc<Applier>>,
+    State(builds): State<Arc<BuildRepository>>,
+    UrlPath(id): UrlPath<String>,
+    Query(query): Query<DeployQuery>,
+) -> Response {
+    let id: AppId = match id.parse() {
+        Ok(id) => id,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    let build = match chosen(&builds, &instance, &id, query.revision.as_deref()).await {
+        Ok(build) => build,
+        Err(refusal) => return refusal,
+    };
+
+    // A row an earlier spaceport wrote, from before the manifest was kept. The
+    // document is the whole of what there is to deploy, and there is nowhere
+    // left to read it from — the commit's checkout is long swept — so this says
+    // what will produce one rather than leaving an operator to work it out.
+    let Some(document) = build
+        .manifest
+        .as_deref()
+        .filter(|document| !document.trim().is_empty())
+    else {
+        return refuse(
+            StatusCode::CONFLICT,
+            &format!(
+                "the build of revision `{}` of app `{id}` kept no manifest — it was built by a spaceport that did not record one, and the checkout it was read from is gone\n  push the branch again, and deploy the revision that builds from it",
+                build.revision,
+            ),
+        );
+    };
+
+    let manifest = match AppManifest::parse(document) {
+        Ok(manifest) => manifest,
+        // The document is the repository's rather than the operator's, so the
+        // sentence says where it came from: what has to change is a file in a
+        // commit, not the command that was just typed.
+        Err(error) => {
+            return refuse(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!(
+                    "the `{}` that revision `{}` of app `{id}` carried is one this spaceport cannot read: {error:#}",
+                    build.manifest_path, build.revision,
+                ),
+            );
+        }
+    };
+
+    // Checked here as well as in the applier, which refuses the same row for the
+    // same reason: this is the only place that can name the image in the answer,
+    // and an answer that named none would leave the operator asking what it is
+    // now running.
+    let Some(image) = build.image_tag.clone() else {
+        return refuse(
+            StatusCode::CONFLICT,
+            &format!(
+                "the build of revision `{}` of app `{id}` recorded no image to run\n  push the branch again, and deploy the revision that builds from it",
+                build.revision,
+            ),
+        );
+    };
+
+    match applier
+        .deploy(id, manifest, Some(&build.revision), false)
+        .await
+    {
+        Ok(Applied::Running(app)) => {
+            let hosts: Vec<&str> = app.hosts().iter().map(|host| host.as_str()).collect();
+            let body = format!(
+                "app `{}` is running revision {}\n  image     {image}\n  container {}\n  upstream  {}\n  routes    {}\n",
+                app.id,
+                build.revision,
+                app.container,
+                app.upstream,
+                hosts.join(", "),
+            );
+
+            (StatusCode::OK, body).into_response()
+        }
+        Ok(Applied::Suspended(app)) => {
+            let hosts: Vec<&str> = app.hosts().iter().map(|host| host.as_str()).collect();
+            let body = format!(
+                "app `{}` is deployed at revision {}, and still suspended\n  image  {image}\n  claims {}\n  resume it with `spaceport apps resume {}`\n",
+                app.id,
+                build.revision,
+                hosts.join(", "),
+                app.id,
+            );
+
+            (StatusCode::OK, body).into_response()
+        }
+        Err(error) => {
+            warn!(%error, "deploy failed");
+            let status = match error {
+                ApplyError::Conflict(_) => StatusCode::CONFLICT,
+                ApplyError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+
+            refuse(status, &error.to_string())
+        }
+    }
+}
+
+/// Which build a deploy is about, or the sentence saying why there is none.
+///
+/// Every path out of here that is not a build is a refusal an operator can act
+/// on, which is the whole of what this is for: "not found" is true of an app
+/// nobody tracks, of a commit still in the queue and of a build that failed an
+/// hour ago, and those are three different mornings.
+async fn chosen(
+    builds: &BuildRepository,
+    instance: &Instance,
+    id: &AppId,
+    revision: Option<&str>,
+) -> Result<Build, Response> {
+    match revision {
+        Some(revision) => named(builds, instance, id, revision).await,
+        None => newest(builds, instance, id).await,
+    }
+}
+
+/// The newest image there is for the app.
+async fn newest(
+    builds: &BuildRepository,
+    instance: &Instance,
+    id: &AppId,
+) -> Result<Build, Response> {
+    match builds.latest_built(id).await {
+        Ok(Some(build)) => Ok(build),
+        Ok(None) => Err(nothing_built(builds, instance, id).await),
+        Err(error) => Err(refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not read what has been built for `{id}`: {error:#}"),
+        )),
+    }
+}
+
+/// Why an app has no image at all, in the words its own state calls for.
+///
+/// An app that was never tracked and an app whose first build has not finished
+/// are different mistakes: the first is missing a command nobody has run, the
+/// second is missing a few minutes. Answering both with "nothing to deploy"
+/// would send the second operator looking for a command they have already run.
+async fn nothing_built(builds: &BuildRepository, instance: &Instance, id: &AppId) -> Response {
+    let Some(tracked) = tracked(instance, id).await else {
+        return refuse(
+            StatusCode::NOT_FOUND,
+            &format!(
+                "app `{id}` has nothing to deploy — it tracks no repository, so spaceport has never built anything for it\n  point it at one with `spaceport apps track {id} <owner/name> --connection <slug>`"
+            ),
+        );
+    };
+    let tracking = &tracked.tracking;
+
+    match builds.latest(id).await {
+        // Something was asked for and did not become an image. Which of the
+        // three that was is the answer, since a commit in the queue is waited
+        // for and a failed one is pushed over.
+        Ok(Some(build)) => refuse(
+            StatusCode::CONFLICT,
+            &format!(
+                "app `{id}` has no finished build to deploy — the last one is {}\n  `spaceport apps show {id}` says what became of it",
+                became_of(&build),
+            ),
+        ),
+        Ok(None) => refuse(
+            StatusCode::NOT_FOUND,
+            &format!(
+                "app `{id}` has nothing to deploy yet — it tracks {} on {}, and nothing has been built from it\n  a pass is due within minutes of a push, and `spaceport apps show {id}` says when one has run",
+                tracking.repository, tracking.branch,
+            ),
+        ),
+        Err(error) => refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not read what has been built for `{id}`: {error:#}"),
+        ),
+    }
+}
+
+/// The build of the revision an operator named.
+///
+/// An abbreviation is taken, and the check is the same read the refusals need
+/// anyway: one query for the app's own rows, matched by prefix in memory. That
+/// is what makes it cheap — an app has a handful of builds, not a repository's
+/// worth of commits — and an abbreviation that names two of them is refused
+/// rather than resolved, because deploying the wrong one of two commits is
+/// exactly what the operator was hoping the sha would prevent.
+///
+/// The exact spelling wins over any prefix it is also a prefix of, so a
+/// revision typed in full is never called ambiguous by a longer one.
+async fn named(
+    builds: &BuildRepository,
+    instance: &Instance,
+    id: &AppId,
+    revision: &str,
+) -> Result<Build, Response> {
+    match builds.built(id, revision).await {
+        Ok(Some(build)) => return Ok(build),
+        Ok(None) => {}
+        Err(error) => {
+            return Err(refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not read the build of revision `{revision}` of `{id}`: {error:#}"),
+            ));
+        }
+    }
+
+    let recorded = match builds.by_app(id).await {
+        Ok(recorded) => recorded,
+        Err(error) => {
+            return Err(refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not read what has been built for `{id}`: {error:#}"),
+            ));
+        }
+    };
+
+    let matching: Vec<&Build> = match recorded.iter().find(|build| build.revision == revision) {
+        Some(exact) => vec![exact],
+        None => recorded
+            .iter()
+            .filter(|build| build.revision.starts_with(revision))
+            .collect(),
+    };
+
+    match matching.as_slice() {
+        [] => Err(unrequested(instance, id, revision).await),
+        [build] if build.state == BuildState::Built => Ok((*build).clone()),
+        [build] => Err(refuse(
+            StatusCode::CONFLICT,
+            &format!(
+                "app `{id}` cannot run revision `{revision}` — its build is {}\n  `spaceport apps show {id}` says what became of it",
+                became_of(build),
+            ),
+        )),
+        many => Err(refuse(
+            StatusCode::BAD_REQUEST,
+            &ambiguous(id, revision, many),
+        )),
+    }
+}
+
+/// A revision nothing was ever asked to build, said against what the app
+/// tracks: a commit on another branch and a commit on a repository nobody
+/// pointed the app at both arrive here, and neither is a typo the operator can
+/// see on their own.
+async fn unrequested(instance: &Instance, id: &AppId, revision: &str) -> Response {
+    match tracked(instance, id).await {
+        Some(tracked) => refuse(
+            StatusCode::NOT_FOUND,
+            &format!(
+                "app `{id}` has no build of revision `{revision}` — it tracks {} on {}, and nothing has asked for that commit\n  `spaceport apps show {id}` says what has been built",
+                tracked.tracking.repository, tracked.tracking.branch,
+            ),
+        ),
+        None => refuse(
+            StatusCode::NOT_FOUND,
+            &format!(
+                "app `{id}` has no build of revision `{revision}` — it tracks no repository, so spaceport has never built anything for it"
+            ),
+        ),
+    }
+}
+
+/// What became of a build, as the clause a refusal is written around.
+fn became_of(build: &Build) -> String {
+    match build.state {
+        BuildState::Pending => format!("waiting for a worker at {}", build.revision),
+        BuildState::Building => format!("still being built at {}", build.revision),
+        BuildState::Failed => match &build.reason {
+            Some(reason) => format!("the failure at {}: {reason}", build.revision),
+            None => format!("the failure at {}", build.revision),
+        },
+        // Never reached from either caller, both of which take a finished build
+        // as their answer rather than as a refusal — and a sentence is a better
+        // thing to leave here than a panic.
+        BuildState::Built => format!("built at {}, with no image recorded", build.revision),
+    }
+}
+
+/// An abbreviation that names more than one build, with every one it names.
+///
+/// All of them, not the first few: the operator is about to retype one, and the
+/// list is what they are choosing from.
+fn ambiguous(id: &AppId, revision: &str, matching: &[&Build]) -> String {
+    let revisions: Vec<&str> = matching
+        .iter()
+        .map(|build| build.revision.as_str())
+        .collect();
+
+    format!(
+        "`{revision}` names {} builds of app `{id}` — {} — so spaceport will not guess which\n  name the revision in full",
+        matching.len(),
+        revisions.join(", "),
+    )
+}
+
+/// Which revision to run, and how much of it was typed.
+///
+/// `deny_unknown_fields` for the reason [`TrackQuery`] has it: an option that is
+/// silently ignored is an operator deploying something other than what they
+/// named.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeployQuery {
+    /// The commit to run, in full or abbreviated to anything that names one
+    /// build of this app. Without one, the newest image there is.
+    revision: Option<String>,
+}
+
 /// `POST /apps/{id}/suspend?stop_container=`: stop serving the app, keep
 /// everything about it.
 async fn suspend(
@@ -1299,12 +1743,11 @@ const DEFAULT_MANIFEST_PATH: &str = "spaceport.yaml";
 /// place, so this ends with the app tracking exactly what the query describes,
 /// whether or not it tracked something before.
 ///
-/// Nothing is built and nothing is deployed by this, and nothing will be when a
-/// push arrives either. All a tracking buys today is that spaceport notices the
-/// push and writes down what it saw; taking a build from it is a later step that
-/// lives nowhere yet. The response says so, because an operator who has just
-/// pointed an app at a branch would otherwise sit waiting for a deployment that
-/// is not coming.
+/// A push to the branch is built from here on, and deployed by nothing: what a
+/// push produces is an image, and running it is `spaceport apps deploy`, which
+/// is a decision an operator takes. The response says so, because an operator
+/// who has just pointed an app at a branch would otherwise sit waiting for a
+/// deployment that is not coming.
 ///
 /// The app does not have to have been applied first. Applying and tracking are
 /// the two ways an app comes to exist: one hands spaceport a manifest, the other
@@ -1436,11 +1879,11 @@ async fn track(
     // in: it promises nothing that is not true of both.
     let last = if holds(&instance, &id).await.unwrap_or(true) {
         format!(
-            "  a push to `{branch}` is noticed from here on — nothing is built or deployed from it yet\n"
+            "  a push to `{branch}` is built from here on, and deployed by nothing — run what it built with `spaceport apps deploy {id}`\n"
         )
     } else {
         format!(
-            "  nothing has been applied under `{id}`, so spaceport knows where its code is and has nothing to run\n  a push to `{branch}` is noticed from here on; building the app from one is a later step that does not exist yet\n"
+            "  nothing has been applied under `{id}`, so spaceport knows where its code is and has nothing to run\n  a push to `{branch}` is built from here on — `spaceport apps deploy {id}` then runs it, manifest and all\n"
         )
     };
 
@@ -2103,6 +2546,7 @@ container:
             store.clone(),
             Arc::new(runtime),
             AppRepository::new(db.clone()),
+            BuildRepository::new(db.clone()),
         ));
         let events = Arc::new(EventBus::new());
         let shutdown = CancellationToken::new();
@@ -3335,7 +3779,19 @@ container:
         let (_, router, _, _, github, connections, tracking, builds) =
             parts_on(OneContainer::default());
         put_app(&router, "site", MANIFEST).await;
-        post_connection(&router, registration("spaceport-acme", 42)).await;
+        connected_and_reaching(&router, &connections).await;
+
+        (router, github, tracking, builds)
+    }
+
+    /// The connection every tracking here goes through, with the one repository
+    /// it reaches cached under it.
+    ///
+    /// Apart from [`tracking_parts`] so that a test which wants the app store
+    /// as well can build its own fixture out of [`parts_on`] rather than being
+    /// handed an app it is not about.
+    async fn connected_and_reaching(router: &Router, connections: &ConnectionRepository) {
+        post_connection(router, registration("spaceport-acme", 42)).await;
         connections
             .record_installations(
                 42,
@@ -3348,8 +3804,6 @@ container:
             )
             .await
             .unwrap();
-
-        (router, github, tracking, builds)
     }
 
     async fn track_app(router: &Router, id: &str, query: &str) -> (StatusCode, String) {
@@ -3397,10 +3851,10 @@ container:
             "{body}"
         );
         assert!(body.contains("has nothing to run"), "{body}");
-        assert!(
-            body.contains("a later step that does not exist yet"),
-            "{body}"
-        );
+        // A push builds and deploys nothing, and the app has no manifest here
+        // either — so the answer names the command that ends both.
+        assert!(body.contains("is built from here on"), "{body}");
+        assert!(body.contains("spaceport apps deploy echo"), "{body}");
     }
 
     /// Accepting the tracking and then denying the app exists would leave an
@@ -3714,7 +4168,7 @@ container:
         assert!(body.contains("branch     release/2026"), "{body}");
         assert!(body.contains("manifest   spaceport.yaml"), "{body}");
         assert!(body.contains("connection spaceport-acme"), "{body}");
-        assert!(body.contains("nothing is built or deployed"), "{body}");
+        assert!(body.contains("deployed by nothing"), "{body}");
         assert!(
             repositories_read(&github).is_empty(),
             "{:?}",
@@ -3841,6 +4295,7 @@ container:
             log: None,
             started_at: String::new(),
             finished_at: None,
+            manifest: None,
         }
     }
 
@@ -3879,6 +4334,7 @@ container:
                 "0123abc",
                 "spaceport/site:0123abc",
                 "sha256:0123",
+                "",
                 "step 1/1 : FROM scratch\n",
             )
             .await
@@ -4002,6 +4458,291 @@ container:
         let (_, body) = show_app(&router, "site", "").await;
 
         assert!(!body.contains("build"), "{body}");
+    }
+
+    /// The manifest a commit carries: an app built from its own repository,
+    /// which is the only kind a deploy ever runs. Under a host of its own, so
+    /// that deploying `echo` never argues with the `site` the fixture applied.
+    const FROM_A_BUILD: &str = "# built from the repository
+schema_version: 1
+source:
+  type: build
+routing:
+  hosts: [gamma.test]
+container:
+  health:
+    readiness:
+      type: none
+";
+
+    async fn deploy_app(router: &Router, id: &str, query: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/apps/{id}/deployment{query}"))
+            .body(Body::empty())
+            .unwrap();
+
+        call(router, request).await
+    }
+
+    /// Point `id` at the repository the fixture's connection reaches.
+    async fn tracked_app(router: &Router, id: &str) {
+        track_app(
+            router,
+            id,
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main",
+        )
+        .await;
+    }
+
+    /// A finished build of `revision`, with the image and the manifest a real
+    /// one would have recorded — the state every deploy starts from.
+    async fn build_succeeded(builds: &BuildRepository, id: &str, revision: &str, manifest: &str) {
+        let app: AppId = id.parse().unwrap();
+        builds.request(&build_of(id, revision)).await.unwrap();
+        builds
+            .succeeded(
+                &app,
+                revision,
+                &format!("spaceport/{id}:{revision}"),
+                "sha256:0123",
+                manifest,
+                "step 1/1 : FROM scratch\n",
+            )
+            .await
+            .unwrap();
+    }
+
+    /// What an operator who has just pushed is asking for, and the only thing
+    /// they can be asking for without naming a revision.
+    #[tokio::test]
+    async fn deploys_the_newest_build_when_no_revision_is_named() {
+        let (store, router, _, _, _, connections, _, builds) = parts_on(OneContainer::default());
+        connected_and_reaching(&router, &connections).await;
+        tracked_app(&router, "echo").await;
+        build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
+        build_succeeded(&builds, "echo", "89abcde", FROM_A_BUILD).await;
+
+        let (status, body) = deploy_app(&router, "echo", "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("app `echo` is running revision 89abcde"),
+            "{body}"
+        );
+        assert!(body.contains("image     spaceport/echo:89abcde"), "{body}");
+        assert!(body.contains("gamma.test"), "{body}");
+        assert!(store.routes().serving("gamma.test").is_some());
+    }
+
+    /// Naming a revision is how a deploy is repeated, and how an app is put
+    /// back on what it was running — so it has to beat the newest image there
+    /// is rather than being a hint towards it.
+    #[tokio::test]
+    async fn deploys_the_revision_it_was_given_rather_than_the_newest() {
+        let (_, router, _, _, _, connections, _, builds) = parts_on(OneContainer::default());
+        connected_and_reaching(&router, &connections).await;
+        tracked_app(&router, "echo").await;
+        build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
+        build_succeeded(&builds, "echo", "89abcde", FROM_A_BUILD).await;
+
+        let (status, body) = deploy_app(&router, "echo", "?revision=0123abc").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("revision 0123abc"), "{body}");
+        assert!(body.contains("spaceport/echo:0123abc"), "{body}");
+        assert!(!body.contains("89abcde"), "{body}");
+    }
+
+    /// A sha is typed off a terminal that abbreviated it, and one that names a
+    /// single build of this app is not a guess.
+    #[tokio::test]
+    async fn takes_an_abbreviated_revision_that_names_one_build() {
+        let (_, router, _, _, _, connections, _, builds) = parts_on(OneContainer::default());
+        connected_and_reaching(&router, &connections).await;
+        tracked_app(&router, "echo").await;
+        build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
+
+        let (status, body) = deploy_app(&router, "echo", "?revision=0123").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("revision 0123abc"), "{body}");
+    }
+
+    /// Deploying the wrong one of two commits is exactly what naming a sha was
+    /// meant to prevent, so an abbreviation that names both is refused with
+    /// them in it.
+    #[tokio::test]
+    async fn refuses_an_abbreviation_that_names_two_builds() {
+        let (_, router, _, _, _, connections, _, builds) = parts_on(OneContainer::default());
+        connected_and_reaching(&router, &connections).await;
+        tracked_app(&router, "echo").await;
+        build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
+        build_succeeded(&builds, "echo", "0123def", FROM_A_BUILD).await;
+
+        let (status, body) = deploy_app(&router, "echo", "?revision=0123").await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("names 2 builds of app `echo`"), "{body}");
+        assert!(body.contains("0123abc"), "{body}");
+        assert!(body.contains("0123def"), "{body}");
+        assert!(body.contains("name the revision in full"), "{body}");
+    }
+
+    /// An app nobody tracked and an app whose first build has not finished are
+    /// different mistakes, and an operator who has already run `apps track`
+    /// should not be told to run it again.
+    #[tokio::test]
+    async fn refuses_to_deploy_an_app_with_no_build() {
+        let (router, _, _, _) = tracking_parts().await;
+
+        let (untracked, body) = deploy_app(&router, "site", "").await;
+        assert_eq!(untracked, StatusCode::NOT_FOUND);
+        assert!(body.contains("it tracks no repository"), "{body}");
+        assert!(body.contains("spaceport apps track site"), "{body}");
+
+        tracked_app(&router, "echo").await;
+        let (tracked, body) = deploy_app(&router, "echo", "").await;
+        assert_eq!(tracked, StatusCode::NOT_FOUND);
+        assert!(
+            body.contains("it tracks an-organisation/site on main"),
+            "{body}"
+        );
+        assert!(body.contains("nothing has been built from it"), "{body}");
+    }
+
+    /// An operator deploying a revision a worker is in the middle of wants to
+    /// be told to wait, not told there is no such commit.
+    #[tokio::test]
+    async fn says_a_revision_that_is_still_building_is_not_one_to_run() {
+        let (router, _, _, builds) = tracking_parts().await;
+        tracked_and_requested(&builds, &router, "0123abc").await;
+        builds
+            .claim()
+            .await
+            .unwrap()
+            .expect("the build was claimed");
+
+        let (status, body) = deploy_app(&router, "site", "?revision=0123abc").await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.contains("still being built at 0123abc"), "{body}");
+        assert!(body.contains("spaceport apps show site"), "{body}");
+    }
+
+    /// A build that will never produce an image is worth its own sentence, with
+    /// the reason in it: what an operator does next is push over it.
+    #[tokio::test]
+    async fn says_why_the_build_of_a_revision_failed() {
+        let (router, _, _, builds) = tracking_parts().await;
+        tracked_and_requested(&builds, &router, "0123abc").await;
+        builds
+            .failed(
+                &"site".parse().unwrap(),
+                "0123abc",
+                "the dockerfile would not parse",
+                "",
+            )
+            .await
+            .unwrap();
+
+        let (status, body) = deploy_app(&router, "site", "?revision=0123abc").await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body.contains("the failure at 0123abc: the dockerfile would not parse"),
+            "{body}"
+        );
+    }
+
+    /// The document the commit carried, byte for byte: what is recorded is what
+    /// the repository said at that revision, and `apps show --manifest` is
+    /// where an operator compares the two.
+    #[tokio::test]
+    async fn records_the_manifest_the_commit_carried() {
+        let (_, router, _, _, _, connections, _, builds) = parts_on(OneContainer::default());
+        connected_and_reaching(&router, &connections).await;
+        tracked_app(&router, "echo").await;
+        build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
+
+        deploy_app(&router, "echo", "").await;
+
+        let (status, body) = show_app(&router, "echo", "?manifest=true").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, FROM_A_BUILD);
+        // The `type: build` it was written with, not the image it resolved to:
+        // the record is the repository's document, and a restart resolves the
+        // revision again.
+        assert!(body.contains("type: build"), "{body}");
+    }
+
+    /// Deploying decides what an app runs, never whether it is being run — the
+    /// same rule applying a manifest to a suspended app follows.
+    #[tokio::test]
+    async fn deploying_to_a_suspended_app_leaves_it_suspended() {
+        let (store, router, _, _, _, connections, _, builds) = parts_on(OneContainer::default());
+        connected_and_reaching(&router, &connections).await;
+        tracked_app(&router, "echo").await;
+        build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
+        put_app_suspended(&router, "echo", &manifest_for("gamma.test")).await;
+
+        let (status, body) = deploy_app(&router, "echo", "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("still suspended"), "{body}");
+        assert!(body.contains("spaceport apps resume echo"), "{body}");
+        assert!(store.apps().is_empty());
+        // Claimed all the same, so resuming it serves the revision at once.
+        assert!(store.routes().hosts().contains("gamma.test"));
+    }
+
+    /// The question behind "why is my change not live": an image exists and
+    /// nothing is running it, which the build stanza on its own reads as
+    /// success.
+    #[tokio::test]
+    async fn shows_the_deployed_revision_against_the_newest_build() {
+        let (_, router, _, _, _, connections, _, builds) = parts_on(OneContainer::default());
+        connected_and_reaching(&router, &connections).await;
+        tracked_app(&router, "echo").await;
+        build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
+        deploy_app(&router, "echo", "").await;
+
+        let (_, deployed) = show_app(&router, "echo", "").await;
+        assert!(
+            deployed.contains("deployed   0123abc, which is the newest build there is"),
+            "{deployed}"
+        );
+
+        build_succeeded(&builds, "echo", "89abcde", FROM_A_BUILD).await;
+
+        let (_, waiting) = show_app(&router, "echo", "").await;
+        assert!(waiting.contains("deployed   0123abc"), "{waiting}");
+        assert!(
+            waiting.contains("a newer build is waiting at 89abcde"),
+            "{waiting}"
+        );
+        assert!(waiting.contains("spaceport apps deploy echo"), "{waiting}");
+    }
+
+    /// An app that is only tracked and has an image waiting is one command away
+    /// from running, and that command is the whole of what its report has to
+    /// say.
+    #[tokio::test]
+    async fn tells_a_tracked_app_with_an_image_to_deploy_it() {
+        let (_, router, _, _, _, connections, _, builds) = parts_on(OneContainer::default());
+        connected_and_reaching(&router, &connections).await;
+        tracked_app(&router, "echo").await;
+        build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
+
+        let (status, body) = show_app(&router, "echo", "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("status    tracked"), "{body}");
+        assert!(
+            body.contains("nothing built here is running — 0123abc is waiting"),
+            "{body}"
+        );
+        assert!(body.contains("spaceport apps deploy echo"), "{body}");
     }
 
     /// An app that is gone has no builds — a pending row would be work the

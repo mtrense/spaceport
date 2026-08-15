@@ -359,6 +359,7 @@ async fn request_what_is_tracked(worker: &Worker) {
             log: None,
             started_at: String::new(),
             finished_at: None,
+            manifest: None,
         };
 
         match worker.builds.request(&build).await {
@@ -396,6 +397,7 @@ async fn run(worker: &Worker, policy: &Policy, build: &Build) {
                     &build.revision,
                     &produced.tag,
                     &produced.id,
+                    &produced.manifest,
                     &produced.log,
                 )
                 .await
@@ -462,6 +464,14 @@ struct Produced {
     /// The engine's own id, and empty for an image spaceport did not build —
     /// see [`produce`].
     id: String,
+    /// The manifest document as the commit carried it, passed on untouched.
+    ///
+    /// Filled in by [`produce`] rather than by [`resolve`], so that the two
+    /// kinds of manifest cannot disagree about whether it was worth keeping:
+    /// the revision that named a prebuilt image is exactly the one whose
+    /// document a deploy has no other way of finding, since no unpacked tree of
+    /// it will still be on this host by then.
+    manifest: String,
     log: String,
 }
 
@@ -559,7 +569,15 @@ async fn produce(worker: &Worker, policy: &Policy, build: &Build) -> Result<Prod
     let manifest = AppManifest::parse(&raw)
         .with_context(|| format!("reading the manifest `{}`", build.manifest_path))?;
 
-    resolve(worker, build, &tree, manifest.source).await
+    let produced = resolve(worker, build, &tree, manifest.source).await?;
+
+    // The document itself and not `manifest` re-serialised: what is written
+    // down has to be what somebody wrote, so that an operator reading it back
+    // is reading their own file rather than this build's idea of the schema.
+    Ok(Produced {
+        manifest: raw,
+        ..produced
+    })
 }
 
 /// What the revision's manifest says the image is.
@@ -601,6 +619,9 @@ async fn resolve(
             return Ok(Produced {
                 tag: image,
                 id: String::new(),
+                // Filled in by the caller, which is the only one holding the
+                // document — see [`Produced::manifest`].
+                manifest: String::new(),
                 log: String::new(),
             });
         }
@@ -636,6 +657,7 @@ async fn resolve(
     Ok(Produced {
         tag: image.tag,
         id: image.id,
+        manifest: String::new(),
         log: image.log.join("\n"),
     })
 }
@@ -1037,6 +1059,9 @@ routing:
         assert_eq!(build.image_tag.as_deref(), Some("spaceport/site:0123456"));
         assert!(build.image_id.unwrap().starts_with("sha256:"));
         assert!(build.log.unwrap().contains("FROM scratch"));
+        // The document out of the commit, byte for byte — the tree it came from
+        // is swept long before a deploy asks what it said.
+        assert_eq!(build.manifest.as_deref(), Some(BUILT_MANIFEST));
         // The location GitHub gave is the one that was fetched, rather than a
         // url built out of what spaceport happens to know.
         assert_eq!(fixture.archives.fetches(), [LOCATION]);
@@ -1074,6 +1099,9 @@ routing:
             Some("ghcr.io/an-organisation/site:v1")
         );
         assert!(fixture.engine.requests().is_empty());
+        // Never through the engine, and still the revision whose manifest a
+        // deploy has nowhere else to read.
+        assert_eq!(build.manifest.as_deref(), Some(PREBUILT_MANIFEST));
 
         fixture.clean_up();
     }
@@ -1295,6 +1323,7 @@ routing:
             log: None,
             started_at: String::new(),
             finished_at: None,
+            manifest: None,
         }
     }
 

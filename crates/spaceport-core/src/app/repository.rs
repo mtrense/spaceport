@@ -33,6 +33,18 @@ pub struct AppRecord {
     /// Still intent, and still this app's: a suspended record says the operator
     /// wants this manifest under this id and does not want it served yet.
     pub suspended: bool,
+
+    /// The commit whose build this app runs, for a manifest that is built
+    /// rather than pulled.
+    ///
+    /// The revision and not the image tag it resolved to, for the same reason
+    /// the manifest is kept verbatim: this is intent. A restart re-resolves
+    /// *this* revision and runs what was deployed, where a stored tag would run
+    /// whatever a later build happened to move it to, and a stored "latest
+    /// build" would silently deploy a commit nobody asked for. `None` for an
+    /// app whose manifest names its image outright, which has no revision to
+    /// remember.
+    pub revision: Option<String>,
 }
 
 /// SQLite integers are signed, so a schema version goes in as an `i64`.
@@ -60,32 +72,46 @@ impl AppRepository {
     }
 
     /// Remember that `manifest` is what the app named `id` should be running,
-    /// and whether it should be running it yet.
+    /// which commit it was deployed from, and whether it should be running it
+    /// yet.
     ///
     /// Replaces whatever was recorded under that id — an apply is a `PUT`, and
-    /// so is this.
-    pub async fn record_applied(&self, id: &AppId, manifest: &str, suspended: bool) -> Result<()> {
+    /// so is this. `revision` goes the same way: an operator who applies a
+    /// manifest of their own over a deployed one has replaced the app, and a
+    /// revision left behind from the deploy before would outlive what it
+    /// described.
+    pub async fn record_applied(
+        &self,
+        id: &AppId,
+        manifest: &str,
+        revision: Option<&str>,
+        suspended: bool,
+    ) -> Result<()> {
         let id = id.to_string();
         let manifest = manifest.to_owned();
+        let revision = revision.map(str::to_owned);
         let applied_at = crate::state::now();
 
         self.db
             .call(move |connection| {
                 connection
                     .execute(
-                        "INSERT INTO apps (id, schema_version, manifest, applied_at, suspended)
-                         VALUES (?1, ?2, ?3, ?4, ?5)
+                        "INSERT INTO apps
+                             (id, schema_version, manifest, applied_at, suspended, revision)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                          ON CONFLICT(id) DO UPDATE SET
                              schema_version = excluded.schema_version,
                              manifest       = excluded.manifest,
                              applied_at     = excluded.applied_at,
-                             suspended      = excluded.suspended",
+                             suspended      = excluded.suspended,
+                             revision       = excluded.revision",
                         rusqlite::params![
                             id,
                             stored(SCHEMA_VERSION),
                             manifest,
                             applied_at,
-                            suspended
+                            suspended,
+                            revision
                         ],
                     )
                     .context("recording an applied app")?;
@@ -144,15 +170,23 @@ impl AppRepository {
         let wanted = id.clone();
         let id = id.to_string();
 
-        let row: Option<(i64, String, String, bool)> = self
+        let row: Option<(i64, String, String, bool, Option<String>)> = self
             .db
             .call(move |connection| {
                 connection
                     .query_row(
-                        "SELECT schema_version, manifest, applied_at, suspended
+                        "SELECT schema_version, manifest, applied_at, suspended, revision
                          FROM apps WHERE id = ?1",
                         [id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ))
+                        },
                     )
                     .optional()
                     .context("reading a recorded app")
@@ -160,12 +194,13 @@ impl AppRepository {
             .await?;
 
         Ok(row.map(
-            |(schema_version, manifest, applied_at, suspended)| AppRecord {
+            |(schema_version, manifest, applied_at, suspended, revision)| AppRecord {
                 id: wanted,
                 schema_version: read(schema_version),
                 manifest,
                 applied_at,
                 suspended,
+                revision,
             },
         ))
     }
@@ -179,12 +214,12 @@ impl AppRepository {
     /// failing the read: one unreadable record must not cost every other app
     /// its restart.
     pub async fn desired(&self) -> Result<Vec<AppRecord>> {
-        let rows: Vec<(String, i64, String, String, bool)> = self
+        let rows: Vec<(String, i64, String, String, bool, Option<String>)> = self
             .db
             .call(|connection| {
                 let mut statement = connection
                     .prepare(
-                        "SELECT id, schema_version, manifest, applied_at, suspended
+                        "SELECT id, schema_version, manifest, applied_at, suspended, revision
                          FROM apps ORDER BY id",
                     )
                     .context("preparing the desired-apps query")?;
@@ -197,6 +232,7 @@ impl AppRepository {
                             row.get(2)?,
                             row.get(3)?,
                             row.get(4)?,
+                            row.get(5)?,
                         ))
                     })
                     .context("reading the desired apps")?
@@ -209,21 +245,24 @@ impl AppRepository {
 
         Ok(rows
             .into_iter()
-            .filter_map(|(id, schema_version, manifest, applied_at, suspended)| {
-                match id.parse::<AppId>() {
+            .filter_map(
+                |(id, schema_version, manifest, applied_at, suspended, revision)| match id
+                    .parse::<AppId>()
+                {
                     Ok(id) => Some(AppRecord {
                         id,
                         schema_version: read(schema_version),
                         manifest,
                         applied_at,
                         suspended,
+                        revision,
                     }),
                     Err(error) => {
                         warn!(app = id, %error, "skipping a recorded app whose id is not valid");
                         None
                     }
-                }
-            })
+                },
+            )
             .collect())
     }
 }
@@ -257,7 +296,7 @@ routing:
     async fn records_a_manifest_verbatim() {
         let repository = repository();
         repository
-            .record_applied(&id("hello"), MANIFEST, false)
+            .record_applied(&id("hello"), MANIFEST, None, false)
             .await
             .unwrap();
 
@@ -274,12 +313,12 @@ routing:
     async fn re_recording_replaces_the_manifest() {
         let repository = repository();
         repository
-            .record_applied(&id("hello"), MANIFEST, false)
+            .record_applied(&id("hello"), MANIFEST, None, false)
             .await
             .unwrap();
         let changed = MANIFEST.replace("alpha.test", "beta.test");
         repository
-            .record_applied(&id("hello"), &changed, false)
+            .record_applied(&id("hello"), &changed, None, false)
             .await
             .unwrap();
 
@@ -292,7 +331,7 @@ routing:
     async fn forgets_an_app() {
         let repository = repository();
         repository
-            .record_applied(&id("hello"), MANIFEST, false)
+            .record_applied(&id("hello"), MANIFEST, None, false)
             .await
             .unwrap();
 
@@ -309,7 +348,7 @@ routing:
     async fn reads_back_one_app() {
         let repository = repository();
         repository
-            .record_applied(&id("hello"), MANIFEST, false)
+            .record_applied(&id("hello"), MANIFEST, None, false)
             .await
             .unwrap();
 
@@ -323,7 +362,7 @@ routing:
         let repository = repository();
         for app in ["zulu", "alpha", "mike"] {
             repository
-                .record_applied(&id(app), MANIFEST, false)
+                .record_applied(&id(app), MANIFEST, None, false)
                 .await
                 .unwrap();
         }
@@ -342,7 +381,7 @@ routing:
     async fn records_an_app_as_running_by_default() {
         let repository = repository();
         repository
-            .record_applied(&id("hello"), MANIFEST, false)
+            .record_applied(&id("hello"), MANIFEST, None, false)
             .await
             .unwrap();
 
@@ -353,7 +392,7 @@ routing:
     async fn records_an_app_that_was_applied_suspended() {
         let repository = repository();
         repository
-            .record_applied(&id("hello"), MANIFEST, true)
+            .record_applied(&id("hello"), MANIFEST, None, true)
             .await
             .unwrap();
 
@@ -368,11 +407,56 @@ routing:
         );
     }
 
+    /// What a restart re-resolves: the commit, not the image its build was
+    /// tagged with.
+    #[tokio::test]
+    async fn records_the_revision_an_app_was_deployed_from() {
+        let repository = repository();
+        repository
+            .record_applied(&id("hello"), MANIFEST, Some("abc1234"), false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repository.desired().await.unwrap()[0].revision.as_deref(),
+            Some("abc1234")
+        );
+        assert_eq!(
+            repository
+                .recorded(&id("hello"))
+                .await
+                .unwrap()
+                .unwrap()
+                .revision
+                .as_deref(),
+            Some("abc1234")
+        );
+    }
+
+    /// An operator who applies a manifest of their own over a deployed app has
+    /// replaced it, and a revision from the deploy before would outlive the app
+    /// it described.
+    #[tokio::test]
+    async fn re_recording_without_a_revision_forgets_the_one_before() {
+        let repository = repository();
+        repository
+            .record_applied(&id("hello"), MANIFEST, Some("abc1234"), false)
+            .await
+            .unwrap();
+
+        repository
+            .record_applied(&id("hello"), MANIFEST, None, false)
+            .await
+            .unwrap();
+
+        assert_eq!(repository.desired().await.unwrap()[0].revision, None);
+    }
+
     #[tokio::test]
     async fn suspends_and_resumes_a_recorded_app() {
         let repository = repository();
         repository
-            .record_applied(&id("hello"), MANIFEST, false)
+            .record_applied(&id("hello"), MANIFEST, None, false)
             .await
             .unwrap();
 
@@ -389,7 +473,7 @@ routing:
     async fn suspending_leaves_the_manifest_and_applied_at_alone() {
         let repository = repository();
         repository
-            .record_applied(&id("hello"), MANIFEST, false)
+            .record_applied(&id("hello"), MANIFEST, None, false)
             .await
             .unwrap();
         let before = repository.recorded(&id("hello")).await.unwrap().unwrap();
@@ -417,7 +501,7 @@ routing:
     async fn skips_a_record_whose_id_is_not_valid() {
         let repository = repository();
         repository
-            .record_applied(&id("hello"), MANIFEST, false)
+            .record_applied(&id("hello"), MANIFEST, None, false)
             .await
             .unwrap();
         repository
