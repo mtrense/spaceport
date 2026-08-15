@@ -397,6 +397,9 @@ mod tests {
                 connections: Arc::new(crate::connections::github::ConnectionRepository::new(
                     crate::state::Db::in_memory().unwrap(),
                 )),
+                tracking: Arc::new(crate::connections::github::TrackingRepository::new(
+                    crate::state::Db::in_memory().unwrap(),
+                )),
                 github: crate::connections::github::api::testing::FakeGitHub::new(),
                 nudge: crate::connections::github::Nudge::new(),
                 hostname: None,

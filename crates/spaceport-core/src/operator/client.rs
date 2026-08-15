@@ -70,6 +70,40 @@ pub async fn resume(endpoint: &OperatorEndpoint, id: &AppId) -> Result<String> {
     send_to(endpoint, request).await
 }
 
+/// Ask it to remember that the app named `id` is built from `repository`.
+///
+/// Without `branch`, the spaceport asks GitHub for the repository's default
+/// branch and records what it answers, so the app follows a branch by name from
+/// then on rather than following whatever the default becomes. Without
+/// `manifest_path`, the manifest is looked for at the top of the repository.
+///
+/// The values go into the query string as they are, which is what every other
+/// call here does and is enough for these: a full name and a slug are github's
+/// own characters, a path is a path, and a branch may hold `/`, which a query
+/// string carries. It is not enough for a branch holding `&`, `#` or `%` —
+/// unusual, and permitted by git — and the answer to that is an encoder this
+/// crate does not have and will not gain a dependency for over a branch nobody
+/// has yet. Such a branch is refused by the spaceport as a repository or a
+/// branch it cannot find rather than silently tracking something else.
+pub async fn track(
+    endpoint: &OperatorEndpoint,
+    id: &AppId,
+    repository: &str,
+    connection: &str,
+    branch: Option<&str>,
+    manifest_path: Option<&str>,
+) -> Result<String> {
+    let mut uri = format!("/apps/{id}/tracking?repository={repository}&connection={connection}");
+    if let Some(branch) = branch {
+        let _ = write!(uri, "&branch={branch}");
+    }
+    if let Some(manifest_path) = manifest_path {
+        let _ = write!(uri, "&manifest_path={manifest_path}");
+    }
+
+    send_to(endpoint, builder("PUT", &uri).body(Full::default())?).await
+}
+
 /// Ask for the apps it is running, optionally only those matching `pattern`.
 pub async fn list(endpoint: &OperatorEndpoint, pattern: Option<&Pattern>) -> Result<String> {
     // A pattern is lowercase letters, digits, hyphens and `*`, all of which a

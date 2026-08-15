@@ -251,6 +251,19 @@ impl ConnectionRepository {
                         .with_context(|| format!("forgetting the rows in `{table}`"))?;
                 }
 
+                // Spelled out separately because the column is not `app_id`:
+                // `github_tracking` holds spaceport's own app id as well, and
+                // names GitHub's `github_app_id` so the two cannot be mistaken
+                // for one another. Written here rather than delegated to
+                // `TrackingRepository`, so it is inside the one transaction
+                // that makes a disconnect all-or-nothing.
+                transaction
+                    .execute(
+                        "DELETE FROM github_tracking WHERE github_app_id = ?1",
+                        [app_id],
+                    )
+                    .context("forgetting what the connection's apps tracked")?;
+
                 transaction
                     .commit()
                     .context("committing a forgotten github connection")?;
@@ -691,10 +704,25 @@ mod tests {
             .record_delivery("delivery-1", 42, "push")
             .await
             .unwrap();
+        let tracking = crate::connections::github::TrackingRepository::new(repository.db.clone());
+        tracking
+            .record(&crate::connections::github::Tracking {
+                app: "site".parse().unwrap(),
+                github_app_id: 42,
+                repository: "an-organisation/site".to_owned(),
+                branch: "main".to_owned(),
+                manifest_path: "spaceport.yaml".to_owned(),
+                tracked_at: String::new(),
+                revision: None,
+                revision_seen_at: None,
+            })
+            .await
+            .unwrap();
 
         repository.forget("spaceport").await.unwrap();
 
         assert!(repository.installations(42).await.unwrap().is_empty());
+        assert!(tracking.all().await.unwrap().is_empty());
         // The delivery is gone too, so its id is new again.
         assert!(
             repository

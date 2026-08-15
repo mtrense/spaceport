@@ -17,15 +17,21 @@
 //! hand, the App Manifest flow that has GitHub create one instead — the
 //! webhook, which verifies what GitHub delivers and records it as an event, and
 //! the reconciliation that asks GitHub outright on a timer and heals whatever a
-//! webhook missed. Acting on any of it is a later step and lives nowhere yet.
+//! webhook missed — and, unlike all of that, the one operator decision in here:
+//! which repository and branch an app is built from — and, beside it, the one
+//! thing a delivery makes happen: a push to a tracked branch writes down the
+//! head it moved to. Building anything from that head is a later step and lives
+//! nowhere yet.
 
 pub mod api;
 pub mod jwt;
 pub mod key;
 pub mod manifest;
+pub mod push;
 pub mod reconcile;
 pub mod register;
 pub mod repository;
+pub mod tracking;
 pub mod webhook;
 
 pub use api::{Client, Network, Transport};
@@ -33,3 +39,4 @@ pub use manifest::{Attempt, Attempts};
 pub use reconcile::{Nudge, maintain};
 pub use register::{Registration, connect};
 pub use repository::{Connection, ConnectionRepository, Installation};
+pub use tracking::{Tracking, TrackingRepository};

@@ -122,6 +122,49 @@ const MIGRATIONS: &[&str] = &[
         event       TEXT    NOT NULL,
         received_at TEXT    NOT NULL
     ) STRICT;",
+    // 5 — which repository an app is built from, and which commit of it was
+    // last accepted.
+    //
+    // Two id-spaces meet in this one table and they are deliberately spelled
+    // apart. Everywhere else under `github_*`, `app_id` means GitHub's numeric
+    // App id; spaceport's own `AppId` is a text name an operator chose. Here
+    // they would sit side by side as two columns called `app_id`, and the first
+    // person to write a join would get a query that runs, returns nothing, and
+    // looks correct. `spaceport_app` and `github_app_id` cannot be confused for
+    // one another, and a `TEXT` column beside an `INTEGER` one will not compare
+    // equal under `STRICT` even if somebody tries.
+    //
+    // The primary key is the spaceport app, so an app tracks at most one
+    // repository and re-tracking is a `PUT` — the same shape as `apps`, where
+    // the id an operator chose is the whole identity of the thing. The
+    // converse is not constrained: many apps may be built from one repository,
+    // a monorepo with a manifest per app being the ordinary case.
+    //
+    // `github_tracking_by_push` is the index a delivery reads. A push names an
+    // App, a repository and a ref, and the question it asks is "which apps does
+    // that move?" — so the index is on exactly those three columns, in that
+    // order, and the App id comes first because it is what a delivery has
+    // already been verified against.
+    //
+    // No foreign keys, for the reason step 4 gives: forgetting a connection
+    // deletes these rows explicitly, and a constraint would make writing a
+    // tracking row depend on a connection row that a concurrent disconnect may
+    // have taken.
+    //
+    // `revision` is nullable because an app can be pointed at a branch before
+    // anything has ever been built from it, and "no commit has been accepted
+    // yet" is a different answer from "the commit is the empty string".
+    "CREATE TABLE github_tracking (
+        spaceport_app    TEXT    PRIMARY KEY,
+        github_app_id    INTEGER NOT NULL,
+        repository       TEXT    NOT NULL,
+        branch           TEXT    NOT NULL,
+        manifest_path    TEXT    NOT NULL,
+        tracked_at       TEXT    NOT NULL,
+        revision         TEXT,
+        revision_seen_at TEXT
+    ) STRICT;
+    CREATE INDEX github_tracking_by_push ON github_tracking (github_app_id, repository, branch);",
 ];
 
 /// The schema version this build writes.
@@ -283,6 +326,26 @@ mod tests {
         assert_eq!(
             columns(&connection, "github_deliveries"),
             ["delivery_id", "app_id", "event", "received_at"]
+        );
+    }
+
+    #[test]
+    fn the_fifth_migration_creates_the_tracking_table() {
+        let connection = empty();
+        migrate(&connection).unwrap();
+
+        assert_eq!(
+            columns(&connection, "github_tracking"),
+            [
+                "spaceport_app",
+                "github_app_id",
+                "repository",
+                "branch",
+                "manifest_path",
+                "tracked_at",
+                "revision",
+                "revision_seen_at"
+            ]
         );
     }
 

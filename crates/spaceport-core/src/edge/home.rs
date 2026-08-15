@@ -37,17 +37,23 @@ use time::OffsetDateTime;
 use tracing::warn;
 
 use crate::connections::github::manifest::{self, Attempts, Manifest};
-use crate::connections::github::{ConnectionRepository, Nudge, Transport, register, webhook};
+use crate::connections::github::{
+    ConnectionRepository, Nudge, TrackingRepository, Transport, register, webhook,
+};
 
 /// What the pages on spaceport's own host are served out of.
 ///
 /// One struct rather than an extractor apiece, because everything in here is
-/// held for the life of the process and the alternative is threading four
-/// `Arc`s through `edge::serve` separately.
+/// held for the life of the process and the alternative is threading every one
+/// of the `Arc`s through `edge::serve` separately.
 pub struct Home {
     /// The registrations an operator has started and not yet finished.
     pub attempts: Arc<Attempts>,
     pub connections: Arc<ConnectionRepository>,
+    /// What each app is built from, over the same database as `connections`.
+    /// Held here because a push arrives at this router and nowhere else, and
+    /// the handler that decides what one means has to be able to ask.
+    pub tracking: Arc<TrackingRepository>,
     /// How the callback reaches GitHub to exchange the code it was handed.
     pub github: Arc<dyn Transport>,
     /// How both handlers here tell the reconciler that what it has cached is
@@ -240,7 +246,15 @@ async fn callback(
 /// The answer is a status and no body: what is reading it is GitHub's delivery
 /// machinery, which records the status and nothing else.
 async fn deliver(State(home): State<Arc<Home>>, headers: HeaderMap, body: Bytes) -> Response {
-    match webhook::receive(&home.connections, &home.nudge, &headers, &body).await {
+    match webhook::receive(
+        &home.connections,
+        &home.tracking,
+        &home.nudge,
+        &headers,
+        &body,
+    )
+    .await
+    {
         Ok(outcome) => outcome.status().into_response(),
         Err(error) => {
             warn!(error = %format!("{error:#}"), "a github webhook delivery could not be handled");
@@ -360,9 +374,11 @@ mod tests {
         let github = FakeGitHub::new();
         github.converts_manifests_into(42, "spaceport-for-acme", "Spaceport for Acme");
 
+        let db = Db::in_memory().unwrap();
         let home = Arc::new(Home {
             attempts: Arc::new(Attempts::new()),
-            connections: Arc::new(ConnectionRepository::new(Db::in_memory().unwrap())),
+            connections: Arc::new(ConnectionRepository::new(db.clone())),
+            tracking: Arc::new(TrackingRepository::new(db)),
             github: github.clone(),
             nudge: Nudge::new(),
             hostname: Some(HOSTNAME.to_owned()),

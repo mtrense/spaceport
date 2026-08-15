@@ -24,7 +24,7 @@ use crate::acme::{CertificateRepository, Certificates};
 use crate::app::reconcile::Report;
 use crate::app::{AppId, Applier, health};
 use crate::config::{Config, TlsProvider};
-use crate::connections::github::{self, ConnectionRepository};
+use crate::connections::github::{self, ConnectionRepository, TrackingRepository};
 use crate::operator::OperatorEndpoint;
 use crate::state::Db;
 
@@ -51,6 +51,11 @@ pub struct Instance {
     /// rather than made on demand so that every handler which needs one gets
     /// the same one, over the same database.
     pub connections: Arc<ConnectionRepository>,
+    /// Which repository each app is built from. Held beside `connections` and
+    /// over the same database, for the same reason: a handler that points an
+    /// app at a branch must be looking at the same rows as the edge that will
+    /// be told about the pushes to it. Nothing reads it yet.
+    pub tracking: Arc<TrackingRepository>,
     /// How anything that has to ask GitHub something reaches it. One for the
     /// whole process, so every connection shares the connection pool rather
     /// than opening a TLS session per operator command.
@@ -526,6 +531,7 @@ container:
             operator: "/run/spaceport.sock".parse().unwrap(),
             applier,
             connections: Arc::new(ConnectionRepository::new(db.clone())),
+            tracking: Arc::new(TrackingRepository::new(db.clone())),
             github: github::api::testing::FakeGitHub::new(),
             attempts: Arc::new(github::Attempts::new()),
             nudge: github::Nudge::new(),

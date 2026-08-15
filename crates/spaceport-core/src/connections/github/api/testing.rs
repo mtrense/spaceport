@@ -2,8 +2,8 @@
 //!
 //! Enough of it for everything [`super::Client`] asks: the App record,
 //! the installations of an App — over as many pages as a test wants — the
-//! repositories of an installation, and the mint that turns an installation
-//! into a token. Requests never leave the process; the client is handed this as
+//! repositories of an installation, one repository read by name, and the mint
+//! that turns an installation into a token. Requests never leave the process; the client is handed this as
 //! its [`Transport`] and there is no socket anywhere.
 //!
 //! What makes it worth having is the recording. Every request is kept with the
@@ -17,6 +17,7 @@
 //! verifies its own against the public key already. All this looks at is the
 //! scheme in front of the token.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -75,6 +76,11 @@ struct State {
     installations: Vec<Value>,
     /// Pages of `/installation/repositories`, each a JSON array.
     repositories: Vec<Value>,
+    /// The default branch of each repository `/repos/{owner}/{name}` knows, by
+    /// full name. Kept apart from the listing pages because the two answer
+    /// different questions — a repository can be granted to an installation and
+    /// still be one no test ever said anything about the branches of.
+    default_branches: HashMap<String, String>,
     token_lifetime: Duration,
     minted: usize,
     /// Answer every request with this status and body instead.
@@ -93,7 +99,8 @@ struct State {
 
 impl FakeGitHub {
     /// A GitHub holding the app the tests connect, one installation and one
-    /// repository — the shape everything starts from.
+    /// repository whose default branch is `main` — the shape everything starts
+    /// from.
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State {
@@ -110,6 +117,10 @@ impl FakeGitHub {
                     json!([{"id": 7, "account": {"login": "an-organisation", "type": "Organization"}}]),
                 ],
                 repositories: vec![json!([{"full_name": "an-organisation/site"}])],
+                default_branches: HashMap::from([(
+                    "an-organisation/site".to_owned(),
+                    "main".to_owned(),
+                )]),
                 token_lifetime: TOKEN_LIFETIME,
                 minted: 0,
                 refusal: None,
@@ -161,6 +172,22 @@ impl FakeGitHub {
                     .collect()
             })
             .collect();
+    }
+
+    /// Say that `/repos/{full_name}` exists and that this is its default
+    /// branch.
+    ///
+    /// Separate from [`Self::repositories_in_pages`] on purpose: a test about
+    /// what an installation can see and a test about which branch an app tracks
+    /// are different tests, and making one script the other would tie them
+    /// together for no reason. A repository nobody has said this about is one
+    /// this GitHub answers `404` for.
+    pub(crate) fn repository_defaults_to(&self, full_name: &str, branch: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .default_branches
+            .insert(full_name.to_owned(), branch.to_owned());
     }
 
     /// Mint tokens that are good for this long — negative for one that has
@@ -288,6 +315,32 @@ impl FakeGitHub {
                     }),
                     next,
                 )
+            }
+            // One repository by name. The name is the path tail as it arrived,
+            // so a test that asks for `owner/name` is asking exactly what the
+            // client put on the wire.
+            ["", "repos", owner, name] => {
+                let full_name = format!("{owner}/{name}");
+
+                match state.default_branches.get(&full_name) {
+                    Some(default_branch) => ok(
+                        json!({
+                            "full_name": full_name,
+                            "default_branch": default_branch,
+                            // A field spaceport does not know, for the same
+                            // reason `/app` carries one.
+                            "html_url": format!("https://github.com/{full_name}"),
+                        }),
+                        None,
+                    ),
+                    // GitHub answers `404` rather than `403` for a repository an
+                    // installation may not see, so that a token cannot be used
+                    // to find out what exists.
+                    None => Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Bytes::from_static(br#"{"message":"Not Found"}"#))
+                        .unwrap(),
+                }
             }
             ["", "app", "installations", installation, "access_tokens"] => {
                 state.minted += 1;

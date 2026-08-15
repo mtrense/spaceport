@@ -7,7 +7,7 @@
 //! person, because that is who is running the command.
 
 use std::convert::Infallible;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -15,7 +15,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{FromRef, Path as UrlPath, Query, State};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http::StatusCode;
@@ -29,7 +29,8 @@ use super::OperatorEndpoint;
 use crate::app::apply::{Applied, Applier, ApplyError, DestroyError, ResumeError, SuspendError};
 use crate::app::{App, AppId, AppManifest, AppRepository, DataDir, Pattern, health};
 use crate::connections::github::{
-    ConnectionRepository, Nudge, Registration, Transport, manifest, register,
+    Client, ConnectionRepository, Installation, Nudge, Registration, Tracking, TrackingRepository,
+    Transport, manifest, register,
 };
 use crate::events::{Event, EventBus, EventFilter, Level};
 use crate::runtime::Adopted;
@@ -122,6 +123,7 @@ fn router(instance: Arc<Instance>, events: Arc<EventBus>, shutdown: Cancellation
     Router::new()
         .route("/apps", get(list))
         .route("/apps/{id}", get(show).put(apply).delete(destroy))
+        .route("/apps/{id}/tracking", put(track))
         .route("/apps/{id}/suspend", post(suspend))
         .route("/apps/{id}/resume", post(resume))
         .route("/connections", get(connections))
@@ -165,6 +167,14 @@ impl FromRef<Operator> for Arc<Instance> {
 impl FromRef<Operator> for Arc<ConnectionRepository> {
     fn from_ref(operator: &Operator) -> Self {
         operator.instance.connections.clone()
+    }
+}
+
+/// So the handler that points an app at a repository can extract the store with
+/// `State` and never learn that there is an instance around it.
+impl FromRef<Operator> for Arc<TrackingRepository> {
+    fn from_ref(operator: &Operator) -> Self {
+        operator.instance.tracking.clone()
     }
 }
 
@@ -309,7 +319,12 @@ impl EventQuery {
 }
 
 /// `GET /apps?pattern=…`: what is running, as a table.
-async fn list(State(applier): State<Arc<Applier>>, Query(query): Query<ListQuery>) -> Response {
+///
+/// An app that is only tracked is listed with the rest, under a status of its
+/// own. Leaving it out would mean `spaceport apps track` accepting a name and
+/// this then denying there is an app by it — and the name is the one thing an
+/// operator has to go on until a manifest arrives.
+async fn list(State(instance): State<Arc<Instance>>, Query(query): Query<ListQuery>) -> Response {
     let pattern = match query
         .pattern
         .as_deref()
@@ -321,7 +336,7 @@ async fn list(State(applier): State<Arc<Applier>>, Query(query): Query<ListQuery
     };
 
     let matches = |id: &AppId| pattern.as_ref().is_none_or(|p| p.matches(id));
-    let store = applier.store();
+    let store = instance.applier.store();
     let running: Vec<_> = store
         .apps()
         .into_iter()
@@ -332,15 +347,6 @@ async fn list(State(applier): State<Arc<Applier>>, Query(query): Query<ListQuery
         .into_iter()
         .filter(|app| matches(&app.id))
         .collect();
-
-    if running.is_empty() && suspended.is_empty() {
-        let body = match &pattern {
-            Some(pattern) => format!("no app matches `{pattern}`\n"),
-            None => "no apps are running\n".to_owned(),
-        };
-
-        return (StatusCode::OK, body).into_response();
-    }
 
     // Suspended apps are listed with the rest, in with them rather than after:
     // an operator asking what spaceport has wants the whole answer, and the
@@ -361,10 +367,61 @@ async fn list(State(applier): State<Arc<Applier>>, Query(query): Query<ListQuery
             hosts: app.hosts().to_vec(),
         }))
         .collect();
+    rows.extend(tracked_only(&instance, &matches).await);
+
+    if rows.is_empty() {
+        let body = match &pattern {
+            Some(pattern) => format!("no app matches `{pattern}`\n"),
+            None => "no apps are running\n".to_owned(),
+        };
+
+        return (StatusCode::OK, body).into_response();
+    }
+
     rows.sort_by(|a, b| a.id.cmp(&b.id));
 
     (StatusCode::OK, table(&rows)).into_response()
 }
+
+/// The apps that are tracked and have no manifest applied, as listing lines.
+///
+/// The repository stands in for the source, because it is where the source will
+/// come from and there is nothing else to name: no image was chosen here. There
+/// are no hosts either — those are in a manifest nobody has applied, so the
+/// column is empty rather than guessed at.
+///
+/// A store that will not answer costs these apps their lines rather than the
+/// whole listing: the apps that *are* running are the ones an operator is most
+/// often asking after, and half a table beats a refusal.
+async fn tracked_only(instance: &Instance, matches: &impl Fn(&AppId) -> bool) -> Vec<Listed> {
+    let mut listed = Vec::new();
+
+    for tracking in instance.tracking.all().await.unwrap_or_default() {
+        // A read that fails is taken as the app having a manifest, which is the
+        // safer way to be wrong: it leaves a line out of the table rather than
+        // printing the same app twice.
+        if !matches(&tracking.app) || holds(instance, &tracking.app).await.unwrap_or(true) {
+            continue;
+        }
+
+        listed.push(Listed {
+            id: tracking.app,
+            source: format!("repository {}@{}", tracking.repository, tracking.branch),
+            status: TRACKED,
+            hosts: Vec::new(),
+        });
+    }
+
+    listed
+}
+
+/// What an app with a tracking and no manifest is called wherever a status is
+/// printed.
+///
+/// A word of its own beside `ready`, `suspended` and `down`, because those are
+/// all states of something spaceport is running and this is not one of them:
+/// spaceport knows where the app's code is and has nothing to run.
+const TRACKED: &str = "tracked";
 
 /// `GET /apps/{id}?manifest=`: everything spaceport knows about one app.
 ///
@@ -375,7 +432,9 @@ async fn list(State(applier): State<Arc<Applier>>, Query(query): Query<ListQuery
 ///
 /// Answers for an app that is recorded but not in the routing table at all —
 /// the one spaceport failed to bring back at startup — because that is exactly
-/// the app somebody is asking about.
+/// the app somebody is asking about. And for one that is only tracked, whose
+/// manifest is in a repository and has never been applied here: `track` took
+/// that name, so this has to know it.
 async fn show(
     State(instance): State<Arc<Instance>>,
     UrlPath(id): UrlPath<String>,
@@ -414,7 +473,24 @@ async fn show(
                 }
             },
             Ok(None) => {
-                return refuse(StatusCode::NOT_FOUND, &format!("no app named `{id}`"));
+                let Some(tracked) = tracked(&instance, &id).await else {
+                    return refuse(StatusCode::NOT_FOUND, &format!("no app named `{id}`"));
+                };
+
+                // Asking for the manifest of an app that has none is answered
+                // with where it is rather than with an empty document: the
+                // file exists, and not on this host.
+                if query.manifest {
+                    return refuse(
+                        StatusCode::NOT_FOUND,
+                        &format!(
+                            "app `{id}` has no manifest here — it tracks {}, where the manifest is {}",
+                            tracked.tracking.repository, tracked.tracking.manifest_path,
+                        ),
+                    );
+                }
+
+                return (StatusCode::OK, tracked_report(&id, &tracked)).into_response();
             }
             Err(error) => {
                 return refuse(
@@ -446,13 +522,55 @@ async fn show(
         Held::Recorded(_) => "not running".to_owned(),
     };
 
+    let tracked = tracked(&instance, &id).await;
     let data = DataDir::new(instance.config.data.directory.clone());
 
     (
         StatusCode::OK,
-        report(&id, &held, &status, applied_at.as_deref(), &data),
+        report(
+            &id,
+            &held,
+            &status,
+            applied_at.as_deref(),
+            &data,
+            tracked.as_ref(),
+        ),
     )
         .into_response()
+}
+
+/// What an app tracks, with the connection named as an operator named it.
+///
+/// A tracking knows the numeric id of the GitHub App that reaches it, which is
+/// the right key to hold and the wrong thing to print: the slug is what every
+/// command takes and what `spaceport connect list` shows.
+struct Tracked {
+    tracking: Tracking,
+    /// `None` for a connection that is no longer there — which nothing should be
+    /// able to leave behind, since forgetting a connection forgets what it
+    /// reached, and which is still worth reporting rather than hiding.
+    connection: Option<String>,
+}
+
+/// Where the app's code lives, if an operator has said.
+///
+/// A read that fails is answered as tracking nothing rather than as no answer
+/// at all: everything else about the app is still worth having, and a caller
+/// that has nothing else has a 404 to fall back on.
+async fn tracked(instance: &Instance, id: &AppId) -> Option<Tracked> {
+    let tracking = instance.tracking.by_app(id).await.ok().flatten()?;
+    let connection = instance
+        .connections
+        .by_app_id(tracking.github_app_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|connection| connection.slug);
+
+    Some(Tracked {
+        tracking,
+        connection,
+    })
 }
 
 /// The manifest verbatim, as the document it is.
@@ -515,6 +633,7 @@ fn report(
     status: &str,
     applied_at: Option<&str>,
     data: &DataDir,
+    tracked: Option<&Tracked>,
 ) -> String {
     let manifest = held.manifest();
     let container = &manifest.container;
@@ -592,7 +711,66 @@ fn report(
         );
     }
 
+    // Where the code is, when an operator has said. An app that tracks nothing
+    // gets no stanza at all, like every other section here: most apps are an
+    // image somebody applied, and a line saying they track nothing would be a
+    // line about a thing they are not doing.
+    if let Some(tracked) = tracked {
+        tracks(&mut out, tracked);
+    }
+
     out.render()
+}
+
+/// Everything known about an app that is only tracked.
+///
+/// Written apart from [`report`] rather than through it, because nearly every
+/// line there is read off a manifest and this app has none: no source, no
+/// hosts, no port and no probes. Reporting those as empty would describe a
+/// container that does not exist, so what is said instead is the one thing that
+/// is true — spaceport knows where the code is and has nothing to run.
+fn tracked_report(id: &AppId, tracked: &Tracked) -> String {
+    let mut out = Report::default();
+
+    out.field("app", id.to_string());
+    out.field("status", TRACKED.to_owned());
+    tracks(&mut out, tracked);
+    out.field(
+        "manifest",
+        "none applied here yet — nothing runs, no hosts are claimed, and the edge routes nothing to it".to_owned(),
+    );
+    out.field(
+        "",
+        format!("apply one with `spaceport apps apply {id} …`, or wait for a build from the repository — which is a later step and does not exist yet"),
+    );
+
+    out.render()
+}
+
+/// The tracking stanza both reports carry.
+fn tracks(out: &mut Report, tracked: &Tracked) {
+    let tracking = &tracked.tracking;
+
+    out.field(
+        "tracks",
+        format!("{} on {}", tracking.repository, tracking.branch),
+    );
+    out.field("", format!("  manifest {}", tracking.manifest_path));
+    out.field(
+        "",
+        match &tracked.connection {
+            Some(slug) => format!("  through the `{slug}` connection"),
+            None => format!(
+                "  through github app {}, which nothing is connected as any more",
+                tracking.github_app_id
+            ),
+        },
+    );
+    // Only when there is one. An app pointed at a branch nothing has been taken
+    // from yet is not an app at revision nothing.
+    if let Some(revision) = &tracking.revision {
+        out.field("", format!("  last saw {revision}"));
+    }
 }
 
 /// One probe in a line.
@@ -742,20 +920,43 @@ fn columns(headers: &[&str], rows: &[Vec<String>]) -> String {
 }
 
 /// `DELETE /apps/{id}`: stop the app and forget it.
-async fn destroy(State(applier): State<Arc<Applier>>, UrlPath(id): UrlPath<String>) -> Response {
+///
+/// The tracking goes with it. There is no `spaceport apps untrack`, so this is
+/// the only way to undo a tracking — and one left behind would be spaceport
+/// still watching a branch on behalf of an app that no longer exists, which
+/// nothing would ever show anybody.
+///
+/// So this succeeds for an app that is nothing *but* a tracking, too. A 404
+/// there would leave the only record of it with no way to remove it.
+async fn destroy(State(instance): State<Arc<Instance>>, UrlPath(id): UrlPath<String>) -> Response {
     let id: AppId = match id.parse() {
         Ok(id) => id,
         Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
     };
 
-    match applier.destroy(&id).await {
+    // Read before anything is removed, so the response can name the repository
+    // the app has stopped tracking.
+    let tracking = instance.tracking.by_app(&id).await.ok().flatten();
+
+    match instance.applier.destroy(&id).await {
         Ok(app) => {
-            let body = match app.container() {
+            let mut body = match app.container() {
                 Some(container) => {
                     format!("app `{}` destroyed\n  container {container}\n", app.id())
                 }
                 None => format!("app `{}` destroyed\n  it had no container\n", app.id()),
             };
+            body.push_str(&forgotten(&instance, &id, tracking.as_ref()).await);
+
+            (StatusCode::OK, body).into_response()
+        }
+        // Nothing was applied under this name, and something is still tracked
+        // under it: what there is to destroy is the tracking.
+        Err(DestroyError::Unknown(_)) if tracking.is_some() => {
+            let body = format!(
+                "app `{id}` destroyed\n  it had no manifest applied, so nothing was running\n{}",
+                forgotten(&instance, &id, tracking.as_ref()).await,
+            );
 
             (StatusCode::OK, body).into_response()
         }
@@ -769,6 +970,32 @@ async fn destroy(State(applier): State<Arc<Applier>>, UrlPath(id): UrlPath<Strin
             };
 
             refuse(status, &error.to_string())
+        }
+    }
+}
+
+/// Stop tracking anything for `id`, and say so in the words the response uses.
+///
+/// A store that will not answer is reported in the body and not as a failure:
+/// the app is gone either way, and telling an operator the destroy failed would
+/// be telling them to run a command that has nothing left to do.
+async fn forgotten(instance: &Instance, id: &AppId, tracking: Option<&Tracking>) -> String {
+    let Some(tracking) = tracking else {
+        return String::new();
+    };
+
+    match instance.tracking.forget(id).await {
+        Ok(_) => format!(
+            "  it no longer tracks {} on {}\n",
+            tracking.repository, tracking.branch
+        ),
+        Err(error) => {
+            warn!(app = %id, %error, "could not forget what the app tracked");
+
+            format!(
+                "  it still tracks {} on {}, which could not be forgotten: {error:#}\n",
+                tracking.repository, tracking.branch
+            )
         }
     }
 }
@@ -916,6 +1143,292 @@ async fn resume(State(applier): State<Arc<Applier>>, UrlPath(id): UrlPath<String
             refuse(status, &error.to_string())
         }
     }
+}
+
+/// Where an app's manifest is looked for when nobody names a path.
+const DEFAULT_MANIFEST_PATH: &str = "spaceport.yaml";
+
+/// `PUT /apps/{id}/tracking?repository=&connection=&branch=&manifest_path=`:
+/// this app's code lives there.
+///
+/// A `PUT` for the same reason applying one is: an app is built from a single
+/// place, so this ends with the app tracking exactly what the query describes,
+/// whether or not it tracked something before.
+///
+/// Nothing is built and nothing is deployed by this, and nothing will be when a
+/// push arrives either. All a tracking buys today is that spaceport notices the
+/// push and writes down what it saw; taking a build from it is a later step that
+/// lives nowhere yet. The response says so, because an operator who has just
+/// pointed an app at a branch would otherwise sit waiting for a deployment that
+/// is not coming.
+///
+/// The app does not have to have been applied first. Applying and tracking are
+/// the two ways an app comes to exist: one hands spaceport a manifest, the other
+/// says where to find one. Demanding the first before the second would mean
+/// copying a manifest out of the repository by hand, which is the work tracking
+/// exists to remove.
+///
+/// That is safe because an app with no applied manifest has nothing to conflict
+/// with: nothing runs, there is no container, no host is claimed, and the edge
+/// routes nothing to it. A tracking on its own is a note about where to look —
+/// so there is nothing for a stricter check to protect.
+///
+/// Everything is settled before anything is written down, in the order the
+/// answers stop being guesses: the connection has to exist before it can be
+/// asked what it reaches, and the repository has to be one it actually reaches
+/// before there is an installation to ask GitHub as.
+///
+/// A branch nobody named is asked of GitHub once, here, and the answer is stored
+/// as though it had been typed. Storing the name rather than the words "the
+/// default branch" is the point: a default branch is a setting on github.com
+/// that somebody may change months from now, and an app that followed it would
+/// silently start building from somewhere else — a repointing nobody asked for,
+/// recorded nowhere, on an app that is already running.
+async fn track(
+    State(instance): State<Arc<Instance>>,
+    State(connections): State<Arc<ConnectionRepository>>,
+    State(tracking): State<Arc<TrackingRepository>>,
+    State(github): State<Arc<dyn Transport>>,
+    UrlPath(id): UrlPath<String>,
+    Query(query): Query<TrackQuery>,
+) -> Response {
+    let id: AppId = match id.parse() {
+        Ok(id) => id,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    let connection = match connections.by_slug(&query.connection).await {
+        Ok(Some(connection)) => connection,
+        Ok(None) => return refuse(StatusCode::NOT_FOUND, &unconnected(&query.connection)),
+        Err(error) => {
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!(
+                    "could not read the connection `{}`: {error:#}",
+                    query.connection
+                ),
+            );
+        }
+    };
+
+    let installations = match connections.installations(connection.app_id).await {
+        Ok(installations) => installations,
+        Err(error) => {
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!(
+                    "could not read what `{}` reaches: {error:#}",
+                    connection.slug
+                ),
+            );
+        }
+    };
+
+    let Some((installation_id, cached_name)) = granting(&installations, &query.repository) else {
+        return refuse(
+            StatusCode::NOT_FOUND,
+            &format!(
+                "`{}` does not reach `{}` — either it was never installed on that repository, or spaceport's copy of what it reaches is older than the installation is\n  the copy is refreshed hourly, and `spaceport connect show {}` says when it last was and what is in it",
+                connection.slug, query.repository, connection.slug,
+            ),
+        );
+    };
+
+    let manifest_path = match manifest_path(query.manifest_path.as_deref()) {
+        Ok(path) => path,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &error),
+    };
+
+    let (branch, repository) = match query.branch.as_deref() {
+        Some(branch) => match branch_named(branch) {
+            Ok(branch) => (branch, cached_name),
+            Err(error) => return refuse(StatusCode::BAD_REQUEST, &error),
+        },
+        None => {
+            let client = match Client::new(&connection, github) {
+                Ok(client) => client,
+                Err(error) => {
+                    return refuse(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("could not act as `{}`: {error:#}", connection.slug),
+                    );
+                }
+            };
+
+            match client.repository(installation_id, &cached_name).await {
+                Ok(record) => (record.default_branch, record.full_name),
+                // GitHub's own sentence, under the status the edge uses for the
+                // same thing: what failed is the far end, and there is nothing
+                // wrong with the request that got here.
+                Err(error) => return refuse(StatusCode::BAD_GATEWAY, &format!("{error:#}")),
+            }
+        }
+    };
+
+    if let Err(error) = tracking
+        .record(&Tracking {
+            app: id.clone(),
+            github_app_id: connection.app_id,
+            repository: repository.clone(),
+            branch: branch.clone(),
+            manifest_path: manifest_path.clone(),
+            // Stamped by the store as it writes the row, so what is recorded is
+            // when it was recorded.
+            tracked_at: String::new(),
+            revision: None,
+            revision_seen_at: None,
+        })
+        .await
+    {
+        return refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not record what `{id}` tracks: {error:#}"),
+        );
+    }
+
+    // What the last line says turns on whether there is anything to deploy to.
+    // A read that fails is taken as the app having a manifest, because that is
+    // the case the sentence is vaguest about and so the safer one to be wrong
+    // in: it promises nothing that is not true of both.
+    let last = if holds(&instance, &id).await.unwrap_or(true) {
+        format!(
+            "  a push to `{branch}` is noticed from here on — nothing is built or deployed from it yet\n"
+        )
+    } else {
+        format!(
+            "  nothing has been applied under `{id}`, so spaceport knows where its code is and has nothing to run\n  a push to `{branch}` is noticed from here on; building the app from one is a later step that does not exist yet\n"
+        )
+    };
+
+    let body = format!(
+        "app `{id}` tracks {repository}\n  branch     {branch}\n  manifest   {manifest_path}\n  connection {}\n{last}",
+        connection.slug,
+    );
+
+    (StatusCode::OK, body).into_response()
+}
+
+/// Whether a manifest has been applied under this name.
+///
+/// The same four places [`show`] looks, because an app is applied wherever it
+/// ends up: running, suspended, down, or recorded and never brought back. What
+/// this answers is what separates an app that is only tracked from one that is
+/// tracked *and* applied — which is the difference [`list`] prints and [`track`]
+/// words its answer on.
+async fn holds(instance: &Instance, id: &AppId) -> Result<bool> {
+    let store = instance.applier.store();
+    if store.get(id).is_some() || store.suspended(id).is_some() || store.downed(id).is_some() {
+        return Ok(true);
+    }
+
+    Ok(AppRepository::new(instance.db.clone())
+        .recorded(id)
+        .await?
+        .is_some())
+}
+
+/// The installation that grants `repository`, and the name GitHub spells it
+/// with.
+///
+/// Matched without regard to case, because github.com resolves `Acme/Site` and
+/// `acme/site` to the same repository and an operator typing what they see in a
+/// browser is typing whichever the page showed them. What comes back is the
+/// cached spelling rather than the typed one: everything downstream compares a
+/// tracking against what a webhook delivery says, and that is GitHub's spelling.
+fn granting(installations: &[Installation], repository: &str) -> Option<(i64, String)> {
+    installations.iter().find_map(|installation| {
+        installation
+            .repositories
+            .iter()
+            .find(|full_name| full_name.eq_ignore_ascii_case(repository))
+            .map(|full_name| (installation.installation_id, full_name.clone()))
+    })
+}
+
+/// Where in the repository to look for the app's manifest.
+///
+/// The path is resolved inside a checkout spaceport makes, which is the same
+/// argument [`crate::app::manifest::Volume`] makes for having no host path in
+/// it: a path that may leave the tree it is rooted in is a path that may name
+/// any file on this host, and the only reliable moment to refuse that is before
+/// it is written down. So it has to be relative, has to stay inside, and has to
+/// name a file — a directory is not a manifest, however it is spelled.
+fn manifest_path(given: Option<&str>) -> Result<String, String> {
+    let path = given.unwrap_or(DEFAULT_MANIFEST_PATH);
+
+    if path.is_empty() {
+        return Err(format!(
+            "the manifest path must not be empty — leave it out for `{DEFAULT_MANIFEST_PATH}`"
+        ));
+    }
+
+    let candidate = Path::new(path);
+    if candidate.has_root() || candidate.components().next() == Some(Component::RootDir) {
+        return Err(format!(
+            "`{path}` is an absolute path, and a manifest is named from the root of the repository rather than from the root of this host"
+        ));
+    }
+    if candidate
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err(format!(
+            "`{path}` climbs out of the repository with `..`, and a manifest spaceport reads has to be inside the repository it was checked out of"
+        ));
+    }
+    if path.ends_with('/')
+        || !matches!(
+            candidate.components().next_back(),
+            Some(Component::Normal(_))
+        )
+    {
+        return Err(format!(
+            "`{path}` names a directory, and spaceport needs the file in it — `{path}/{DEFAULT_MANIFEST_PATH}`, say"
+        ));
+    }
+
+    Ok(path.to_owned())
+}
+
+/// The branch as it was given, if it is a branch.
+///
+/// A branch and not a ref: `refs/heads/main` is how git names the ref that a
+/// branch is, and taking one here would record a branch nothing has, since every
+/// comparison downstream is against the branch name a push carries.
+fn branch_named(branch: &str) -> Result<String, String> {
+    if branch.is_empty() {
+        return Err(
+            "the branch must not be empty — leave it out to take the repository's default branch"
+                .to_owned(),
+        );
+    }
+    if branch.starts_with("refs/") {
+        return Err(format!(
+            "`{branch}` is a ref rather than a branch — name the branch itself, as `{}`",
+            branch
+                .trim_start_matches("refs/")
+                .trim_start_matches("heads/")
+        ));
+    }
+
+    Ok(branch.to_owned())
+}
+
+/// Which repository an app is built from, and how much of that was said.
+///
+/// `deny_unknown_fields` so a misspelled option is refused rather than silently
+/// doing something else: an operator who typed `--manifest` and meant
+/// `--manifest-path` would otherwise get an app tracking a file they did not
+/// name.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrackQuery {
+    /// `owner/name`, as github.com spells it.
+    repository: String,
+    /// The slug of the connection that reaches it.
+    connection: String,
+    branch: Option<String>,
+    manifest_path: Option<String>,
 }
 
 /// Where GitHub takes an operator to install an app on an account.
@@ -1302,7 +1815,6 @@ fn refuse(status: StatusCode, message: &str) -> Response {
 mod tests {
     use super::*;
     use crate::app::{App, AppRepository, AppStore};
-    use crate::connections::github::Installation;
     use crate::connections::github::api::testing::FakeGitHub;
     use crate::events::Level;
     use crate::runtime::{Container, ContainerId, ContainerRuntime, Managed};
@@ -1393,7 +1905,7 @@ container:
     }
 
     fn router_and_events() -> (Router, Arc<EventBus>) {
-        let (_, router, events, _, _, _) = parts_on(OneContainer::default());
+        let (_, router, events, _, _, _, _) = parts_on(OneContainer::default());
 
         (router, events)
     }
@@ -1401,28 +1913,33 @@ container:
     /// A router and the GitHub behind it, for the connection tests — which are
     /// the only ones that care what GitHub answers.
     fn router_and_github() -> (Router, Arc<FakeGitHub>) {
-        let (_, router, _, _, github, _) = parts_on(OneContainer::default());
+        let (_, router, _, _, github, _, _) = parts_on(OneContainer::default());
 
         (router, github)
     }
 
     fn store_router_and_events_on(runtime: OneContainer) -> (Arc<AppStore>, Router, Arc<EventBus>) {
-        let (store, router, events, _, _, _) = parts_on(runtime);
+        let (store, router, events, _, _, _, _) = parts_on(runtime);
 
         (store, router, events)
     }
 
     /// Everything a test might want a hand on, shutdown token included.
-    fn parts_on(
-        runtime: OneContainer,
-    ) -> (
+    ///
+    /// A tuple and not a struct, because every test takes it apart on the line
+    /// it is built and names only the two or three pieces it uses. Named as a
+    /// type only so that the shape is written once.
+    type Parts = (
         Arc<AppStore>,
         Router,
         Arc<EventBus>,
         CancellationToken,
         Arc<FakeGitHub>,
         Arc<ConnectionRepository>,
-    ) {
+        Arc<TrackingRepository>,
+    );
+
+    fn parts_on(runtime: OneContainer) -> Parts {
         parts_configured(runtime, CONFIG)
     }
 
@@ -1434,17 +1951,7 @@ container:
         parts_configured(OneContainer::default(), &config).1
     }
 
-    fn parts_configured(
-        runtime: OneContainer,
-        config: &str,
-    ) -> (
-        Arc<AppStore>,
-        Router,
-        Arc<EventBus>,
-        CancellationToken,
-        Arc<FakeGitHub>,
-        Arc<ConnectionRepository>,
-    ) {
+    fn parts_configured(runtime: OneContainer, config: &str) -> Parts {
         let store = Arc::new(AppStore::new());
         let db = Db::in_memory().unwrap();
         let applier = Arc::new(Applier::new(
@@ -1471,6 +1978,7 @@ container:
         );
 
         let connections = Arc::new(ConnectionRepository::new(db.clone()));
+        let tracking = Arc::new(TrackingRepository::new(db.clone()));
         let instance = Arc::new(Instance {
             version: "9.9.9".to_owned(),
             started_at: time::OffsetDateTime::now_utc(),
@@ -1479,6 +1987,7 @@ container:
             operator: "/run/spaceport.sock".parse().unwrap(),
             applier,
             connections: connections.clone(),
+            tracking: tracking.clone(),
             github: github.clone(),
             attempts: Arc::new(crate::connections::github::Attempts::new()),
             nudge: Nudge::new(),
@@ -1494,6 +2003,7 @@ container:
             shutdown,
             github,
             connections,
+            tracking,
         )
     }
 
@@ -2169,7 +2679,7 @@ container:
     /// for as long as anyone was watching it.
     #[tokio::test]
     async fn a_watcher_is_let_go_when_spaceport_shuts_down() {
-        let (_, router, _, shutdown, _, _) = parts_on(OneContainer::default());
+        let (_, router, _, shutdown, _, _, _) = parts_on(OneContainer::default());
         let mut stream = watch(&router, "").await;
 
         shutdown.cancel();
@@ -2550,7 +3060,7 @@ container:
     /// particular repository is in reach, and a count cannot answer that.
     #[tokio::test]
     async fn shows_the_repositories_each_installation_reaches() {
-        let (_, router, _, _, _, connections) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _) = parts_on(OneContainer::default());
         post_connection(&router, registration("spaceport-acme", 42)).await;
         connections
             .record_installations(
@@ -2594,7 +3104,7 @@ container:
     /// a failure to look if it is printed as an empty list.
     #[tokio::test]
     async fn says_when_an_installation_reaches_no_repository_at_all() {
-        let (_, router, _, _, _, connections) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _) = parts_on(OneContainer::default());
         post_connection(&router, registration("spaceport-acme", 42)).await;
         connections
             .record_installations(
@@ -2656,6 +3166,508 @@ container:
             delete_connection(&router, "spaceport-acme").await.0,
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// An app applied, a connection made, and one repository cached as
+    /// reachable through it — which is the state every tracking starts from.
+    async fn tracking_router() -> (Router, Arc<FakeGitHub>) {
+        let (router, github, _) = tracking_parts().await;
+
+        (router, github)
+    }
+
+    /// The same, with the tracking store itself — for the tests that ask what
+    /// was written down rather than what was said back.
+    async fn tracking_parts() -> (Router, Arc<FakeGitHub>, Arc<TrackingRepository>) {
+        let (_, router, _, _, github, connections, tracking) = parts_on(OneContainer::default());
+        put_app(&router, "site", MANIFEST).await;
+        post_connection(&router, registration("spaceport-acme", 42)).await;
+        connections
+            .record_installations(
+                42,
+                &[Installation {
+                    installation_id: 100,
+                    account: "an-organisation".to_owned(),
+                    account_type: "Organization".to_owned(),
+                    repositories: vec!["an-organisation/site".to_owned()],
+                }],
+            )
+            .await
+            .unwrap();
+
+        (router, github, tracking)
+    }
+
+    async fn track_app(router: &Router, id: &str, query: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/apps/{id}/tracking{query}"))
+            .body(Body::empty())
+            .unwrap();
+
+        call(router, request).await
+    }
+
+    /// Whether anything went out to github for a repository, which is the whole
+    /// question when a branch was given explicitly.
+    fn repositories_read(github: &FakeGitHub) -> Vec<String> {
+        github
+            .requests()
+            .into_iter()
+            .map(|request| request.path)
+            .filter(|path| path.starts_with("/repos/"))
+            .collect()
+    }
+
+    /// Applying and tracking are the two ways an app comes to exist, and
+    /// requiring the first before the second would mean copying a manifest out
+    /// of the repository by hand — the work tracking exists to remove.
+    #[tokio::test]
+    async fn tracks_an_app_nobody_applied() {
+        let (router, _) = tracking_router().await;
+
+        let (status, body) = track_app(
+            &router,
+            "echo",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("app `echo` tracks an-organisation/site"),
+            "{body}"
+        );
+        assert!(
+            body.contains("nothing has been applied under `echo`"),
+            "{body}"
+        );
+        assert!(body.contains("has nothing to run"), "{body}");
+        assert!(
+            body.contains("a later step that does not exist yet"),
+            "{body}"
+        );
+    }
+
+    /// Accepting the tracking and then denying the app exists would leave an
+    /// operator with a name that answers nowhere.
+    #[tokio::test]
+    async fn shows_an_app_that_is_only_tracked() {
+        let (router, _) = tracking_router().await;
+        track_app(
+            &router,
+            "echo",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main",
+        )
+        .await;
+
+        let (status, body) = show_app(&router, "echo", "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("status    tracked"), "{body}");
+        assert!(body.contains("an-organisation/site on main"), "{body}");
+        assert!(
+            body.contains("through the `spaceport-acme` connection"),
+            "{body}"
+        );
+        assert!(body.contains("none applied here yet"), "{body}");
+        // Nothing of a manifest, because there is no manifest to read it off.
+        assert!(!body.contains("readiness"), "{body}");
+        assert!(!body.contains("source"), "{body}");
+    }
+
+    /// The document is in a repository rather than here, and saying where is a
+    /// better answer than an empty file.
+    #[tokio::test]
+    async fn refuses_the_manifest_of_an_app_that_is_only_tracked() {
+        let (router, _) = tracking_router().await;
+        track_app(
+            &router,
+            "echo",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main",
+        )
+        .await;
+
+        let (status, body) = show_app(&router, "echo", "?manifest=true").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("has no manifest here"), "{body}");
+        assert!(body.contains("an-organisation/site"), "{body}");
+        assert!(body.contains("spaceport.yaml"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn lists_an_app_that_is_only_tracked_beside_one_that_is_running() {
+        let (router, _) = tracking_router().await;
+        track_app(
+            &router,
+            "echo",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main",
+        )
+        .await;
+
+        let (status, body) = get_apps(&router, "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(lines[1].starts_with("echo"), "{body}");
+        assert!(
+            lines[1].contains("repository an-organisation/site@main"),
+            "{body}"
+        );
+        assert!(lines[1].contains("tracked"), "{body}");
+        // It claims nothing, so there is nothing in the hosts column.
+        assert!(!lines[1].contains(".test"), "{body}");
+        assert!(lines[2].starts_with("site"), "{body}");
+        assert!(lines[2].contains("unreachable"), "{body}");
+    }
+
+    /// A tracked-only app is one of the apps a pattern is asked about, and one
+    /// the pattern misses is as absent as any other.
+    #[tokio::test]
+    async fn lists_only_the_tracked_apps_a_pattern_matches() {
+        let (router, _) = tracking_router().await;
+        track_app(
+            &router,
+            "echo",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main",
+        )
+        .await;
+
+        let (matched, body) = get_apps(&router, "?pattern=ech*").await;
+        assert_eq!(matched, StatusCode::OK);
+        assert!(body.contains("echo"), "{body}");
+        assert!(!body.contains("site  "), "{body}");
+
+        let (missed, body) = get_apps(&router, "?pattern=worker").await;
+        assert_eq!(missed, StatusCode::OK);
+        assert_eq!(body, "no app matches `worker`\n");
+    }
+
+    /// The order the two arrive in is the operator's, not spaceport's: the
+    /// manifest may be applied long after the tracking that named the app.
+    #[tokio::test]
+    async fn applying_a_manifest_for_an_app_already_tracked_keeps_the_tracking() {
+        let (router, _) = tracking_router().await;
+        track_app(
+            &router,
+            "echo",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main",
+        )
+        .await;
+
+        let (applied, _) = put_app(&router, "echo", &manifest_for("gamma.test")).await;
+
+        assert_eq!(applied, StatusCode::OK);
+        let (status, body) = show_app(&router, "echo", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("gamma.test"), "{body}");
+        assert!(body.contains("an-organisation/site on main"), "{body}");
+        assert!(!body.contains("none applied here yet"), "{body}");
+    }
+
+    /// There is no `spaceport apps untrack`, so destroying the app is the only
+    /// way to undo a tracking — and a tracking nothing can reach is spaceport
+    /// watching a branch for an app that does not exist.
+    #[tokio::test]
+    async fn destroys_an_app_that_is_only_tracked() {
+        let (router, _, tracking) = tracking_parts().await;
+        track_app(
+            &router,
+            "echo",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main",
+        )
+        .await;
+
+        let (status, body) = delete_app(&router, "echo").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("app `echo` destroyed"), "{body}");
+        assert!(body.contains("no manifest applied"), "{body}");
+        assert!(
+            body.contains("no longer tracks an-organisation/site on main"),
+            "{body}"
+        );
+        assert!(
+            tracking
+                .by_app(&"echo".parse().unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn destroying_a_running_app_forgets_what_it_tracked() {
+        let (router, _, tracking) = tracking_parts().await;
+        track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main",
+        )
+        .await;
+
+        let (status, body) = delete_app(&router, "site").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("container site0123456"), "{body}");
+        assert!(
+            body.contains("no longer tracks an-organisation/site on main"),
+            "{body}"
+        );
+        assert!(
+            tracking
+                .by_app(&"site".parse().unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Tracked-only apps are apps; a name that is neither is still nothing.
+    #[tokio::test]
+    async fn showing_an_app_that_is_neither_applied_nor_tracked_is_a_404() {
+        let (router, _) = tracking_router().await;
+
+        let (status, body) = show_app(&router, "ghost", "").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("no app named `ghost`"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn refuses_to_track_through_a_connection_nobody_made() {
+        let (router, _) = tracking_router().await;
+
+        let (status, body) = track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=ghost&branch=main",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("`ghost` is not connected"), "{body}");
+    }
+
+    /// The connection is what reaches the repository, and one that does not
+    /// reach it can neither read the manifest nor hear the push. The cache
+    /// being stale is the likeliest reason, so the refusal says so.
+    #[tokio::test]
+    async fn refuses_a_repository_the_connection_does_not_reach() {
+        let (router, _) = tracking_router().await;
+
+        let (status, body) = track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/elsewhere&connection=spaceport-acme&branch=main",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("does not reach"), "{body}");
+        assert!(body.contains("hourly"), "{body}");
+        assert!(
+            body.contains("spaceport connect show spaceport-acme"),
+            "{body}"
+        );
+    }
+
+    /// github.com resolves `Acme/Site` and `acme/site` to one repository, and
+    /// an operator types whichever spelling the page showed them — but what is
+    /// stored is github's, because that is what a delivery will say.
+    #[tokio::test]
+    async fn matches_the_repository_however_it_was_spelled() {
+        let (router, _) = tracking_router().await;
+
+        let (status, body) = track_app(
+            &router,
+            "site",
+            "?repository=An-Organisation/Site&connection=spaceport-acme&branch=main",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("an-organisation/site"), "{body}");
+        let (_, shown) = show_app(&router, "site", "").await;
+        assert!(shown.contains("an-organisation/site"), "{shown}");
+    }
+
+    /// The same argument the app manifest makes for a volume having no host
+    /// path: a path that may leave the tree it is rooted in may name any file
+    /// on this host.
+    #[tokio::test]
+    async fn refuses_a_manifest_path_that_leaves_the_repository() {
+        let (router, _) = tracking_router().await;
+        let base = "?repository=an-organisation/site&connection=spaceport-acme&branch=main";
+
+        let (climbing, body) = track_app(
+            &router,
+            "site",
+            &format!("{base}&manifest_path=../etc/passwd"),
+        )
+        .await;
+        assert_eq!(climbing, StatusCode::BAD_REQUEST);
+        assert!(body.contains("climbs out"), "{body}");
+
+        let (absolute, body) = track_app(
+            &router,
+            "site",
+            &format!("{base}&manifest_path=/etc/spaceport.yaml"),
+        )
+        .await;
+        assert_eq!(absolute, StatusCode::BAD_REQUEST);
+        assert!(body.contains("absolute"), "{body}");
+
+        let (directory, body) =
+            track_app(&router, "site", &format!("{base}&manifest_path=apps/")).await;
+        assert_eq!(directory, StatusCode::BAD_REQUEST);
+        assert!(body.contains("names a directory"), "{body}");
+    }
+
+    /// A branch is a branch and not a ref: every comparison downstream is
+    /// against the name a push carries.
+    #[tokio::test]
+    async fn refuses_a_branch_that_is_a_ref() {
+        let (router, _) = tracking_router().await;
+
+        let (status, body) = track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=refs/heads/main",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("is a ref rather than a branch"), "{body}");
+        assert!(body.contains("`main`"), "{body}");
+    }
+
+    /// An operator who named the branch has said everything there is to know,
+    /// and asking github anyway would be a round trip to confirm their typing.
+    #[tokio::test]
+    async fn takes_the_branch_it_was_given_without_asking_github() {
+        let (router, github) = tracking_router().await;
+
+        let (status, body) = track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=release/2026",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("branch     release/2026"), "{body}");
+        assert!(body.contains("manifest   spaceport.yaml"), "{body}");
+        assert!(body.contains("connection spaceport-acme"), "{body}");
+        assert!(body.contains("nothing is built or deployed"), "{body}");
+        assert!(
+            repositories_read(&github).is_empty(),
+            "{:?}",
+            repositories_read(&github)
+        );
+    }
+
+    /// Resolved once and stored by name, so that changing the default branch on
+    /// github.com months from now cannot silently re-point a running app.
+    #[tokio::test]
+    async fn resolves_the_branch_from_github_when_none_was_given() {
+        let (router, github) = tracking_router().await;
+        github.repository_defaults_to("an-organisation/site", "trunk");
+
+        let (status, body) = track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("branch     trunk"), "{body}");
+        assert_eq!(repositories_read(&github), ["/repos/an-organisation/site"]);
+        let (_, shown) = show_app(&router, "site", "").await;
+        assert!(shown.contains("an-organisation/site on trunk"), "{shown}");
+    }
+
+    /// GitHub's own sentence, under the status that says whose trouble it is.
+    #[tokio::test]
+    async fn says_when_github_will_not_say_what_the_default_branch_is() {
+        let (router, github) = tracking_router().await;
+        github.refuse_with(StatusCode::INTERNAL_SERVER_ERROR, "<html>");
+
+        let (status, body) = track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(body.contains("github's own trouble"), "{body}");
+    }
+
+    /// An app is built from one place, so pointing it somewhere else replaces
+    /// rather than adds.
+    #[tokio::test]
+    async fn re_tracking_an_app_replaces_what_it_tracked() {
+        let (router, _) = tracking_router().await;
+        track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main",
+        )
+        .await;
+
+        let (status, _) = track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=release&manifest_path=apps/site/spaceport.yaml",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let (_, shown) = show_app(&router, "site", "").await;
+        assert!(shown.contains("an-organisation/site on release"), "{shown}");
+        assert!(shown.contains("apps/site/spaceport.yaml"), "{shown}");
+        assert!(!shown.contains(" on main"), "{shown}");
+    }
+
+    /// The report is where an operator finds out what a push to this app would
+    /// be about, and the connection is named by the slug every command takes.
+    #[tokio::test]
+    async fn shows_what_an_app_tracks() {
+        let (router, _) = tracking_router().await;
+        track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main",
+        )
+        .await;
+
+        let (status, body) = show_app(&router, "site", "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("tracks"), "{body}");
+        assert!(body.contains("an-organisation/site on main"), "{body}");
+        assert!(body.contains("manifest spaceport.yaml"), "{body}");
+        assert!(
+            body.contains("through the `spaceport-acme` connection"),
+            "{body}"
+        );
+        // Nothing has been taken from the branch, so there is no revision to
+        // report — and reporting one would say a build had happened.
+        assert!(!body.contains("last saw"), "{body}");
+    }
+
+    /// Most apps are an image somebody applied, and a line telling them they
+    /// track nothing is a line about a thing they are not doing.
+    #[tokio::test]
+    async fn says_nothing_about_tracking_when_an_app_tracks_nothing() {
+        let (router, _) = tracking_router().await;
+
+        let (_, body) = show_app(&router, "site", "").await;
+
+        assert!(!body.contains("tracks"), "{body}");
     }
 
     #[tokio::test]

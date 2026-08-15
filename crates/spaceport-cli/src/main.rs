@@ -121,6 +121,14 @@ enum AppsCommand {
     List(ListArgs),
     /// Report everything spaceport knows about one app.
     Show(ShowArgs),
+    /// Say which repository and branch an app's code lives on, so that a push
+    /// to it is noticed.
+    ///
+    /// Noticed, and no more than that: nothing is built and nothing is deployed,
+    /// now or when the push arrives. Doing something about a push is a later
+    /// step, and until it exists this is a note spaceport keeps rather than a
+    /// pipeline it runs.
+    Track(TrackArgs),
     /// Stop serving an app, keeping everything about it.
     Suspend(SuspendArgs),
     /// Serve a suspended app again.
@@ -317,6 +325,47 @@ struct ShowArgs {
 }
 
 #[derive(Debug, Args)]
+struct TrackArgs {
+    /// The app whose code this is.
+    app_id: AppId,
+
+    /// The repository the app is built from, as `owner/name`.
+    repository: String,
+
+    /// The connection that reaches the repository.
+    ///
+    /// Named rather than worked out, because a repository can be reachable
+    /// through more than one of them — a spaceport connected to an
+    /// organisation's app and to somebody's personal one can see the same
+    /// repository as either. Which identity acts on a push decides what it may
+    /// read and what shows up in the repository's audit log, and that is not
+    /// something to settle by picking whichever connection was found first.
+    #[arg(long, value_name = "SLUG")]
+    connection: String,
+
+    /// The branch a push has to be on to be about this app.
+    ///
+    /// Without it, spaceport asks GitHub what the repository's default branch is
+    /// and records the name it answers. The name and not "the default": a
+    /// default branch is a setting somebody may change on github.com months from
+    /// now, and an app that followed it would quietly start building from
+    /// somewhere nobody pointed it at.
+    #[arg(short, long, value_name = "BRANCH")]
+    branch: Option<String>,
+
+    /// Where the app's manifest is in the repository, as a path from its root.
+    ///
+    /// A monorepo holding one of these per app is the reason it is an option at
+    /// all: several apps track the same repository and branch, and the manifest
+    /// path is the only thing that tells their builds apart.
+    #[arg(short, long, value_name = "FILE", default_value = "spaceport.yaml")]
+    manifest_path: String,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
 struct DestroyArgs {
     /// The app to stop and remove.
     app_id: AppId,
@@ -411,6 +460,7 @@ async fn main() -> Result<()> {
             AppsCommand::Apply(args) => apply(args).await,
             AppsCommand::List(args) => list(args).await,
             AppsCommand::Show(args) => show(args).await,
+            AppsCommand::Track(args) => track(args).await,
             AppsCommand::Suspend(args) => suspend(args).await,
             AppsCommand::Resume(args) => resume(args).await,
             AppsCommand::Destroy(args) => destroy(args).await,
@@ -561,6 +611,11 @@ async fn run(args: RunArgs) -> Result<()> {
     let github = Arc::new(github::Network::new()?);
     let connections = Arc::new(ConnectionRepository::new(db.clone()));
 
+    // What each app is built from. One for the whole process, so the operator
+    // socket that records a tracking and the edge that hears the pushes about
+    // it are looking at the same rows.
+    let tracking = Arc::new(github::TrackingRepository::new(db.clone()));
+
     // One signal for the whole process, built here because everything that
     // shoves it and the one thing that listens for it are assembled below: the
     // reconciliation loop, the operator socket where an app is connected, and
@@ -593,6 +648,7 @@ async fn run(args: RunArgs) -> Result<()> {
     let home = Arc::new(edge::Home {
         attempts: attempts.clone(),
         connections: connections.clone(),
+        tracking: tracking.clone(),
         github: github.clone(),
         nudge: nudge.clone(),
         hostname: config.edge.hostname.as_ref().map(ToString::to_string),
@@ -609,6 +665,7 @@ async fn run(args: RunArgs) -> Result<()> {
             operator: endpoint.clone(),
             applier,
             connections,
+            tracking,
             github,
             attempts,
             nudge,
@@ -691,6 +748,23 @@ async fn show(args: ShowArgs) -> Result<()> {
     print!(
         "{}",
         client::show(&args.server.server, &args.app_id, args.manifest).await?
+    );
+
+    Ok(())
+}
+
+async fn track(args: TrackArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::track(
+            &args.server.server,
+            &args.app_id,
+            &args.repository,
+            &args.connection,
+            args.branch.as_deref(),
+            Some(&args.manifest_path),
+        )
+        .await?
     );
 
     Ok(())

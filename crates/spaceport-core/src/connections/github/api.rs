@@ -1,10 +1,11 @@
 //! Asking GitHub things, as the App an operator connected.
 //!
 //! This is the only file in spaceport that makes an outbound request to
-//! something that is not on this host. What it offers is the four questions a
+//! something that is not on this host. What it offers is the five questions a
 //! connection is actually for: what does GitHub say this App is, where has it
-//! been installed, what can each installation see, and — the one everything
-//! else is built on — a token that acts as an installation for the next hour.
+//! been installed, what can each installation see, what does one of those
+//! repositories look like, and — the one everything else is built on — a token
+//! that acts as an installation for the next hour.
 //!
 //! Every one of those goes through [`Transport`], which exists so the tests can
 //! answer in-process. That seam is the same shape as the ACME one: a trait with
@@ -219,6 +220,25 @@ pub struct InstallationRecord {
     pub account_type: String,
 }
 
+/// What spaceport needs of a repository, which is its default branch and
+/// nothing else.
+///
+/// The rest of GitHub's repository object — the description, the topics, the
+/// counts, the dozens of urls — is left on the wire for the same reason the
+/// listing hands back bare `Vec<String>` full names: spaceport would be keeping
+/// a copy of somebody else's record, one that is stale the moment anybody
+/// touches the repository on github.com, and every field of it would be a field
+/// some later code was tempted to trust. What is lifted out here is what a
+/// tracked app is *decided* by, and it is lifted out once, at track time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryRecord {
+    pub default_branch: String,
+    /// GitHub's own spelling of `owner/name`, which is not necessarily the
+    /// spelling that was asked for — the API resolves a renamed repository to
+    /// its current name.
+    pub full_name: String,
+}
+
 /// The wire shapes GitHub answers with.
 ///
 /// None of these carries `deny_unknown_fields`, which is the deliberate
@@ -261,6 +281,16 @@ mod wire {
     #[derive(Deserialize)]
     pub(super) struct Repository {
         pub(super) full_name: String,
+    }
+
+    /// One repository asked for by name, which carries fields a listing does
+    /// not promise — hence a shape of its own rather than an `Option` bolted on
+    /// to [`Repository`], where a missing branch would be indistinguishable
+    /// from a listing spaceport forgot to ask the right endpoint for.
+    #[derive(Deserialize)]
+    pub(super) struct RepositoryDetail {
+        pub(super) full_name: String,
+        pub(super) default_branch: String,
     }
 }
 
@@ -396,6 +426,38 @@ impl Client {
             .flat_map(|page| page.repositories)
             .map(|repository| repository.full_name)
             .collect())
+    }
+
+    /// One repository, as GitHub has it now.
+    ///
+    /// Asked as the installation, like the listing and for the same reason, and
+    /// through [`Self::installation_token`] rather than a mint of its own, so
+    /// that tracking several apps in one pass costs one token and not one per
+    /// repository.
+    ///
+    /// Not paginated, because it is one object: there is no `Link` header to
+    /// follow and nothing to cap.
+    pub async fn repository(
+        &self,
+        installation_id: i64,
+        full_name: &str,
+    ) -> Result<RepositoryRecord> {
+        let token = self.installation_token(installation_id).await?;
+        // `full_name` is already `owner/name`, which is exactly the tail of the
+        // path — splitting it here only to join it again would be a chance to
+        // get it wrong.
+        let repository: wire::RepositoryDetail = self
+            .fetch(
+                &format!("/repos/{full_name}"),
+                &Credential::Installation(token),
+                &format!("repository `{full_name}`"),
+            )
+            .await?;
+
+        Ok(RepositoryRecord {
+            default_branch: repository.default_branch,
+            full_name: repository.full_name,
+        })
     }
 
     /// A token that acts as installation `installation_id`, minting one only if
@@ -578,8 +640,13 @@ fn refusal(response: &Response<Bytes>, what: &str) -> anyhow::Error {
             "github is rate limiting this app and is refusing requests until {} — nothing is wrong with the connection, and the next pass will pick up where this one stopped",
             resets_at(response)
         ),
+        // Said without naming which of the two it is, because GitHub does not
+        // say either: a repository an installation was never granted is a `404`
+        // and not a `403`, deliberately, so that a token cannot be used to find
+        // out what exists. A sentence per caller was the alternative, and it
+        // would have been several sentences all guessing at the same thing.
         StatusCode::NOT_FOUND => anyhow!(
-            "github knows no {what} — the app this connection names does not exist there, so check the `App ID` on the app's settings page"
+            "github knows no {what} — it is either not there or not something this app has been granted, so check the `App ID` on the app's settings page and what the app was installed on"
         ),
         _ if status.is_server_error() => anyhow!(
             "github answered {status} when asked about the {what}, which is github's own trouble rather than this spaceport's — it is worth trying again"
@@ -757,6 +824,67 @@ mod tests {
         // And the mint itself is the App speaking, since an installation
         // cannot mint its own token.
         assert_eq!(github.requests()[0].authorization, Authorization::Jwt);
+    }
+
+    /// The branch a tracked app follows is resolved once, here, so this is the
+    /// call that decides it — and it is asked as the installation, since the
+    /// App itself may not read a repository.
+    #[tokio::test]
+    async fn asks_for_a_repository_with_an_installation_token() {
+        let github = FakeGitHub::new();
+        github.repository_defaults_to("an-organisation/site", "trunk");
+
+        let repository = client(&github)
+            .repository(7, "an-organisation/site")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repository,
+            RepositoryRecord {
+                default_branch: "trunk".to_owned(),
+                full_name: "an-organisation/site".to_owned(),
+            }
+        );
+        let read = github
+            .requests()
+            .into_iter()
+            .find(|request| request.path == "/repos/an-organisation/site")
+            .expect("the repository was read");
+        assert_eq!(read.authorization, Authorization::Token);
+    }
+
+    /// Tracking several apps in one pass must not mint a token per repository:
+    /// the same cache and the same refresh window as every other call.
+    #[tokio::test]
+    async fn reads_a_second_repository_with_the_token_already_in_hand() {
+        let github = FakeGitHub::new();
+        github.repository_defaults_to("an-organisation/api", "main");
+        let client = client(&github);
+
+        client.repository(7, "an-organisation/site").await.unwrap();
+        client.repository(7, "an-organisation/api").await.unwrap();
+
+        assert_eq!(github.minted(), 1);
+    }
+
+    #[tokio::test]
+    async fn says_when_the_repository_is_one_github_will_not_show() {
+        let github = FakeGitHub::new();
+
+        let error = format!(
+            "{:#}",
+            client(&github)
+                .repository(7, "an-organisation/nowhere")
+                .await
+                .unwrap_err()
+        );
+
+        assert!(
+            error.contains("knows no repository `an-organisation/nowhere`"),
+            "{error}"
+        );
+        assert!(error.contains("has been granted"), "{error}");
     }
 
     #[tokio::test]

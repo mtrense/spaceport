@@ -155,6 +155,14 @@ const CATEGORIES: &[(&str, &str)] = &[
         "spaceport_core::connections::github::reconcile",
         "connection.reconcile",
     ),
+    // Not under `connection`: what an app is built from is the app's business
+    // rather than the connection's, and an operator watching a deployment wants
+    // it without the registration and reconciliation traffic around it. Two
+    // modules, one category — where a branch was recorded from and where it
+    // moved to are the same story to the operator reading them, whatever it
+    // took spaceport to hear about it.
+    ("spaceport_core::connections::github::tracking", "tracking"),
+    ("spaceport_core::connections::github::push", "tracking"),
     ("spaceport_core::connections", "connection"),
     ("spaceport_core::edge", "edge"),
     ("spaceport_core::operator", "operator"),

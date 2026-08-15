@@ -8,12 +8,14 @@
 //! GitHub issued when the App was created came from GitHub; a body that does
 //! not is a stranger's, whatever its headers claim.
 //!
-//! What this module does with a delivery is observe it, and — for the two
-//! events that say the installations are not what they were — shove the
-//! reconciler. It never applies what a delivery claims. A body is a story about
-//! the past that may arrive twice, late, or out of order, and the answer to all
-//! three is to go and ask GitHub outright; the delivery only decides *when* that
-//! happens. No app is deployed, no container is touched.
+//! What this module does with a delivery is observe it, and then hand on the
+//! two kinds of delivery something is waiting for: the two events that say the
+//! installations are not what they were shove the reconciler, and a `push` goes
+//! to [`super::push`], which writes down the head a tracked branch moved to. It
+//! never applies what a delivery claims about the installations. A body is a
+//! story about the past that may arrive twice, late, or out of order, and the
+//! answer to all three is to go and ask GitHub outright; the delivery only
+//! decides *when* that happens. No app is deployed, no container is touched.
 //!
 //! The shove happens after verification and after deduplication, and that
 //! ordering is a security property rather than a tidiness one. This endpoint is
@@ -38,8 +40,10 @@ use ring::hmac;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
+use super::push;
 use super::reconcile::Nudge;
 use super::repository::ConnectionRepository;
+use super::tracking::TrackingRepository;
 use crate::connections::Secret;
 
 /// The header naming what happened — `push`, `installation`, `ping`.
@@ -101,6 +105,13 @@ const SIGNATURE_PREFIX: &str = "sha256=";
 /// every other event a busy repository generates all day.
 pub const EVENTS_THAT_STALE_THE_CACHE: [&str; 2] = ["installation", "installation_repositories"];
 
+/// The event that says a ref moved.
+///
+/// The one event spaceport acts on rather than merely observes, and what it
+/// does about it lives in [`super::push`] — this module's part is being sure it
+/// is genuine and has not been handled before.
+pub const PUSH_EVENT: &str = "push";
+
 /// What spaceport made of a delivery.
 ///
 /// A status code is chosen from this rather than returned from the handling,
@@ -126,10 +137,10 @@ impl Outcome {
     /// The status GitHub is answered with.
     pub fn status(self) -> StatusCode {
         match self {
-            // Nothing acts on the delivery yet, and "accepted, not acted on" is
-            // exactly what 202 means. It is also what this will keep meaning
-            // once the reconciler does act, since acting will be a background
-            // pass rather than something finished before the response.
+            // "Accepted, and what follows from it is not finished yet" is
+            // exactly what 202 means, and it stays right now that a push writes
+            // a revision: what the revision is *for* is a build, and a build is
+            // a background pass rather than something done before the response.
             Self::Accepted => StatusCode::ACCEPTED,
             // Plain 200: the work was already done, and repeating it is not
             // something GitHub should be told about.
@@ -182,6 +193,7 @@ pub fn verify(secret: &Secret, signature: &str, body: &[u8]) -> Result<()> {
 /// GitHub rather than a fault of this spaceport's.
 pub async fn receive(
     connections: &ConnectionRepository,
+    tracking: &TrackingRepository,
     nudge: &Nudge,
     headers: &HeaderMap,
     body: &[u8],
@@ -285,6 +297,22 @@ pub async fn receive(
         nudge.nudge();
     }
 
+    // Beside the nudge and not inside it. A push says nothing about where the
+    // App is installed, so it must never wake the reconciler — that restriction
+    // is what keeps an endpoint the whole internet can reach from becoming an
+    // amplifier for GitHub API requests — and what it does say is a matter for
+    // the apps that track the branch it moved.
+    if event == PUSH_EVENT {
+        push::handle(tracking, app_id, &payload)
+            .await
+            .context("acting on a push github delivered")?;
+    }
+
+    // Whatever came of that, the delivery was a good one. [`Outcome`] says what
+    // happened to the *delivery* rather than what spaceport did about it, so a
+    // push to a branch nothing tracks is `Accepted` exactly like a push that
+    // moved five apps — GitHub has no use for the difference, and telling it
+    // otherwise would have it retry a delivery there is nothing wrong with.
     Ok(Outcome::Accepted)
 }
 
@@ -296,14 +324,27 @@ pub async fn receive(
 /// delivery whose signature was good: the signature is what says the delivery
 /// is genuine, and nothing spaceport failed to understand can take that back.
 #[derive(Debug, Default)]
-struct Payload {
+pub(super) struct Payload {
     /// What was done — `opened`, `created`, `synchronize`.
-    action: Option<String>,
+    pub(super) action: Option<String>,
     /// The repository it happened in, as `owner/name`.
-    repository: Option<String>,
+    pub(super) repository: Option<String>,
     /// The installation it came through, which is what a token is minted
     /// against.
-    installation: Option<i64>,
+    pub(super) installation: Option<i64>,
+    /// The ref a push moved, in full — `refs/heads/main`, `refs/tags/v1.0.0`.
+    ///
+    /// GitHub spells the field `ref`, which is a Rust keyword, so the field is
+    /// named for what a ref is rather than written as a raw identifier.
+    pub(super) reference: Option<String>,
+    /// What the ref points at now. All zeros when the push deleted it.
+    pub(super) after: Option<String>,
+    /// Whether the push was the ref going away. Absent means `false`, which is
+    /// what every ordinary push sends.
+    pub(super) deleted: bool,
+    /// The id of the commit at the tip of the push, which is `after` said
+    /// another way — and the only one of the two a body missing `after` has.
+    pub(super) head_commit: Option<String>,
 }
 
 impl Payload {
@@ -312,7 +353,7 @@ impl Payload {
     /// The payload itself never becomes a field. A `push` body runs to hundreds
     /// of kilobytes, and an event stream that carried them would be a copy of
     /// GitHub rather than a record of what spaceport heard.
-    fn read(body: &[u8]) -> Self {
+    pub(super) fn read(body: &[u8]) -> Self {
         let Ok(value) = serde_json::from_slice::<Value>(body) else {
             warn!("a verified webhook delivery was not json");
 
@@ -323,6 +364,10 @@ impl Payload {
             action: text(&value["action"]),
             repository: text(&value["repository"]["full_name"]),
             installation: value["installation"]["id"].as_i64(),
+            reference: text(&value["ref"]),
+            after: text(&value["after"]),
+            deleted: value["deleted"].as_bool().unwrap_or_default(),
+            head_commit: text(&value["head_commit"]["id"]),
         }
     }
 }
@@ -390,8 +435,18 @@ fn digit(byte: u8) -> Result<u8> {
 mod tests {
     use super::*;
 
+    use super::super::key;
+    use super::super::repository::Connection;
+    use super::super::tracking::Tracking;
+    use crate::state::Db;
+
     const SECRET: &str = "a-webhook-secret";
     const BODY: &[u8] = br#"{"action":"opened"}"#;
+    const APP_ID: i64 = 42;
+    /// A push body with only the fields this module reads out of one.
+    const PUSH: &[u8] = br#"{"ref":"refs/heads/main",
+                             "after":"0123456789abcdef0123456789abcdef01234567",
+                             "repository":{"full_name":"an-organisation/site"}}"#;
 
     /// A signature exactly as GitHub would have computed it, written with
     /// `ring::hmac::sign` rather than pasted as hex so the test says what it
@@ -526,5 +581,168 @@ mod tests {
         assert_eq!(Outcome::Unattributed.status(), StatusCode::NOT_FOUND);
         assert_eq!(Outcome::Unverified.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(Outcome::Malformed.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn reads_what_a_push_says_about_the_ref_it_moved() {
+        let payload = Payload::read(
+            br#"{"ref":"refs/heads/main",
+                 "after":"0123456789abcdef0123456789abcdef01234567",
+                 "deleted":true,
+                 "head_commit":{"id":"89abcdef"}}"#,
+        );
+
+        assert_eq!(payload.reference.as_deref(), Some("refs/heads/main"));
+        assert_eq!(
+            payload.after.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert!(payload.deleted);
+        assert_eq!(payload.head_commit.as_deref(), Some("89abcdef"));
+        // No `action` on a push, as ever.
+        assert_eq!(payload.action, None);
+    }
+
+    /// A delivery that is not a push carries none of a push's fields, and the
+    /// absent flag is `false` rather than anything that could read as a delete.
+    #[test]
+    fn a_body_that_is_not_a_push_says_nothing_about_a_ref() {
+        let payload = Payload::read(BODY);
+
+        assert_eq!(payload.reference, None);
+        assert_eq!(payload.after, None);
+        assert_eq!(payload.head_commit, None);
+        assert!(!payload.deleted);
+    }
+
+    /// A connection as one is read back out of the state store.
+    fn connection(app_id: i64) -> Connection {
+        Connection {
+            slug: "spaceport-for-acme".to_owned(),
+            app_id,
+            name: "Spaceport for Acme".to_owned(),
+            owner: "an-organisation".to_owned(),
+            client_id: "Iv1.0123456789abcdef".to_owned(),
+            client_secret: Secret::new("a-client-secret"),
+            webhook_secret: Secret::new(SECRET),
+            private_key: Secret::new(key::testing::PKCS1),
+            connected_at: String::new(),
+        }
+    }
+
+    /// One connected App, and the trackings over the same database.
+    async fn connected() -> (ConnectionRepository, TrackingRepository) {
+        let db = Db::in_memory().unwrap();
+        let connections = ConnectionRepository::new(db.clone());
+        connections.record(&connection(APP_ID)).await.unwrap();
+
+        (connections, TrackingRepository::new(db))
+    }
+
+    /// The headers GitHub sends with `body`, signed as GitHub would sign them.
+    fn delivery(event: &str, delivery_id: &str, body: &[u8]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(EVENT_HEADER, event.parse().unwrap());
+        headers.insert(DELIVERY_HEADER, delivery_id.parse().unwrap());
+        headers.insert(TARGET_TYPE_HEADER, APP_TARGET_TYPE.parse().unwrap());
+        headers.insert(TARGET_ID_HEADER, APP_ID.to_string().parse().unwrap());
+        headers.insert(SIGNATURE_HEADER, signature(SECRET, body).parse().unwrap());
+
+        headers
+    }
+
+    /// The delivery was a good one whatever spaceport had to do about it, and
+    /// a 202 is what stops GitHub retrying a push to a branch nobody tracks.
+    #[tokio::test]
+    async fn a_push_nothing_tracks_is_still_accepted() {
+        let (connections, tracking) = connected().await;
+
+        let outcome = receive(
+            &connections,
+            &tracking,
+            &Nudge::new(),
+            &delivery("push", "delivery-1", PUSH),
+            PUSH,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, Outcome::Accepted);
+    }
+
+    #[tokio::test]
+    async fn a_push_to_a_tracked_branch_records_the_head_it_moved_to() {
+        let (connections, tracking) = connected().await;
+        tracking
+            .record(&Tracking {
+                app: "site".parse().unwrap(),
+                github_app_id: APP_ID,
+                repository: "an-organisation/site".to_owned(),
+                branch: "main".to_owned(),
+                manifest_path: "spaceport.yaml".to_owned(),
+                tracked_at: String::new(),
+                revision: None,
+                revision_seen_at: None,
+            })
+            .await
+            .unwrap();
+
+        let outcome = receive(
+            &connections,
+            &tracking,
+            &Nudge::new(),
+            &delivery("push", "delivery-1", PUSH),
+            PUSH,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, Outcome::Accepted);
+        let read = tracking
+            .by_app(&"site".parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            read.revision.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+    }
+
+    /// The amplification guard. A push says nothing about where the App is
+    /// installed, and an endpoint the whole internet can reach must not turn
+    /// every commit an organisation makes into a GitHub round trip per
+    /// connection — acting on a push must not have quietly changed that.
+    #[tokio::test]
+    async fn a_push_still_nudges_nothing() {
+        let (connections, tracking) = connected().await;
+        let nudge = Nudge::new();
+        let changed = nudge.changed();
+
+        receive(
+            &connections,
+            &tracking,
+            &nudge,
+            &delivery("push", "delivery-1", PUSH),
+            PUSH,
+        )
+        .await
+        .unwrap();
+
+        assert!(!changed.has_changed().unwrap());
+
+        // And the reconciler is genuinely reachable from here, so the assertion
+        // above is about the event and not about a nudge nothing could send.
+        receive(
+            &connections,
+            &tracking,
+            &nudge,
+            &delivery("installation", "delivery-2", BODY),
+            BODY,
+        )
+        .await
+        .unwrap();
+
+        assert!(changed.has_changed().unwrap());
     }
 }
