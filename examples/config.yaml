@@ -40,3 +40,20 @@ data:
   # spaceport's own, and the two are not readable by the same people.
   # directory: /var/lib/spaceport/apps
   directory: ./tmp-spaceport-apps
+build:
+  # Where a commit is unpacked and built, one subtree per connection and app.
+  # Unlike the two directories above, spaceport deletes in here: a build tree is
+  # scratch that the commit can produce again, and it is readable only by the
+  # user spaceport runs as because it holds an app's source code.
+  # directory: /var/lib/spaceport/builds
+  directory: ./tmp-spaceport-builds
+
+  # How many built revisions of each app to keep. Three: the one running, the
+  # one a rollback goes back to, and the one being built. At least 1 — the
+  # sweep runs after a build, so keeping none would delete what was just built.
+  keep: 3
+
+  # The largest commit archive spaceport will download, in bytes. Refused on
+  # what github says the size is, before any of it is read. 64 MiB by default:
+  # a source tree larger than that is one with build outputs committed into it.
+  max_archive_bytes: 67108864

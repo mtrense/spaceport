@@ -12,6 +12,9 @@ use spaceport_core::acme::{CertificateRepository, Certificates, Challenges};
 use spaceport_core::app::{
     AppId, AppRepository, AppStore, Applier, DataDir, Pattern, reconcile, supervise,
 };
+use spaceport_core::build;
+use spaceport_core::build::dir::BuildDir;
+use spaceport_core::build::repository::BuildRepository;
 use spaceport_core::config::TlsProvider;
 use spaceport_core::connections::github::{self, ConnectionRepository};
 use spaceport_core::events::{self, Category, Event, EventBus, Level};
@@ -536,6 +539,13 @@ async fn run(args: RunArgs) -> Result<()> {
     data.create()?;
     info!(path = %data.root().display(), "opened the app data directory");
 
+    // Beside the data directory and emphatically not inside it: this is the one
+    // directory spaceport deletes from, and it holds the source code of
+    // somebody's app rather than the data an operator backs up.
+    let builds = BuildDir::new(config.build.directory.clone());
+    builds.create()?;
+    info!(path = %builds.root().display(), "opened the build directory");
+
     let runtime = Arc::new(DockerRuntime::connect(data)?);
     runtime.ping().await?;
 
@@ -546,9 +556,12 @@ async fn run(args: RunArgs) -> Result<()> {
         info!(%hostname, "answering to this host as spaceport itself");
     }
 
+    // Cloned rather than moved: the same engine runs the containers and builds
+    // the images, which is what [`spaceport_core::build::image::ImageBuilder`]
+    // is implemented on `DockerRuntime` for.
     let applier = Arc::new(Applier::new(
         apps.clone(),
-        runtime,
+        runtime.clone(),
         AppRepository::new(db.clone()),
     ));
 
@@ -637,6 +650,41 @@ async fn run(args: RunArgs) -> Result<()> {
         shutdown.clone(),
     ));
 
+    // The builder's own signal, and deliberately not the reconciler's. A push
+    // wakes this one, which reads the trackings out of the database; waking the
+    // reconciler for a push would make every commit an organisation makes into
+    // a GitHub round trip per connection.
+    let building = github::Nudge::new();
+
+    // One store, cloned into the worker that writes the rows and held by the
+    // operator interface that reads them back: `spaceport apps show` reports
+    // what a build came to, and it has to be looking at the same table the
+    // worker finished writing.
+    let build_records = Arc::new(BuildRepository::new(db.clone()));
+
+    // Started unconditionally, for the reason the reconciler is: an app can be
+    // tracked while spaceport is running, and a loop that was not started
+    // because nothing was tracked at startup would never build the first
+    // commit. A pass over nothing is two local queries and no network at all.
+    tokio::spawn(build::worker::maintain(
+        Arc::new(build::worker::Worker {
+            builds: (*build_records).clone(),
+            trackings: tracking.clone(),
+            connections: connections.clone(),
+            github: github.clone(),
+            archives: Arc::new(build::archive::Downloads::new()?),
+            images: runtime,
+            directory: builds,
+        }),
+        build::worker::Policy {
+            max_archive_bytes: config.build.max_archive_bytes,
+            keep: config.build.keep,
+            ..build::worker::Policy::default()
+        },
+        building.clone(),
+        shutdown.clone(),
+    ));
+
     // Shared between the two listeners on purpose: `spaceport connect github
     // --auto` issues a state on the operator socket, and the browser that
     // answers for it arrives at the edge.
@@ -651,6 +699,7 @@ async fn run(args: RunArgs) -> Result<()> {
         tracking: tracking.clone(),
         github: github.clone(),
         nudge: nudge.clone(),
+        builds: building,
         hostname: config.edge.hostname.as_ref().map(ToString::to_string),
     });
 
@@ -666,6 +715,7 @@ async fn run(args: RunArgs) -> Result<()> {
             applier,
             connections,
             tracking,
+            builds: build_records,
             github,
             attempts,
             nudge,

@@ -81,6 +81,10 @@ struct State {
     /// different questions — a repository can be granted to an installation and
     /// still be one no test ever said anything about the branches of.
     default_branches: HashMap<String, String>,
+    /// Where `/repos/{owner}/{name}/tarball/{revision}` redirects to, by full
+    /// name and revision. Empty to begin with, because a redirect to nowhere is
+    /// not a useful default and a test that cares about the download says so.
+    archives: HashMap<(String, String), String>,
     token_lifetime: Duration,
     minted: usize,
     /// Answer every request with this status and body instead.
@@ -121,6 +125,7 @@ impl FakeGitHub {
                     "an-organisation/site".to_owned(),
                     "main".to_owned(),
                 )]),
+                archives: HashMap::new(),
                 token_lifetime: TOKEN_LIFETIME,
                 minted: 0,
                 refusal: None,
@@ -188,6 +193,19 @@ impl FakeGitHub {
             .unwrap()
             .default_branches
             .insert(full_name.to_owned(), branch.to_owned());
+    }
+
+    /// Say that the tarball of `revision` is downloadable from `location`.
+    ///
+    /// Answered as GitHub answers it: a `302` and a `Location`, never the bytes.
+    /// A revision nothing has been said about is a `404`, which is the same
+    /// answer a repository this installation was never granted would get — see
+    /// [`Self::repository_defaults_to`] for why GitHub does not distinguish.
+    pub(crate) fn archives_at(&self, full_name: &str, revision: &str, location: &str) {
+        self.state.lock().unwrap().archives.insert(
+            (full_name.to_owned(), revision.to_owned()),
+            location.to_owned(),
+        );
     }
 
     /// Mint tokens that are good for this long — negative for one that has
@@ -336,6 +354,25 @@ impl FakeGitHub {
                     // GitHub answers `404` rather than `403` for a repository an
                     // installation may not see, so that a token cannot be used
                     // to find out what exists.
+                    None => Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Bytes::from_static(br#"{"message":"Not Found"}"#))
+                        .unwrap(),
+                }
+            }
+            // The tarball, which is a redirect and never a body. The revision
+            // is the rest of the path joined back up, since a branch name is
+            // allowed to have slashes in it and the client sends it unescaped.
+            ["", "repos", owner, name, "tarball", revision @ ..] => {
+                let full_name = format!("{owner}/{name}");
+                let revision = revision.join("/");
+
+                match state.archives.get(&(full_name, revision)) {
+                    Some(location) => Response::builder()
+                        .status(StatusCode::FOUND)
+                        .header(header::LOCATION, location)
+                        .body(Bytes::new())
+                        .unwrap(),
                     None => Response::builder()
                         .status(StatusCode::NOT_FOUND)
                         .body(Bytes::from_static(br#"{"message":"Not Found"}"#))

@@ -460,6 +460,46 @@ impl Client {
         })
     }
 
+    /// Where GitHub says the tarball of `revision` may be downloaded from.
+    ///
+    /// The one call in this module that does not want a body. `GET
+    /// /repos/{owner}/{repo}/tarball/{ref}` never answers with an archive: it
+    /// answers `302` to `codeload.github.com` with a short-lived token in the
+    /// query string, and codeload *refuses* a request that forwards the
+    /// `Authorization` header this one carried. So the download is two requests
+    /// by GitHub's design, and this is the first of them — the authenticated
+    /// one, which reads the header and goes no further.
+    ///
+    /// Following the redirect here is exactly what [`Network::send`] refuses to
+    /// do, and it is refused for this endpoint most of all: the whole value of
+    /// not following is that an installation token is never replayed to
+    /// whatever host answered. The second request is made by
+    /// [`crate::build::archive`], to a host it pins, carrying no credential at
+    /// all.
+    ///
+    /// The location is handed back exactly as GitHub wrote it. The token in the
+    /// query string is the credential the download is authorised by, and any
+    /// parsing, re-encoding or tidying of the url is a chance to break it.
+    pub async fn archive_location(
+        &self,
+        installation_id: i64,
+        full_name: &str,
+        revision: &str,
+    ) -> Result<String> {
+        let token = self.installation_token(installation_id).await?;
+        let what = format!("archive of `{full_name}` at `{revision}`");
+        let response = self
+            .send(
+                Method::GET,
+                &format!("{API}/repos/{full_name}/tarball/{revision}"),
+                Some(&Credential::Installation(token)),
+            )
+            .await
+            .with_context(|| format!("asking github for the {what}"))?;
+
+        location(&response, &what)
+    }
+
     /// A token that acts as installation `installation_id`, minting one only if
     /// the one in hand is not good for long enough.
     pub async fn installation_token(&self, installation_id: i64) -> Result<Secret> {
@@ -622,6 +662,42 @@ fn decode<T: DeserializeOwned>(response: &Response<Bytes>, what: &str) -> Result
     serde_json::from_slice(response.body()).with_context(|| {
         format!("github's answer about the {what} is not what spaceport expected it to be")
     })
+}
+
+/// Read the `Location` of a response that is supposed to be a redirect.
+///
+/// The mirror image of [`decode`], and it needs its own path because it inverts
+/// that function's rule: there every non-2xx is a refusal, and here the *only*
+/// good answer is a `302`. A `200` is the case worth being explicit about — it
+/// would mean GitHub had started answering this endpoint with the archive
+/// itself, and a caller handed a body where it expected a url would go looking
+/// for the fault anywhere but here.
+///
+/// Everything GitHub refuses with — the credentials, the rate limit, a
+/// repository or a revision it will not show, its own bad afternoon — is left
+/// to [`refusal`], so those read the way they read everywhere else.
+fn location(response: &Response<Bytes>, what: &str) -> Result<String> {
+    let status = response.status();
+
+    if status.is_client_error() || status.is_server_error() {
+        return Err(refusal(response, what));
+    }
+    if status != StatusCode::FOUND {
+        bail!(
+            "github answered {status} for the {what} rather than a download location, which is not how that endpoint is documented to behave — spaceport will not guess where the archive is"
+        );
+    }
+
+    response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            anyhow!(
+                "github redirected the {what} without saying where to, so it did not answer with a download location spaceport can fetch"
+            )
+        })
 }
 
 /// What to tell an operator about a status GitHub answered with.
@@ -882,6 +958,91 @@ mod tests {
 
         assert!(
             error.contains("knows no repository `an-organisation/nowhere`"),
+            "{error}"
+        );
+        assert!(error.contains("has been granted"), "{error}");
+    }
+
+    /// The archive is read as the installation like every other repository
+    /// call, and through the same cache — a build is not a reason to mint a
+    /// token of its own.
+    #[tokio::test]
+    async fn asks_where_a_revision_may_be_downloaded_from_with_an_installation_token() {
+        let github = FakeGitHub::new();
+        github.archives_at(
+            "an-organisation/site",
+            "d34db33f",
+            "https://codeload.github.com/an-organisation/site/legacy.tar.gz/d34db33f",
+        );
+
+        client(&github)
+            .archive_location(7, "an-organisation/site", "d34db33f")
+            .await
+            .unwrap();
+
+        let asked = github
+            .requests()
+            .into_iter()
+            .find(|request| request.path == "/repos/an-organisation/site/tarball/d34db33f")
+            .expect("the archive location was asked for");
+        assert_eq!(asked.authorization, Authorization::Token);
+    }
+
+    /// The token in the query string is what authorises the download, so the
+    /// location has to come back byte for byte — anything that parses and
+    /// rebuilds the url is a chance to drop it.
+    #[tokio::test]
+    async fn hands_back_the_location_github_gave_including_its_token() {
+        let github = FakeGitHub::new();
+        let location = "https://codeload.github.com/an-organisation/site/legacy.tar.gz/d34db33f?token=ABCDEF%2F123";
+        github.archives_at("an-organisation/site", "d34db33f", location);
+
+        let answer = client(&github)
+            .archive_location(7, "an-organisation/site", "d34db33f")
+            .await
+            .unwrap();
+
+        assert_eq!(answer, location);
+    }
+
+    /// A `200` here would mean the archive itself had arrived on a path
+    /// spaceport reads a header off, and a caller handed bytes where it wanted
+    /// a url would look for the fault everywhere but here.
+    #[tokio::test]
+    async fn refuses_an_archive_answer_that_is_not_a_redirect() {
+        let github = FakeGitHub::new();
+        let client = client(&github);
+        // Minted first, so that answering everything with `200` afterwards is
+        // about the tarball call and not about the token.
+        client.installation_token(7).await.unwrap();
+        github.refuse_with(StatusCode::OK, "a tarball, apparently");
+
+        let error = format!(
+            "{:#}",
+            client
+                .archive_location(7, "an-organisation/site", "d34db33f")
+                .await
+                .unwrap_err()
+        );
+
+        assert!(error.contains("rather than a download location"), "{error}");
+        assert!(error.contains("will not guess"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn says_when_the_revision_is_one_github_will_not_show() {
+        let github = FakeGitHub::new();
+
+        let error = format!(
+            "{:#}",
+            client(&github)
+                .archive_location(7, "an-organisation/site", "d34db33f")
+                .await
+                .unwrap_err()
+        );
+
+        assert!(
+            error.contains("knows no archive of `an-organisation/site` at `d34db33f`"),
             "{error}"
         );
         assert!(error.contains("has been granted"), "{error}");

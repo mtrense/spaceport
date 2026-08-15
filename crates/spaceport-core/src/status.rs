@@ -23,6 +23,7 @@ use time::OffsetDateTime;
 use crate::acme::{CertificateRepository, Certificates};
 use crate::app::reconcile::Report;
 use crate::app::{AppId, Applier, health};
+use crate::build::repository::BuildRepository;
 use crate::config::{Config, TlsProvider};
 use crate::connections::github::{self, ConnectionRepository, TrackingRepository};
 use crate::operator::OperatorEndpoint;
@@ -56,6 +57,11 @@ pub struct Instance {
     /// app at a branch must be looking at the same rows as the edge that will
     /// be told about the pushes to it. Nothing reads it yet.
     pub tracking: Arc<TrackingRepository>,
+    /// What became of the revisions those trackings named. Held beside them
+    /// because that is the question an operator asks straight after "what is
+    /// this app built from" — and the same rows the worker writes are the ones
+    /// a report has to read, or a failed build would be invisible here.
+    pub builds: Arc<BuildRepository>,
     /// How anything that has to ask GitHub something reaches it. One for the
     /// whole process, so every connection shares the connection pool rather
     /// than opening a TLS session per operator command.
@@ -532,6 +538,7 @@ container:
             applier,
             connections: Arc::new(ConnectionRepository::new(db.clone())),
             tracking: Arc::new(TrackingRepository::new(db.clone())),
+            builds: Arc::new(BuildRepository::new(db.clone())),
             github: github::api::testing::FakeGitHub::new(),
             attempts: Arc::new(github::Attempts::new()),
             nudge: github::Nudge::new(),

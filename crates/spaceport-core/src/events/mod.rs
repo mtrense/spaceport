@@ -143,6 +143,11 @@ const CATEGORIES: &[(&str, &str)] = &[
     ("spaceport_core::app::store", "route"),
     ("spaceport_core::app::repository", "state"),
     ("spaceport_core::runtime", "container"),
+    // Every module of the build: fetching a commit, unpacking it, asking the
+    // engine and remembering what came back are one story to the operator
+    // watching a push turn into an image, and splitting them would make
+    // `--category build` the wrong answer to "why is my app not building".
+    ("spaceport_core::build", "build"),
     ("spaceport_core::edge::proxy", "request"),
     ("spaceport_core::edge::tls", "tls"),
     ("spaceport_core::acme::resolver", "tls"),
@@ -363,6 +368,26 @@ mod tests {
         );
         assert!(
             !Category::new("connection.reconcile").within(&Category::new("connection.webhook"))
+        );
+    }
+
+    /// Turning a commit into an image is its own kind of thing: an operator
+    /// watching a deployment wants the build without the container's events
+    /// around it, and every module of the build answers to the same word.
+    #[test]
+    fn categorises_what_a_build_does() {
+        assert_eq!(
+            Category::for_target("spaceport_core::build::worker").as_str(),
+            "build"
+        );
+        assert_eq!(
+            Category::for_target("spaceport_core::build::dir").as_str(),
+            "build"
+        );
+        // And it is not the runtime's, which the entry above it holds.
+        assert_eq!(
+            Category::for_target("spaceport_core::runtime::docker").as_str(),
+            "container"
         );
     }
 

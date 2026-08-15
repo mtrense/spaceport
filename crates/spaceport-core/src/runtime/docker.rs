@@ -11,8 +11,9 @@
 //! and the label is what lets a restarted spaceport find every container it
 //! left behind, including the ones no app is named for any more.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -23,9 +24,9 @@ use bollard::models::{
     ContainerCreateBody, EventMessage, HostConfig, Mount, MountType, PortBinding, PortMap,
 };
 use bollard::query_parameters::{
-    CreateContainerOptionsBuilder, CreateImageOptionsBuilder, EventsOptionsBuilder,
-    InspectContainerOptions, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
-    StartContainerOptions, StopContainerOptionsBuilder,
+    BuildImageOptionsBuilder, CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
+    EventsOptionsBuilder, InspectContainerOptions, ListContainersOptionsBuilder,
+    RemoveContainerOptionsBuilder, StartContainerOptions, StopContainerOptionsBuilder,
 };
 use futures_util::{StreamExt, stream};
 use tokio::sync::mpsc;
@@ -35,6 +36,7 @@ use super::{Adopted, Container, ContainerId, ContainerRuntime, Events, Managed, 
 use crate::app::data::{DataDir, Owner};
 use crate::app::manifest::Source;
 use crate::app::{AppId, AppManifest};
+use crate::build::image::{BuildRequest, BuiltImage, ImageBuilder};
 
 /// Marks a container as spaceport's, and says whose it is.
 const MANAGED_LABEL: &str = "spaceport.managed";
@@ -648,6 +650,204 @@ impl DockerRuntime {
     }
 }
 
+/// How many lines of a build's log spaceport keeps.
+///
+/// A build is free to print as much as it likes, and some do: a package
+/// manager fetching a thousand dependencies is a thousand lines nobody will
+/// read. The log is kept because a failed build's output is the only thing
+/// that explains it, and what explains one is the end of it — so this is a cap
+/// on the tail rather than a truncation of the head. Uncapped, a single
+/// unlucky `RUN` would put a megabyte into the event stream and another into
+/// the database, for every build, forever.
+const MAX_LOG_LINES: usize = 500;
+
+/// How many of those lines an error message carries.
+///
+/// An operator reading "the build failed" wants the last thing the build said,
+/// not its whole output; the rest is on the build record.
+const LOG_TAIL: usize = 20;
+
+/// Building is implemented on [`DockerRuntime`] rather than on a `DockerBuilder`
+/// of its own because the daemon handle is already here, along with the
+/// connecting and the ping that say whether there is a daemon to talk to at
+/// all. A second type would either clone the client or open a second connection
+/// to the same socket, and would have to be constructed and checked in parallel
+/// with this one everywhere spaceport starts up. Building an image and running
+/// a container are two things asked of one engine.
+#[async_trait]
+impl ImageBuilder for DockerRuntime {
+    async fn build(&self, request: &BuildRequest) -> Result<BuiltImage> {
+        // Non-UTF-8 is refused rather than lossily converted: a path that went
+        // through `to_string_lossy` would name a file that is not there, and
+        // the daemon's complaint would be about the replacement characters.
+        let dockerfile = request.dockerfile.to_str().ok_or_else(|| {
+            anyhow!(
+                "the dockerfile path `{}` is not utf-8",
+                request.dockerfile.display()
+            )
+        })?;
+
+        // Walking and reading a source tree is blocking work, and unlike the
+        // handful of directories `provision` makes it is proportional to the
+        // size of the repository. It goes on the blocking pool so that a large
+        // context does not stall the reactor the edge is serving on.
+        let context = request.context.clone();
+        let tar = tokio::task::spawn_blocking(move || pack(&context))
+            .await
+            .context("packing the build context")??;
+
+        let labels: HashMap<String, String> = request
+            .labels
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+
+        // `version` is left at its default, `BuilderVersion::BuilderV1`. Asking
+        // for version 2 without bollard's `buildkit` feature reaches a branch
+        // bollard itself documents as "should not be possible" and panics
+        // there — the classic builder is the only one this build of spaceport
+        // has. `nocache` is left at its default too: a context is a fresh
+        // unpacked commit, so the cache can only ever hit on layers that really
+        // are the same.
+        let options = BuildImageOptionsBuilder::new()
+            .dockerfile(dockerfile)
+            .t(&request.tag)
+            .labels(&labels)
+            .rm(true)
+            .build();
+
+        info!(tag = request.tag, "building image");
+
+        // Hazard: `build_image` *unwraps* its tar argument, so a call that
+        // passes `None` panics rather than failing. There is exactly one call
+        // and the body is always `Some`; nothing here may be refactored into a
+        // shape where it is optional.
+        //
+        // It is also not an async fn — it returns a stream borrowing the client
+        // — so the stream is created and drained here, inside a method that
+        // holds `&self`, and never handed back to a caller.
+        let mut progress =
+            self.docker
+                .build_image(options, None, Some(bollard::body_full(tar.into())));
+
+        let mut log = VecDeque::new();
+        let mut id = None;
+
+        while let Some(item) = progress.next().await {
+            // Bollard turns a build step's `errorDetail` into a stream error,
+            // so a Dockerfile that failed and a socket that broke arrive the
+            // same way. Both mean there is no image, and both are worth the
+            // log: it is what says which of the two happened.
+            let info = match item {
+                Ok(info) => info,
+                Err(error) => {
+                    return Err(error).context(format!(
+                        "building image `{}`{}",
+                        request.tag,
+                        tail(&log)
+                    ));
+                }
+            };
+
+            // Unlike a pull, whose progress is discarded, every line is kept.
+            if let Some(stream) = info.stream {
+                record(&mut log, &stream);
+            }
+
+            // Where the classic builder puts the id of what it made. With
+            // bollard's `buildkit` feature this field is a different type
+            // entirely, which is the whole reason there is a trait above this.
+            if let Some(image) = info.aux.and_then(|aux| aux.id) {
+                id = Some(image);
+            }
+        }
+
+        // A stream that ended without ever carrying an `aux` is a build that
+        // produced no image and did not say so, which is a failure however
+        // cleanly the connection closed.
+        let Some(id) = id else {
+            bail!(
+                "the docker daemon finished building `{}` without naming an image{}",
+                request.tag,
+                tail(&log),
+            );
+        };
+
+        info!(tag = request.tag, image = id, "image built");
+
+        Ok(BuiltImage {
+            tag: request.tag.clone(),
+            id,
+            log: log.into(),
+        })
+    }
+}
+
+/// Pack `context` into a tar in memory, as the engine wants its build context.
+///
+/// In memory because that is what the daemon is going to hold anyway — the
+/// whole archive is the request body — and a temporary file would only add a
+/// path that has to be cleaned up after a failure.
+///
+/// Symlinks are packed as symlinks rather than followed. Following them would
+/// let a `Dockerfile`'s neighbour — a symlink to `/etc/shadow`, say, committed
+/// to a repository spaceport builds — arrive in the build context as the file
+/// it points at, on the host spaceport is running on.
+fn pack(context: &Path) -> Result<Vec<u8>> {
+    let mut builder = tar::Builder::new(Vec::new());
+    builder.follow_symlinks(false);
+
+    // An empty prefix, so entries are named the way the Dockerfile path is:
+    // relative to the root of the context and with nothing in front of them.
+    builder
+        .append_dir_all("", context)
+        .with_context(|| format!("packing the build context at `{}`", context.display()))?;
+
+    builder
+        .into_inner()
+        .context("finishing the build context archive")
+}
+
+/// Keep whatever the engine has just said, in whole lines and no more than
+/// [`MAX_LOG_LINES`] of them.
+///
+/// The engine emits fragments rather than lines — one chunk can carry several
+/// lines, or half of one — so this splits on newlines and drops what is empty
+/// afterwards. A log kept verbatim would be a list of arbitrary fragments,
+/// which is neither what an operator reads nor what a line cap counts.
+fn record(log: &mut VecDeque<String>, chunk: &str) {
+    for line in chunk.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+
+        if log.len() == MAX_LOG_LINES {
+            log.pop_front();
+        }
+        log.push_back(line.to_owned());
+    }
+}
+
+/// The last [`LOG_TAIL`] lines of a build's log, introduced so that an error
+/// message reads as one sentence.
+///
+/// Empty when the build said nothing at all: a message ending in a heading with
+/// nothing under it reads like something went missing.
+fn tail(log: &VecDeque<String>) -> String {
+    let lines: Vec<&str> = log
+        .iter()
+        .skip(log.len().saturating_sub(LOG_TAIL))
+        .map(String::as_str)
+        .collect();
+
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    format!(", whose last output was:\n{}", lines.join("\n"))
+}
+
 /// What this manifest says the container should be, in 32 hex characters.
 ///
 /// Covers what is decided when a container is created and cannot be changed
@@ -1069,6 +1269,64 @@ env:
         assert_ne!(spec(&one), spec(&other));
     }
 
+    fn log_of(lines: &[&str]) -> VecDeque<String> {
+        let mut log = VecDeque::new();
+        for line in lines {
+            record(&mut log, line);
+        }
+
+        log
+    }
+
+    /// The engine emits fragments, not lines: one chunk can carry several, or
+    /// half of one and the rest of it next time. A log kept verbatim would be
+    /// a list of arbitrary fragments rather than of build output.
+    #[test]
+    fn keeps_what_the_engine_says_as_whole_lines() {
+        let log = log_of(&["Step 1/2 : FROM scratch\n ---> ok\n", "\n", "Step 2/2\n"]);
+
+        assert_eq!(
+            log,
+            ["Step 1/2 : FROM scratch", " ---> ok", "Step 2/2"]
+                .map(str::to_owned)
+                .to_vec()
+        );
+    }
+
+    /// A build that prints a megabyte must not put a megabyte in the event
+    /// stream, and the end is the part that explains a failure.
+    #[test]
+    fn keeps_only_the_end_of_a_talkative_build() {
+        let noise: Vec<String> = (0..MAX_LOG_LINES + 50).map(|n| n.to_string()).collect();
+        let log = log_of(&noise.iter().map(String::as_str).collect::<Vec<_>>());
+
+        assert_eq!(log.len(), MAX_LOG_LINES);
+        assert_eq!(log.front().unwrap(), "50");
+        assert_eq!(log.back().unwrap(), &(MAX_LOG_LINES + 49).to_string());
+    }
+
+    #[test]
+    fn puts_the_last_of_the_log_in_the_message_that_reports_a_failure() {
+        let noise: Vec<String> = (0..100).map(|n| n.to_string()).collect();
+        let tail = tail(&log_of(
+            &noise.iter().map(String::as_str).collect::<Vec<_>>(),
+        ));
+
+        assert!(tail.contains("\n99"), "{tail}");
+        assert!(tail.contains(&format!("\n{}", 100 - LOG_TAIL)), "{tail}");
+        assert!(
+            !tail.contains(&format!("\n{}", 100 - LOG_TAIL - 1)),
+            "{tail}"
+        );
+    }
+
+    /// A build that said nothing at all gets no heading: a message that ends
+    /// in one with nothing under it reads like something went missing.
+    #[test]
+    fn says_nothing_about_a_log_that_is_empty() {
+        assert_eq!(tail(&VecDeque::new()), "");
+    }
+
     /// The daemon-backed tests below are skipped rather than failed where
     /// there is no daemon: they are the only way to check the parts that are
     /// nothing but daemon, so they should run wherever one exists, but a
@@ -1442,6 +1700,97 @@ container:
             .to_string();
 
         assert!(err.contains("cannot do yet"), "{err}");
+    }
+
+    /// A build context on disk, written the way one arrives: a directory with
+    /// a Dockerfile in it. `FROM scratch` so that the test needs no registry —
+    /// a build that pulled a base image would be testing the network.
+    fn build_context(dockerfile: &str) -> std::path::PathBuf {
+        let root = temp_dir();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Dockerfile"), dockerfile).unwrap();
+        std::fs::write(root.join("hello.txt"), "hello").unwrap();
+
+        root
+    }
+
+    #[tokio::test]
+    async fn builds_an_image_and_says_what_the_engine_called_it() {
+        let Some(runtime) = daemon().await else {
+            eprintln!("skipping: no docker daemon");
+            return;
+        };
+        let app: AppId = "spaceport-selftest-build".parse().unwrap();
+        let context = build_context("FROM scratch\nCOPY hello.txt /hello.txt\n");
+        let tag = crate::build::image::tag(&app, "0123456789abcdef");
+
+        let built = runtime
+            .build(&BuildRequest {
+                context: context.clone(),
+                dockerfile: "Dockerfile".into(),
+                tag: tag.clone(),
+                labels: std::collections::BTreeMap::from([(
+                    MANAGED_LABEL.to_owned(),
+                    "true".to_owned(),
+                )]),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(built.tag, tag);
+        assert!(!built.id.is_empty());
+        // The log is kept, unlike a pull's progress: it is the only thing that
+        // could ever explain a build.
+        assert!(!built.log.is_empty(), "{:?}", built.log);
+
+        // The tag and the labels reached the daemon, so what was asked for is
+        // what is now on the host.
+        let inspect = runtime.docker.inspect_image(&tag).await.unwrap();
+        assert!(
+            inspect.repo_tags.unwrap_or_default().contains(&tag),
+            "the image is not tagged `{tag}`"
+        );
+        let labels = inspect.config.unwrap().labels.unwrap_or_default();
+        assert_eq!(labels.get(MANAGED_LABEL).map(String::as_str), Some("true"));
+
+        let _ = runtime
+            .docker
+            .remove_image(
+                &tag,
+                None::<bollard::query_parameters::RemoveImageOptions>,
+                None,
+            )
+            .await;
+        let _ = std::fs::remove_dir_all(&context);
+    }
+
+    /// The whole reason the log is retained: a build that failed has to come
+    /// back saying what the engine was doing when it did.
+    #[tokio::test]
+    async fn reports_a_build_that_failed_with_the_output_that_explains_it() {
+        let Some(runtime) = daemon().await else {
+            eprintln!("skipping: no docker daemon");
+            return;
+        };
+        let app: AppId = "spaceport-selftest-build-fails".parse().unwrap();
+        let context = build_context("FROM scratch\nCOPY nothing-is-here.txt /\n");
+        let tag = crate::build::image::tag(&app, "0123456789abcdef");
+
+        let err = runtime
+            .build(&BuildRequest {
+                context: context.clone(),
+                dockerfile: "Dockerfile".into(),
+                tag: tag.clone(),
+                labels: std::collections::BTreeMap::new(),
+            })
+            .await
+            .unwrap_err();
+
+        let err = format!("{err:#}");
+        assert!(err.contains(&tag), "{err}");
+        assert!(err.contains("nothing-is-here.txt"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&context);
     }
 
     /// The supervisor's fast path, end to end against a real daemon: the label

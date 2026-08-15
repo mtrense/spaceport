@@ -5,10 +5,14 @@
 //! branch of a repository moved. This module is the join between the two, and
 //! the whole of what it does is write down the head sha the branch moved to —
 //! one row per app, and one line in the event stream so that an operator
-//! watching `spaceport stream` sees the moment spaceport heard. Nothing builds
-//! anything from this yet. No image is made, no container is replaced, and the
-//! only observable effect of a push is a revision in `github_tracking` and the
-//! event that says it was written.
+//! watching `spaceport stream` sees the moment spaceport heard.
+//!
+//! Nothing here builds anything, and it shoves something that does. The
+//! `builds` [`Nudge`] is the *only* effect a push has beyond the row: no image
+//! is made here, no container is replaced, and what the builder does when it
+//! wakes is read the trackings for itself. That is deliberate — the shove says
+//! "go and look", never "build this" — so a shove that goes missing costs the
+//! interval [`crate::build::worker`] runs on and nothing else.
 //!
 //! Branches only, and deliberately. `refs/tags/*` reaches this module and
 //! leaves it untouched, because `spaceport apps track` binds exactly one branch
@@ -39,6 +43,7 @@
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
+use super::reconcile::Nudge;
 use super::tracking::TrackingRepository;
 use super::webhook::Payload;
 
@@ -70,8 +75,19 @@ const SHA_LENGTHS: [usize; 2] = [40, 64];
 /// The `Err` case is the state store failing, and nothing else: a push that
 /// matches no tracking, names no branch, or has already been seen is an
 /// ordinary outcome and returns `Ok`.
+///
+/// `builds` is shoved once a revision has actually been written down, and never
+/// before. It is a [`Nudge`] of the same type the reconciler takes and
+/// emphatically not the same *instance*: that one makes spaceport ask GitHub
+/// where its App is installed, which is one round trip per connection, and
+/// waking it for every commit an organisation pushes is precisely the
+/// amplification [`super::webhook`] refuses to build. The type is reused rather
+/// than copied because a `watch` that coalesces a burst into one pass is
+/// exactly as right for a build queue as it is for a reconciliation, and a
+/// second implementation of it would be a second thing to get wrong.
 pub(super) async fn handle(
     tracking: &TrackingRepository,
+    builds: &Nudge,
     github_app_id: i64,
     payload: &Payload,
 ) -> Result<()> {
@@ -144,6 +160,12 @@ pub(super) async fn handle(
 
             continue;
         }
+
+        // After the row and not before: the builder reads the trackings for
+        // itself, so a shove that arrived first would send it to look at a
+        // revision that is not written down yet — and it would find the old one
+        // and believe it.
+        builds.nudge();
 
         let head = abbreviate(revision);
         info!(
@@ -249,6 +271,51 @@ mod tests {
         )
     }
 
+    /// A revision written down is a build wanted, and an operator watching a
+    /// push should not wait out the builder's interval to see it start.
+    #[tokio::test]
+    async fn recording_a_revision_wakes_the_builder() {
+        let tracking = repository();
+        track(&tracking, "site", APP_ID, "main").await;
+        let builds = Nudge::new();
+        let woken = builds.changed();
+
+        handle(&tracking, &builds, APP_ID, &push("refs/heads/main", HEAD))
+            .await
+            .unwrap();
+
+        assert!(woken.has_changed().unwrap());
+    }
+
+    /// A push that changed nothing here — a tag, a deletion, a branch nobody
+    /// tracks, or the revision already recorded — leaves the builder asleep. It
+    /// would find the same trackings it found last time, and a busy
+    /// organisation pushes all day.
+    #[tokio::test]
+    async fn a_push_that_recorded_nothing_wakes_the_builder_for_nothing() {
+        let tracking = repository();
+        track(&tracking, "site", APP_ID, "main").await;
+        let builds = Nudge::new();
+        handle(&tracking, &builds, APP_ID, &push("refs/heads/main", HEAD))
+            .await
+            .unwrap();
+        // Everything the first push said is now seen, so what follows is all
+        // that is being measured.
+        let woken = builds.changed();
+
+        for payload in [
+            push("refs/tags/v1.0.0", HEAD),
+            push("refs/heads/release", HEAD),
+            push("refs/heads/main", ABSENT),
+            // The same head again, as a redelivery outside the window is.
+            push("refs/heads/main", HEAD),
+        ] {
+            handle(&tracking, &builds, APP_ID, &payload).await.unwrap();
+        }
+
+        assert!(!woken.has_changed().unwrap());
+    }
+
     async fn revision(tracking: &TrackingRepository, id: &str) -> Option<String> {
         tracking.by_app(&app(id)).await.unwrap().unwrap().revision
     }
@@ -258,9 +325,14 @@ mod tests {
         let tracking = repository();
         track(&tracking, "site", APP_ID, "main").await;
 
-        handle(&tracking, APP_ID, &push("refs/heads/release", HEAD))
-            .await
-            .unwrap();
+        handle(
+            &tracking,
+            &Nudge::new(),
+            APP_ID,
+            &push("refs/heads/release", HEAD),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(revision(&tracking, "site").await, None);
     }
@@ -272,14 +344,24 @@ mod tests {
         let tracking = repository();
         track(&tracking, "site", APP_ID, "main").await;
 
-        handle(&tracking, APP_ID, &push("refs/tags/v1.0.0", HEAD))
-            .await
-            .unwrap();
+        handle(
+            &tracking,
+            &Nudge::new(),
+            APP_ID,
+            &push("refs/tags/v1.0.0", HEAD),
+        )
+        .await
+        .unwrap();
         // And anything else that is not a branch either.
-        handle(&tracking, APP_ID, &push("refs/pull/7/head", HEAD))
-            .await
-            .unwrap();
-        handle(&tracking, APP_ID, &push("main", HEAD))
+        handle(
+            &tracking,
+            &Nudge::new(),
+            APP_ID,
+            &push("refs/pull/7/head", HEAD),
+        )
+        .await
+        .unwrap();
+        handle(&tracking, &Nudge::new(), APP_ID, &push("main", HEAD))
             .await
             .unwrap();
 
@@ -296,13 +378,17 @@ mod tests {
 
         let mut flagged = push("refs/heads/main", HEAD);
         flagged.deleted = true;
-        handle(&tracking, APP_ID, &flagged).await.unwrap();
+        handle(&tracking, &Nudge::new(), APP_ID, &flagged)
+            .await
+            .unwrap();
 
         assert_eq!(revision(&tracking, "site").await, None);
 
         let zeroed = push("refs/heads/main", ABSENT);
         assert!(!zeroed.deleted, "the flag is not what this case tests");
-        handle(&tracking, APP_ID, &zeroed).await.unwrap();
+        handle(&tracking, &Nudge::new(), APP_ID, &zeroed)
+            .await
+            .unwrap();
 
         assert_eq!(revision(&tracking, "site").await, None);
     }
@@ -326,7 +412,9 @@ mod tests {
             .as_bytes(),
         );
 
-        handle(&tracking, APP_ID, &payload).await.unwrap();
+        handle(&tracking, &Nudge::new(), APP_ID, &payload)
+            .await
+            .unwrap();
 
         assert_eq!(revision(&tracking, "site").await.as_deref(), Some(HEAD));
     }
@@ -338,9 +426,14 @@ mod tests {
     async fn ignores_a_push_that_lands_on_the_revision_already_seen() {
         let tracking = repository();
         track(&tracking, "site", APP_ID, "main").await;
-        handle(&tracking, APP_ID, &push("refs/heads/main", HEAD))
-            .await
-            .unwrap();
+        handle(
+            &tracking,
+            &Nudge::new(),
+            APP_ID,
+            &push("refs/heads/main", HEAD),
+        )
+        .await
+        .unwrap();
         let seen_at = tracking
             .by_app(&app("site"))
             .await
@@ -348,9 +441,14 @@ mod tests {
             .unwrap()
             .revision_seen_at;
 
-        handle(&tracking, APP_ID, &push("refs/heads/main", HEAD))
-            .await
-            .unwrap();
+        handle(
+            &tracking,
+            &Nudge::new(),
+            APP_ID,
+            &push("refs/heads/main", HEAD),
+        )
+        .await
+        .unwrap();
 
         let read = tracking.by_app(&app("site")).await.unwrap().unwrap();
         assert_eq!(read.revision.as_deref(), Some(HEAD));
@@ -364,13 +462,23 @@ mod tests {
     async fn acts_on_a_force_push_that_moves_the_head() {
         let tracking = repository();
         track(&tracking, "site", APP_ID, "main").await;
-        handle(&tracking, APP_ID, &push("refs/heads/main", HEAD))
-            .await
-            .unwrap();
+        handle(
+            &tracking,
+            &Nudge::new(),
+            APP_ID,
+            &push("refs/heads/main", HEAD),
+        )
+        .await
+        .unwrap();
 
-        handle(&tracking, APP_ID, &push("refs/heads/main", PREVIOUS))
-            .await
-            .unwrap();
+        handle(
+            &tracking,
+            &Nudge::new(),
+            APP_ID,
+            &push("refs/heads/main", PREVIOUS),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(revision(&tracking, "site").await.as_deref(), Some(PREVIOUS));
     }
@@ -382,9 +490,14 @@ mod tests {
         let tracking = repository();
         track(&tracking, "site", APP_ID, "feature/x").await;
 
-        handle(&tracking, APP_ID, &push("refs/heads/feature/x", HEAD))
-            .await
-            .unwrap();
+        handle(
+            &tracking,
+            &Nudge::new(),
+            APP_ID,
+            &push("refs/heads/feature/x", HEAD),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(revision(&tracking, "site").await.as_deref(), Some(HEAD));
     }
@@ -397,9 +510,14 @@ mod tests {
         track(&tracking, "site", APP_ID, "main").await;
         track(&tracking, "other", 43, "main").await;
 
-        handle(&tracking, APP_ID, &push("refs/heads/main", HEAD))
-            .await
-            .unwrap();
+        handle(
+            &tracking,
+            &Nudge::new(),
+            APP_ID,
+            &push("refs/heads/main", HEAD),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(revision(&tracking, "site").await.as_deref(), Some(HEAD));
         assert_eq!(revision(&tracking, "other").await, None);
@@ -412,9 +530,14 @@ mod tests {
         track(&tracking, "site", APP_ID, "main").await;
         track(&tracking, "docs", APP_ID, "main").await;
 
-        handle(&tracking, APP_ID, &push("refs/heads/main", HEAD))
-            .await
-            .unwrap();
+        handle(
+            &tracking,
+            &Nudge::new(),
+            APP_ID,
+            &push("refs/heads/main", HEAD),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(revision(&tracking, "site").await.as_deref(), Some(HEAD));
         assert_eq!(revision(&tracking, "docs").await.as_deref(), Some(HEAD));
@@ -435,7 +558,9 @@ mod tests {
             .as_bytes(),
         );
 
-        handle(&tracking, APP_ID, &payload).await.unwrap();
+        handle(&tracking, &Nudge::new(), APP_ID, &payload)
+            .await
+            .unwrap();
 
         assert_eq!(revision(&tracking, "site").await.as_deref(), Some(HEAD));
     }

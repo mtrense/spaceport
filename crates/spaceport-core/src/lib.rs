@@ -2,6 +2,7 @@
 
 pub mod acme;
 pub mod app;
+pub mod build;
 pub mod config;
 pub mod connections;
 pub mod duration;

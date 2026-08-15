@@ -60,6 +60,12 @@ pub struct Home {
     /// no longer what GitHub would say — a delivery about an installation, or
     /// an App this spaceport has just been handed.
     pub nudge: Nudge,
+    /// How a push that moved a tracked branch tells the build worker to go and
+    /// look. A second instance of the same type as `nudge` and never the same
+    /// one: waking the reconciler costs a GitHub round trip per connection, and
+    /// waking the builder costs a read of this host's own database — see
+    /// [`webhook::receive`].
+    pub builds: Nudge,
     /// The host these pages are being served on, which is also the host every
     /// url in the manifest is built from. Absent when the config named none —
     /// in which case nothing should ever have issued an attempt, and a page
@@ -250,6 +256,7 @@ async fn deliver(State(home): State<Arc<Home>>, headers: HeaderMap, body: Bytes)
         &home.connections,
         &home.tracking,
         &home.nudge,
+        &home.builds,
         &headers,
         &body,
     )
@@ -381,6 +388,7 @@ mod tests {
             tracking: Arc::new(TrackingRepository::new(db)),
             github: github.clone(),
             nudge: Nudge::new(),
+            builds: Nudge::new(),
             hostname: Some(HOSTNAME.to_owned()),
         });
 

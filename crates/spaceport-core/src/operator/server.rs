@@ -28,6 +28,7 @@ use tracing::{info, warn};
 use super::OperatorEndpoint;
 use crate::app::apply::{Applied, Applier, ApplyError, DestroyError, ResumeError, SuspendError};
 use crate::app::{App, AppId, AppManifest, AppRepository, DataDir, Pattern, health};
+use crate::build::repository::{Build, BuildRepository, BuildState};
 use crate::connections::github::{
     Client, ConnectionRepository, Installation, Nudge, Registration, Tracking, TrackingRepository,
     Transport, manifest, register,
@@ -175,6 +176,14 @@ impl FromRef<Operator> for Arc<ConnectionRepository> {
 impl FromRef<Operator> for Arc<TrackingRepository> {
     fn from_ref(operator: &Operator) -> Self {
         operator.instance.tracking.clone()
+    }
+}
+
+/// The same, for the handlers that report what became of a tracked revision and
+/// the one that forgets it.
+impl FromRef<Operator> for Arc<BuildRepository> {
+    fn from_ref(operator: &Operator) -> Self {
+        operator.instance.builds.clone()
     }
 }
 
@@ -437,6 +446,7 @@ const TRACKED: &str = "tracked";
 /// that name, so this has to know it.
 async fn show(
     State(instance): State<Arc<Instance>>,
+    State(builds): State<Arc<BuildRepository>>,
     UrlPath(id): UrlPath<String>,
     Query(query): Query<ShowQuery>,
 ) -> Response {
@@ -490,7 +500,9 @@ async fn show(
                     );
                 }
 
-                return (StatusCode::OK, tracked_report(&id, &tracked)).into_response();
+                let built = built(&builds, &id).await;
+
+                return (StatusCode::OK, tracked_report(&id, &tracked, &built)).into_response();
             }
             Err(error) => {
                 return refuse(
@@ -523,6 +535,13 @@ async fn show(
     };
 
     let tracked = tracked(&instance, &id).await;
+    // Only asked for when there is a tracking, because the answer is only about
+    // one: an app somebody applied an image to has no revision this could be
+    // reporting on.
+    let built = match &tracked {
+        Some(_) => built(&builds, &id).await,
+        None => Built::None,
+    };
     let data = DataDir::new(instance.config.data.directory.clone());
 
     (
@@ -534,6 +553,7 @@ async fn show(
             applied_at.as_deref(),
             &data,
             tracked.as_ref(),
+            &built,
         ),
     )
         .into_response()
@@ -571,6 +591,31 @@ async fn tracked(instance: &Instance, id: &AppId) -> Option<Tracked> {
         tracking,
         connection,
     })
+}
+
+/// What became of the revision an app tracks.
+///
+/// Three answers rather than an `Option`, because the two empty ones mean quite
+/// different things to the operator reading them: a tracking nothing has been
+/// built from yet is an ordinary state on the way to the first build, and a
+/// store that will not answer is a fault in this host that a report claiming
+/// "nothing yet" would hide.
+enum Built {
+    /// The most recent build, whatever became of it.
+    Latest(Box<Build>),
+    /// Nothing has been asked for under this app.
+    None,
+    /// The builds could not be read, and why.
+    Unreadable(String),
+}
+
+/// The last build of `id`, as much as the store will say about it.
+async fn built(builds: &BuildRepository, id: &AppId) -> Built {
+    match builds.latest(id).await {
+        Ok(Some(build)) => Built::Latest(Box::new(build)),
+        Ok(None) => Built::None,
+        Err(error) => Built::Unreadable(format!("{error:#}")),
+    }
 }
 
 /// The manifest verbatim, as the document it is.
@@ -634,6 +679,7 @@ fn report(
     applied_at: Option<&str>,
     data: &DataDir,
     tracked: Option<&Tracked>,
+    built: &Built,
 ) -> String {
     let manifest = held.manifest();
     let container = &manifest.container;
@@ -717,6 +763,7 @@ fn report(
     // line about a thing they are not doing.
     if let Some(tracked) = tracked {
         tracks(&mut out, tracked);
+        builds(&mut out, built);
     }
 
     out.render()
@@ -729,12 +776,13 @@ fn report(
 /// hosts, no port and no probes. Reporting those as empty would describe a
 /// container that does not exist, so what is said instead is the one thing that
 /// is true — spaceport knows where the code is and has nothing to run.
-fn tracked_report(id: &AppId, tracked: &Tracked) -> String {
+fn tracked_report(id: &AppId, tracked: &Tracked, built: &Built) -> String {
     let mut out = Report::default();
 
     out.field("app", id.to_string());
     out.field("status", TRACKED.to_owned());
     tracks(&mut out, tracked);
+    builds(&mut out, built);
     out.field(
         "manifest",
         "none applied here yet — nothing runs, no hosts are claimed, and the edge routes nothing to it".to_owned(),
@@ -770,6 +818,69 @@ fn tracks(out: &mut Report, tracked: &Tracked) {
     // from yet is not an app at revision nothing.
     if let Some(revision) = &tracking.revision {
         out.field("", format!("  last saw {revision}"));
+    }
+}
+
+/// How many lines of a failed build's output the report prints.
+///
+/// The stored log is already only the tail of what the build printed, and
+/// sixteen kilobytes of it is more than belongs in a report about one app. The
+/// end is where a build stops, so the end is what is kept again here — enough
+/// for the failing step and what led to it, which is what an operator reads.
+const LOG_LINES: usize = 20;
+
+/// What became of the tracked revision, under the stanza that named it.
+///
+/// The reason and the log are the whole point of this: a build that failed
+/// hours ago on a host that has since restarted is answered for nowhere else,
+/// and an operator who cannot read why is left rerunning a push to find out.
+fn builds(out: &mut Report, built: &Built) {
+    let build = match built {
+        Built::Latest(build) => build,
+        // An app pointed at a branch whose revision nothing has got to yet.
+        // Said plainly, because an empty stanza would read as a build that
+        // produced nothing.
+        Built::None => {
+            out.field(
+                "build",
+                "nothing built from this yet — a pass is due within minutes of a push".to_owned(),
+            );
+
+            return;
+        }
+        Built::Unreadable(error) => {
+            out.field("build", format!("could not be read: {error}"));
+
+            return;
+        }
+    };
+
+    out.field("build", format!("{} at {}", build.state, build.revision));
+
+    if let Some(image) = &build.image_tag {
+        out.field("", format!("  image {image}"));
+    }
+    if build.state != BuildState::Failed {
+        return;
+    }
+
+    if let Some(reason) = &build.reason {
+        out.field("", format!("  reason {reason}"));
+    }
+    if let Some(log) = &build.log {
+        let lines: Vec<&str> = log.lines().collect();
+        let from = lines.len().saturating_sub(LOG_LINES);
+
+        out.field(
+            "",
+            match from {
+                0 => "  it printed".to_owned(),
+                _ => format!("  it printed, of which the last {LOG_LINES} lines"),
+            },
+        );
+        for line in &lines[from..] {
+            out.field("", format!("    {line}"));
+        }
     }
 }
 
@@ -926,9 +1037,18 @@ fn columns(headers: &[&str], rows: &[Vec<String>]) -> String {
 /// still watching a branch on behalf of an app that no longer exists, which
 /// nothing would ever show anybody.
 ///
+/// So do the builds, for the same reason and one more: a pending row is a piece
+/// of work the queue would go on offering a worker, and it names an app there is
+/// nothing left to build for. An app applied again under the name it had is a
+/// fresh app, and it should not inherit the failures of the one before it.
+///
 /// So this succeeds for an app that is nothing *but* a tracking, too. A 404
 /// there would leave the only record of it with no way to remove it.
-async fn destroy(State(instance): State<Arc<Instance>>, UrlPath(id): UrlPath<String>) -> Response {
+async fn destroy(
+    State(instance): State<Arc<Instance>>,
+    State(builds): State<Arc<BuildRepository>>,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
     let id: AppId = match id.parse() {
         Ok(id) => id,
         Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
@@ -947,6 +1067,7 @@ async fn destroy(State(instance): State<Arc<Instance>>, UrlPath(id): UrlPath<Str
                 None => format!("app `{}` destroyed\n  it had no container\n", app.id()),
             };
             body.push_str(&forgotten(&instance, &id, tracking.as_ref()).await);
+            body.push_str(&unbuilt(&builds, &id).await);
 
             (StatusCode::OK, body).into_response()
         }
@@ -954,8 +1075,9 @@ async fn destroy(State(instance): State<Arc<Instance>>, UrlPath(id): UrlPath<Str
         // under it: what there is to destroy is the tracking.
         Err(DestroyError::Unknown(_)) if tracking.is_some() => {
             let body = format!(
-                "app `{id}` destroyed\n  it had no manifest applied, so nothing was running\n{}",
+                "app `{id}` destroyed\n  it had no manifest applied, so nothing was running\n{}{}",
                 forgotten(&instance, &id, tracking.as_ref()).await,
+                unbuilt(&builds, &id).await,
             );
 
             (StatusCode::OK, body).into_response()
@@ -996,6 +1118,25 @@ async fn forgotten(instance: &Instance, id: &AppId, tracking: Option<&Tracking>)
                 "  it still tracks {} on {}, which could not be forgotten: {error:#}\n",
                 tracking.repository, tracking.branch
             )
+        }
+    }
+}
+
+/// Forget every build recorded for `id`, and say so in the same words.
+///
+/// The same discipline [`forgotten`] applies, and for the same reason: a store
+/// that will not answer is reported in the body and logged, never turned into a
+/// failure. An app that had no builds says nothing at all — most apps are an
+/// image somebody applied, and they were never built here.
+async fn unbuilt(builds: &BuildRepository, id: &AppId) -> String {
+    match builds.forget(id).await {
+        Ok(0) => String::new(),
+        Ok(1) => "  the build it had recorded is forgotten\n".to_owned(),
+        Ok(forgotten) => format!("  the {forgotten} builds it had recorded are forgotten\n"),
+        Err(error) => {
+            warn!(app = %id, %error, "could not forget the builds of the app");
+
+            format!("  its builds could not be forgotten: {error:#}\n")
         }
     }
 }
@@ -1905,7 +2046,7 @@ container:
     }
 
     fn router_and_events() -> (Router, Arc<EventBus>) {
-        let (_, router, events, _, _, _, _) = parts_on(OneContainer::default());
+        let (_, router, events, _, _, _, _, _) = parts_on(OneContainer::default());
 
         (router, events)
     }
@@ -1913,13 +2054,13 @@ container:
     /// A router and the GitHub behind it, for the connection tests — which are
     /// the only ones that care what GitHub answers.
     fn router_and_github() -> (Router, Arc<FakeGitHub>) {
-        let (_, router, _, _, github, _, _) = parts_on(OneContainer::default());
+        let (_, router, _, _, github, _, _, _) = parts_on(OneContainer::default());
 
         (router, github)
     }
 
     fn store_router_and_events_on(runtime: OneContainer) -> (Arc<AppStore>, Router, Arc<EventBus>) {
-        let (store, router, events, _, _, _, _) = parts_on(runtime);
+        let (store, router, events, _, _, _, _, _) = parts_on(runtime);
 
         (store, router, events)
     }
@@ -1937,6 +2078,7 @@ container:
         Arc<FakeGitHub>,
         Arc<ConnectionRepository>,
         Arc<TrackingRepository>,
+        Arc<BuildRepository>,
     );
 
     fn parts_on(runtime: OneContainer) -> Parts {
@@ -1979,6 +2121,7 @@ container:
 
         let connections = Arc::new(ConnectionRepository::new(db.clone()));
         let tracking = Arc::new(TrackingRepository::new(db.clone()));
+        let builds = Arc::new(BuildRepository::new(db.clone()));
         let instance = Arc::new(Instance {
             version: "9.9.9".to_owned(),
             started_at: time::OffsetDateTime::now_utc(),
@@ -1988,6 +2131,7 @@ container:
             applier,
             connections: connections.clone(),
             tracking: tracking.clone(),
+            builds: builds.clone(),
             github: github.clone(),
             attempts: Arc::new(crate::connections::github::Attempts::new()),
             nudge: Nudge::new(),
@@ -2004,6 +2148,7 @@ container:
             github,
             connections,
             tracking,
+            builds,
         )
     }
 
@@ -2679,7 +2824,7 @@ container:
     /// for as long as anyone was watching it.
     #[tokio::test]
     async fn a_watcher_is_let_go_when_spaceport_shuts_down() {
-        let (_, router, _, shutdown, _, _, _) = parts_on(OneContainer::default());
+        let (_, router, _, shutdown, _, _, _, _) = parts_on(OneContainer::default());
         let mut stream = watch(&router, "").await;
 
         shutdown.cancel();
@@ -3060,7 +3205,7 @@ container:
     /// particular repository is in reach, and a count cannot answer that.
     #[tokio::test]
     async fn shows_the_repositories_each_installation_reaches() {
-        let (_, router, _, _, _, connections, _) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, _) = parts_on(OneContainer::default());
         post_connection(&router, registration("spaceport-acme", 42)).await;
         connections
             .record_installations(
@@ -3104,7 +3249,7 @@ container:
     /// a failure to look if it is printed as an empty list.
     #[tokio::test]
     async fn says_when_an_installation_reaches_no_repository_at_all() {
-        let (_, router, _, _, _, connections, _) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, _) = parts_on(OneContainer::default());
         post_connection(&router, registration("spaceport-acme", 42)).await;
         connections
             .record_installations(
@@ -3171,15 +3316,21 @@ container:
     /// An app applied, a connection made, and one repository cached as
     /// reachable through it — which is the state every tracking starts from.
     async fn tracking_router() -> (Router, Arc<FakeGitHub>) {
-        let (router, github, _) = tracking_parts().await;
+        let (router, github, _, _) = tracking_parts().await;
 
         (router, github)
     }
 
-    /// The same, with the tracking store itself — for the tests that ask what
-    /// was written down rather than what was said back.
-    async fn tracking_parts() -> (Router, Arc<FakeGitHub>, Arc<TrackingRepository>) {
-        let (_, router, _, _, github, connections, tracking) = parts_on(OneContainer::default());
+    /// The same, with the stores themselves — for the tests that ask what was
+    /// written down rather than what was said back.
+    async fn tracking_parts() -> (
+        Router,
+        Arc<FakeGitHub>,
+        Arc<TrackingRepository>,
+        Arc<BuildRepository>,
+    ) {
+        let (_, router, _, _, github, connections, tracking, builds) =
+            parts_on(OneContainer::default());
         put_app(&router, "site", MANIFEST).await;
         post_connection(&router, registration("spaceport-acme", 42)).await;
         connections
@@ -3195,7 +3346,7 @@ container:
             .await
             .unwrap();
 
-        (router, github, tracking)
+        (router, github, tracking, builds)
     }
 
     async fn track_app(router: &Router, id: &str, query: &str) -> (StatusCode, String) {
@@ -3371,7 +3522,7 @@ container:
     /// watching a branch for an app that does not exist.
     #[tokio::test]
     async fn destroys_an_app_that_is_only_tracked() {
-        let (router, _, tracking) = tracking_parts().await;
+        let (router, _, tracking, _) = tracking_parts().await;
         track_app(
             &router,
             "echo",
@@ -3399,7 +3550,7 @@ container:
 
     #[tokio::test]
     async fn destroying_a_running_app_forgets_what_it_tracked() {
-        let (router, _, tracking) = tracking_parts().await;
+        let (router, _, tracking, _) = tracking_parts().await;
         track_app(
             &router,
             "site",
@@ -3668,6 +3819,244 @@ container:
         let (_, body) = show_app(&router, "site", "").await;
 
         assert!(!body.contains("tracks"), "{body}");
+    }
+
+    /// A build as the worker would have asked for one: the revision an app
+    /// tracks, through the connection that reaches it.
+    fn build_of(id: &str, revision: &str) -> Build {
+        Build {
+            app: id.parse().unwrap(),
+            revision: revision.to_owned(),
+            connection: "spaceport-acme".to_owned(),
+            repository: "an-organisation/site".to_owned(),
+            branch: "main".to_owned(),
+            manifest_path: "spaceport.yaml".to_owned(),
+            state: BuildState::Pending,
+            image_tag: None,
+            image_id: None,
+            reason: None,
+            log: None,
+            started_at: String::new(),
+            finished_at: None,
+        }
+    }
+
+    /// A tracked app whose revision has been asked for, and nothing more.
+    async fn tracked_and_requested(builds: &BuildRepository, router: &Router, revision: &str) {
+        track_app(
+            router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main",
+        )
+        .await;
+        builds.request(&build_of("site", revision)).await.unwrap();
+    }
+
+    /// A build nobody has got to yet is the ordinary state a minute after a
+    /// push, and the report says which revision is waiting rather than nothing
+    /// at all.
+    #[tokio::test]
+    async fn shows_a_build_that_is_still_waiting_for_a_worker() {
+        let (router, _, _, builds) = tracking_parts().await;
+        tracked_and_requested(&builds, &router, "0123abc").await;
+
+        let (status, body) = show_app(&router, "site", "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("build      pending at 0123abc"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn shows_the_image_a_successful_build_produced() {
+        let (router, _, _, builds) = tracking_parts().await;
+        tracked_and_requested(&builds, &router, "0123abc").await;
+        builds
+            .succeeded(
+                &"site".parse().unwrap(),
+                "0123abc",
+                "spaceport/site:0123abc",
+                "sha256:0123",
+                "step 1/1 : FROM scratch\n",
+            )
+            .await
+            .unwrap();
+
+        let (_, body) = show_app(&router, "site", "").await;
+
+        assert!(body.contains("build      built at 0123abc"), "{body}");
+        assert!(body.contains("image spaceport/site:0123abc"), "{body}");
+        // A build that worked is not one an operator has to read the log of.
+        assert!(!body.contains("it printed"), "{body}");
+    }
+
+    /// The whole reason the stanza exists: an operator who cannot read why a
+    /// build failed is left pushing again to find out.
+    #[tokio::test]
+    async fn shows_why_a_build_failed_and_what_it_printed() {
+        let (router, _, _, builds) = tracking_parts().await;
+        tracked_and_requested(&builds, &router, "0123abc").await;
+        builds
+            .failed(
+                &"site".parse().unwrap(),
+                "0123abc",
+                "the manifest names no image or build",
+                "step 1/2 : FROM scratch\nthe dockerfile would not parse\n",
+            )
+            .await
+            .unwrap();
+
+        let (_, body) = show_app(&router, "site", "").await;
+        assert!(body.contains("build      failed at 0123abc"), "{body}");
+        assert!(
+            body.contains("reason the manifest names no image or build"),
+            "{body}"
+        );
+        assert!(body.contains("the dockerfile would not parse"), "{body}");
+        // Nothing was produced, so nothing is named as though it had been.
+        assert!(!body.contains("image spaceport/"), "{body}");
+    }
+
+    /// A log longer than the report prints is cut to its end, where a build
+    /// stops — and the line above it says that is what happened.
+    #[tokio::test]
+    async fn shows_the_end_of_a_long_build_log() {
+        let (router, _, _, builds) = tracking_parts().await;
+        tracked_and_requested(&builds, &router, "0123abc").await;
+        let noisy = format!("{}the last line\n", "chatter\n".repeat(LOG_LINES * 2));
+        builds
+            .failed(
+                &"site".parse().unwrap(),
+                "0123abc",
+                "the engine refused",
+                &noisy,
+            )
+            .await
+            .unwrap();
+
+        let (_, body) = show_app(&router, "site", "").await;
+
+        assert!(body.contains("the last 20 lines"), "{body}");
+        assert!(body.contains("the last line"), "{body}");
+        assert_eq!(body.matches("chatter").count(), LOG_LINES - 1, "{body}");
+    }
+
+    /// An app pointed at a branch nothing has been built from yet says so: an
+    /// empty stanza would read as a build that produced nothing.
+    #[tokio::test]
+    async fn says_a_tracked_app_has_not_been_built_yet() {
+        let (router, _) = tracking_router().await;
+        track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main",
+        )
+        .await;
+
+        let (_, body) = show_app(&router, "site", "").await;
+
+        assert!(
+            body.contains("build      nothing built from this yet"),
+            "{body}"
+        );
+    }
+
+    /// An app that is only tracked is the one a build matters most for — its
+    /// manifest is in the repository, and the build is the whole of what has
+    /// happened to it here.
+    #[tokio::test]
+    async fn shows_the_build_of_an_app_that_is_only_tracked() {
+        let (router, _, _, builds) = tracking_parts().await;
+        track_app(
+            &router,
+            "echo",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main",
+        )
+        .await;
+        builds.request(&build_of("echo", "0123abc")).await.unwrap();
+        builds
+            .failed(
+                &"echo".parse().unwrap(),
+                "0123abc",
+                "the commit holds no `spaceport.yaml`",
+                "",
+            )
+            .await
+            .unwrap();
+
+        let (status, body) = show_app(&router, "echo", "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("failed at 0123abc"), "{body}");
+        assert!(body.contains("no `spaceport.yaml`"), "{body}");
+    }
+
+    /// An app somebody applied an image to has no revision to report on, and a
+    /// build stanza would be a line about a thing it is not doing.
+    #[tokio::test]
+    async fn says_nothing_about_builds_when_an_app_tracks_nothing() {
+        let (router, _) = tracking_router().await;
+
+        let (_, body) = show_app(&router, "site", "").await;
+
+        assert!(!body.contains("build"), "{body}");
+    }
+
+    /// An app that is gone has no builds — a pending row would be work the
+    /// queue goes on offering for an app there is nothing left to build for.
+    #[tokio::test]
+    async fn destroying_an_app_forgets_the_builds_it_recorded() {
+        let (router, _, _, builds) = tracking_parts().await;
+        tracked_and_requested(&builds, &router, "0123abc").await;
+        builds.request(&build_of("site", "89abcde")).await.unwrap();
+        builds.request(&build_of("echo", "0123abc")).await.unwrap();
+
+        let (status, body) = delete_app(&router, "site").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("the 2 builds it had recorded"), "{body}");
+        assert!(
+            builds
+                .by_app(&"site".parse().unwrap())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Another app's builds are another app's.
+        assert_eq!(
+            builds.by_app(&"echo".parse().unwrap()).await.unwrap().len(),
+            1
+        );
+    }
+
+    /// A connection that is gone can no longer fetch a commit, so a build taken
+    /// through it is a row pointing at nothing — and one taken through another
+    /// connection is untouched.
+    #[tokio::test]
+    async fn forgetting_a_connection_forgets_the_builds_it_fetched() {
+        let (router, _, _, builds) = tracking_parts().await;
+        tracked_and_requested(&builds, &router, "0123abc").await;
+        builds
+            .request(&Build {
+                connection: "spaceport-other".to_owned(),
+                ..build_of("echo", "0123abc")
+            })
+            .await
+            .unwrap();
+
+        let (status, _) = delete_connection(&router, "spaceport-acme").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            builds
+                .by_app(&"site".parse().unwrap())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            builds.by_app(&"echo".parse().unwrap()).await.unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]

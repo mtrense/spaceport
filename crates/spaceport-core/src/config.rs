@@ -1,4 +1,14 @@
 //! Configuration loading and validation.
+//!
+//! Every section but `edge` is defaulted, and that is what lets a config file
+//! written against an older spaceport go on working when a new section appears.
+//! The reverse is not true: `deny_unknown_fields` at the top level means an
+//! older binary handed a config that names a newer section — `build:`, say —
+//! refuses to start rather than run with a setting it will not honour. That is
+//! the same judgement [`Config::validate`] makes about ACME settings the
+//! provider would ignore: configuration nobody reads still reads, to the
+//! operator who wrote it, as configuration in force. Downgrading a spaceport
+//! therefore means downgrading its config with it.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -62,6 +72,24 @@ data:
   # directory: this is the data an app writes and an operator backs up, not
   # spaceport's own, and the two are not readable by the same people.
   directory: /var/lib/spaceport/apps
+build:
+  # Where a commit is unpacked and built, one subtree per connection and app.
+  # Unlike the two directories above, spaceport deletes in here: a build tree is
+  # scratch that the commit can produce again, and it is readable only by the
+  # user spaceport runs as because it holds an app's source code.
+  directory: /var/lib/spaceport/builds
+
+  # How many built revisions of each app to keep. Three: the one running, the
+  # one a rollback goes back to, and the one being built. At least 1 — the
+  # sweep runs after a build, so keeping none would delete what was just built.
+  #
+  # keep: 3
+
+  # The largest commit archive spaceport will download, in bytes. Refused on
+  # what github says the size is, before any of it is read. 64 MiB by default:
+  # a source tree larger than that is one with build outputs committed into it.
+  #
+  # max_archive_bytes: 67108864
 ";
 
 /// A parsed and validated spaceport configuration.
@@ -87,6 +115,12 @@ pub struct Config {
     /// working untouched.
     #[serde(default)]
     pub data: Data,
+
+    /// Where commits are unpacked and built, and what a build is allowed to
+    /// cost. Defaulted like the two above: a config written before spaceport
+    /// built anything must go on working untouched.
+    #[serde(default)]
+    pub build: Build,
 }
 
 /// Where spaceport's durable state lives.
@@ -135,6 +169,72 @@ impl Default for Data {
 
 fn default_data_dir() -> PathBuf {
     PathBuf::from(crate::app::data::DEFAULT_DATA_DIR)
+}
+
+/// Where commits are unpacked and built.
+///
+/// A third directory rather than a corner of one of the other two, because it
+/// is the only one of the three that is thrown away: [`crate::build::dir`]
+/// deletes what has aged out, and a routine that deletes has no business
+/// pointed at the directory holding an operator's backups or spaceport's keys.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Build {
+    /// The directory a commit's source tree is unpacked under, one subtree per
+    /// connection and app. Created at startup if it is not there, and readable
+    /// only by the user spaceport runs as — it holds somebody's source code.
+    #[serde(default = "default_build_dir")]
+    pub directory: PathBuf,
+
+    /// How many built revisions of each app to keep on disk.
+    ///
+    /// At least one: the sweep runs after a build, so `0` would mean deleting
+    /// the tree the build just produced and the image was made from. An
+    /// operator who wants nothing kept wants the build directory on a tmpfs,
+    /// not a setting that makes every build delete its own evidence.
+    #[serde(default = "default_builds_kept")]
+    pub keep: usize,
+
+    /// The largest commit archive that will be downloaded, in bytes, refused on
+    /// the strength of what GitHub says before a byte of it is read.
+    ///
+    /// Spelled in bytes and named for it. There is a [`crate::duration`] module
+    /// because durations appear all over a manifest and `30` was genuinely
+    /// ambiguous; sizes appear exactly here, and one setting is not enough to
+    /// justify a parser and a second syntax for an operator to remember. A
+    /// number whose field name ends in `_bytes` is unambiguous without either.
+    #[serde(default = "default_max_archive_bytes")]
+    pub max_archive_bytes: u64,
+}
+
+impl Default for Build {
+    fn default() -> Self {
+        Self {
+            directory: default_build_dir(),
+            keep: default_builds_kept(),
+            max_archive_bytes: default_max_archive_bytes(),
+        }
+    }
+}
+
+fn default_build_dir() -> PathBuf {
+    PathBuf::from(crate::build::dir::DEFAULT_BUILD_DIR)
+}
+
+fn default_builds_kept() -> usize {
+    crate::build::dir::DEFAULT_REVISIONS_KEPT
+}
+
+/// 64 MiB. A source tree that does not fit is a repository with build outputs
+/// or media committed into it, and unpacking one on a host that runs other
+/// people's apps is a poor way to find out how much disk it wanted. The
+/// constant lives with the config rather than with the code that enforces it
+/// because the limit is an operator's judgement about their host, not a
+/// property of the download.
+const DEFAULT_MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn default_max_archive_bytes() -> u64 {
+    DEFAULT_MAX_ARCHIVE_BYTES
 }
 
 /// A schema version this build accepts.
@@ -298,6 +398,20 @@ impl Config {
 
     /// What serde cannot express: the rules that span more than one field.
     fn validate(&self) -> Result<()> {
+        // The sweep runs after a build, so keeping none would delete the tree
+        // the running image was built from — and the operator who wrote `0`
+        // meant "keep the current one", which is `1`.
+        if self.build.keep == 0 {
+            bail!(
+                "build.keep must be at least 1: a build's own source tree is swept away with the rest, so keeping none would delete what was just built"
+            );
+        }
+        if self.build.max_archive_bytes == 0 {
+            bail!(
+                "build.max_archive_bytes must be at least 1: a limit of zero refuses every commit"
+            );
+        }
+
         match (self.edge.tls.provider, &self.edge.tls.acme) {
             (TlsProvider::Acme, None) => {
                 bail!("edge.tls.acme is required when the tls provider is `acme`")
@@ -349,6 +463,10 @@ edge:
         assert_eq!(
             config.state.directory,
             PathBuf::from(crate::state::DEFAULT_STATE_DIR)
+        );
+        assert_eq!(
+            config.build.directory,
+            PathBuf::from(crate::build::dir::DEFAULT_BUILD_DIR)
         );
     }
 
@@ -593,6 +711,54 @@ edge:
             config.data.directory,
             PathBuf::from("/var/lib/spaceport/apps")
         );
+    }
+
+    /// A config written before spaceport built anything has to go on working,
+    /// and these are the numbers such a host silently gets.
+    #[test]
+    fn defaults_the_build_settings() {
+        let config = Config::parse(MINIMAL).unwrap();
+
+        assert_eq!(
+            config.build.directory,
+            PathBuf::from("/var/lib/spaceport/builds")
+        );
+        assert_eq!(config.build.keep, 3);
+        assert_eq!(config.build.max_archive_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.build, Build::default());
+    }
+
+    #[test]
+    fn takes_the_build_settings_the_config_names() {
+        let config = Config::parse(&format!(
+            "{MINIMAL}build:\n  directory: /srv/builds\n  keep: 1\n  max_archive_bytes: 1024\n"
+        ))
+        .unwrap();
+
+        assert_eq!(config.build.directory, PathBuf::from("/srv/builds"));
+        assert_eq!(config.build.keep, 1);
+        assert_eq!(config.build.max_archive_bytes, 1024);
+    }
+
+    /// The sweep runs after the build, so `keep: 0` would take away the tree
+    /// the running image was built from — which is not what anybody typing it
+    /// means.
+    #[test]
+    fn rejects_keeping_no_builds_at_all() {
+        let err = Config::parse(&format!("{MINIMAL}build:\n  keep: 0\n"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("build.keep must be at least 1"), "{err}");
+    }
+
+    #[test]
+    fn rejects_an_archive_limit_that_refuses_everything() {
+        let err = Config::parse(&format!("{MINIMAL}build:\n  max_archive_bytes: 0\n"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("max_archive_bytes"), "{err}");
     }
 
     #[test]

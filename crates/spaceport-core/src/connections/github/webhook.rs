@@ -11,8 +11,9 @@
 //! What this module does with a delivery is observe it, and then hand on the
 //! two kinds of delivery something is waiting for: the two events that say the
 //! installations are not what they were shove the reconciler, and a `push` goes
-//! to [`super::push`], which writes down the head a tracked branch moved to. It
-//! never applies what a delivery claims about the installations. A body is a
+//! to [`super::push`], which writes down the head a tracked branch moved to and
+//! shoves the build worker. It never applies what a delivery claims about the
+//! installations. A body is a
 //! story about the past that may arrive twice, late, or out of order, and the
 //! answer to all three is to go and ask GitHub outright; the delivery only
 //! decides *when* that happens. No app is deployed, no container is touched.
@@ -191,10 +192,19 @@ pub fn verify(secret: &Secret, signature: &str, body: &[u8]) -> Result<()> {
 /// The `Err` case is reserved for the state store failing — everything a
 /// delivery itself can get wrong is an [`Outcome`], because it is an answer to
 /// GitHub rather than a fault of this spaceport's.
+///
+/// Two [`Nudge`]s, and they must not be the same one. `nudge` wakes the
+/// reconciler, which asks GitHub where the App is installed — one round trip
+/// per connection — and `builds` wakes the build worker, which asks the local
+/// database what the apps track and nothing else. Handing a push to the first
+/// of them would make every commit an organisation pushes into GitHub traffic
+/// this endpoint's caller chose, which is the amplification the module header
+/// refuses.
 pub async fn receive(
     connections: &ConnectionRepository,
     tracking: &TrackingRepository,
     nudge: &Nudge,
+    builds: &Nudge,
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<Outcome> {
@@ -303,7 +313,7 @@ pub async fn receive(
     // amplifier for GitHub API requests — and what it does say is a matter for
     // the apps that track the branch it moved.
     if event == PUSH_EVENT {
-        push::handle(tracking, app_id, &payload)
+        push::handle(tracking, builds, app_id, &payload)
             .await
             .context("acting on a push github delivered")?;
     }
@@ -661,6 +671,7 @@ mod tests {
             &connections,
             &tracking,
             &Nudge::new(),
+            &Nudge::new(),
             &delivery("push", "delivery-1", PUSH),
             PUSH,
         )
@@ -691,6 +702,7 @@ mod tests {
             &connections,
             &tracking,
             &Nudge::new(),
+            &Nudge::new(),
             &delivery("push", "delivery-1", PUSH),
             PUSH,
         )
@@ -714,15 +726,17 @@ mod tests {
     /// every commit an organisation makes into a GitHub round trip per
     /// connection — acting on a push must not have quietly changed that.
     #[tokio::test]
-    async fn a_push_still_nudges_nothing() {
+    async fn a_push_still_nudges_the_reconciler_for_nothing() {
         let (connections, tracking) = connected().await;
         let nudge = Nudge::new();
+        let builds = Nudge::new();
         let changed = nudge.changed();
 
         receive(
             &connections,
             &tracking,
             &nudge,
+            &builds,
             &delivery("push", "delivery-1", PUSH),
             PUSH,
         )
@@ -737,6 +751,7 @@ mod tests {
             &connections,
             &tracking,
             &nudge,
+            &builds,
             &delivery("installation", "delivery-2", BODY),
             BODY,
         )
@@ -744,5 +759,43 @@ mod tests {
         .unwrap();
 
         assert!(changed.has_changed().unwrap());
+    }
+
+    /// The other half of the same rule: the signal a push *is* news for is the
+    /// builder's, and it goes no further than this host's own database.
+    #[tokio::test]
+    async fn a_push_to_a_tracked_branch_wakes_the_builder_and_not_the_reconciler() {
+        let (connections, tracking) = connected().await;
+        tracking
+            .record(&Tracking {
+                app: "site".parse().unwrap(),
+                github_app_id: APP_ID,
+                repository: "an-organisation/site".to_owned(),
+                branch: "main".to_owned(),
+                manifest_path: "spaceport.yaml".to_owned(),
+                tracked_at: String::new(),
+                revision: None,
+                revision_seen_at: None,
+            })
+            .await
+            .unwrap();
+        let nudge = Nudge::new();
+        let builds = Nudge::new();
+        let reconciler = nudge.changed();
+        let builder = builds.changed();
+
+        receive(
+            &connections,
+            &tracking,
+            &nudge,
+            &builds,
+            &delivery("push", "delivery-1", PUSH),
+            PUSH,
+        )
+        .await
+        .unwrap();
+
+        assert!(builder.has_changed().unwrap());
+        assert!(!reconciler.has_changed().unwrap());
     }
 }

@@ -402,6 +402,7 @@ mod tests {
                 )),
                 github: crate::connections::github::api::testing::FakeGitHub::new(),
                 nudge: crate::connections::github::Nudge::new(),
+                builds: crate::connections::github::Nudge::new(),
                 hostname: None,
             })),
             apps,

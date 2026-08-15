@@ -62,13 +62,68 @@ pub enum Source {
     /// A pre-built image, pulled as given.
     Image { image: String },
 
-    /// An image built from a local context. Parses, but nothing builds it yet.
+    /// An image built from a checkout of the app's repository.
+    ///
+    /// Both paths are inside that checkout and are kept there — see
+    /// [`Source::validate`].
     Build {
         #[serde(default = "default_dockerfile")]
         dockerfile: PathBuf,
         #[serde(default = "default_context")]
         context: PathBuf,
     },
+}
+
+impl Source {
+    /// What serde cannot express about where an image comes from: that a build
+    /// stays inside the tree it was given.
+    ///
+    /// The principle is [`Volume`]'s, and these two paths were violating it by
+    /// construction. A manifest may not name a host path — the host path is
+    /// spaceport's to choose — and `context: /etc` or `dockerfile: ../../../x`
+    /// is a manifest naming one. Both would be read by whatever unpacked the
+    /// commit and by the engine after it, so the file that reaches the build is
+    /// whatever the document asked for, from anywhere on the host.
+    ///
+    /// Refused here rather than where a build happens, because there is more
+    /// than one place a build happens and only one place a manifest is
+    /// accepted. This was unreachable for as long as every path bailed on
+    /// `Source::Build`; building makes it reachable.
+    fn validate(&self) -> Result<()> {
+        let Self::Build {
+            dockerfile,
+            context,
+        } = self
+        else {
+            return Ok(());
+        };
+
+        for (field, path) in [("dockerfile", dockerfile), ("context", context)] {
+            if path.as_os_str().is_empty() {
+                bail!("source.{field} must name a path inside the repository, not nothing");
+            }
+            if path.is_absolute() {
+                bail!(
+                    "source.{field} must be relative to the repository, not `{}`",
+                    path.display()
+                );
+            }
+            // Component-wise rather than by looking for `..` in the text: a
+            // path is not a string, and `a..b` is a perfectly ordinary
+            // directory name that a substring search would refuse.
+            if path
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+            {
+                bail!(
+                    "source.{field} must stay inside the repository, and `{}` climbs out of it",
+                    path.display()
+                );
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl fmt::Display for Source {
@@ -652,6 +707,8 @@ impl AppManifest {
 
     /// What serde cannot express: the rules that span more than one field.
     fn validate(&self) -> Result<()> {
+        self.source.validate()?;
+
         if self.routing.hosts.is_empty() {
             bail!("routing.hosts must name at least one host");
         }
@@ -755,6 +812,91 @@ routing:
             Source::Build {
                 dockerfile: "Dockerfile".into(),
                 context: ".".into(),
+            }
+        );
+    }
+
+    /// `MINIMAL` with a build source in place of its image one.
+    fn with_build(fields: &str) -> String {
+        let fields: String = fields.lines().map(|line| format!("  {line}\n")).collect();
+
+        MINIMAL.replace(
+            "source:\n  type: image\n  image: strm/helloworld-http:latest\n",
+            &format!("source:\n  type: build\n{fields}"),
+        )
+    }
+
+    /// The defaults are a build of the repository as it arrives, and they are
+    /// what a manifest that says `type: build` and nothing else gets — so they
+    /// have to survive the rules below.
+    #[test]
+    fn builds_the_repository_as_it_arrives_by_default() {
+        let manifest = AppManifest::parse(&with_build("")).unwrap();
+
+        assert_eq!(
+            manifest.source,
+            Source::Build {
+                dockerfile: "Dockerfile".into(),
+                context: ".".into(),
+            }
+        );
+    }
+
+    /// The host path is spaceport's to choose. A manifest that could name one
+    /// could name any, and `/etc` is the same document asking to build the
+    /// host's configuration.
+    #[test]
+    fn rejects_a_build_path_that_is_absolute() {
+        for field in ["dockerfile: /etc/Dockerfile", "context: /etc"] {
+            let err = AppManifest::parse(&with_build(field))
+                .unwrap_err()
+                .to_string();
+
+            assert!(err.contains("must be relative"), "for `{field}`: {err}");
+        }
+    }
+
+    /// The other way out of the checkout, and the one that does not look like
+    /// a host path in the document.
+    #[test]
+    fn rejects_a_build_path_that_climbs_out_of_the_repository() {
+        for field in [
+            "dockerfile: ../../../x",
+            "context: ..",
+            "dockerfile: build/../../elsewhere/Dockerfile",
+        ] {
+            let err = AppManifest::parse(&with_build(field))
+                .unwrap_err()
+                .to_string();
+
+            assert!(err.contains("climbs out"), "for `{field}`: {err}");
+        }
+    }
+
+    /// An empty path is not the default: it is a field somebody meant to fill
+    /// in, and it would be joined to the checkout to mean the checkout itself.
+    #[test]
+    fn rejects_a_build_path_that_is_empty() {
+        for field in ["dockerfile: \"\"", "context: \"\""] {
+            let err = AppManifest::parse(&with_build(field))
+                .unwrap_err()
+                .to_string();
+
+            assert!(err.contains("not nothing"), "for `{field}`: {err}");
+        }
+    }
+
+    /// A directory named `a..b` is an ordinary directory, and refusing it would
+    /// be a substring search standing in for reading a path.
+    #[test]
+    fn accepts_a_build_path_with_dots_in_a_name() {
+        let manifest = AppManifest::parse(&with_build("context: services/a..b")).unwrap();
+
+        assert_eq!(
+            manifest.source,
+            Source::Build {
+                dockerfile: "Dockerfile".into(),
+                context: "services/a..b".into(),
             }
         );
     }

@@ -165,6 +165,75 @@ const MIGRATIONS: &[&str] = &[
         revision_seen_at TEXT
     ) STRICT;
     CREATE INDEX github_tracking_by_push ON github_tracking (github_app_id, repository, branch);",
+    // 6 — the attempt to turn a revision into an image, and how it went.
+    //
+    // A tracking says where an app comes from and which commit was last
+    // accepted; this is what happened when spaceport tried to build that
+    // commit. It is written down rather than kept in the worker so that a build
+    // is not done twice, so a failure has somewhere to say why, and so a
+    // process that restarts can tell what it was in the middle of.
+    //
+    // The key is `(spaceport_app, revision)` and not a synthetic id, because
+    // that pair *is* the identity of the work: one app builds one commit once,
+    // and the image that comes out is the image for that commit. Asking for the
+    // same revision again — a webhook GitHub sent twice, a reconciliation that
+    // noticed the same head, an operator retrying — must land on the row that
+    // already exists rather than pile a second attempt on top of it, and with
+    // this key the insert is the check. A synthetic id would make every request
+    // a new row and push the question "have we already built this?" into a
+    // query that somebody has to remember to write.
+    //
+    // `state` is a text column and not a foreign key into a table of states,
+    // for the reason `github_installations.account_type` keeps GitHub's own
+    // word: a row must stay readable when the word in it is one this build has
+    // never heard of. A database written by a newer spaceport, or by one whose
+    // states were spelled differently, then still reads back as a row, and the
+    // one function that maps rows is where the unknown word is met and named —
+    // rather than a join that quietly returns nothing and a build that has
+    // vanished from an operator's listing with nobody able to say why.
+    //
+    // `log` holds the tail of the build output, and is truncated by the writer
+    // before it ever reaches this table. Storing the whole thing and cutting it
+    // down in the query would mean the megabyte a noisy compiler printed is
+    // already in the database, already in every backup and already in the page
+    // cache of every read — the cheap place to lose it is the only place that
+    // ever had it whole. `reason` is separate and short, because what an
+    // operator needs first is one sentence, not the last hundred lines.
+    //
+    // `spaceport_app` is spaceport's own `AppId`, the name an operator chose,
+    // and matches `github_tracking.spaceport_app` exactly. The neighbouring
+    // tables spell GitHub's numeric App id `github_app_id`; the two are
+    // different id-spaces and are kept spelled apart here for the same reason
+    // step 5 gives. `connection` is the slug the revision was fetched through,
+    // kept so that forgetting a connection can take its builds with it without
+    // a join back through the tracking that forgetting has already deleted.
+    //
+    // No foreign keys, for the reason step 4 gives: the destroy and
+    // connection-forget cascades are written by hand, and a constraint would
+    // turn a build racing a disconnect into a failed write rather than a stale
+    // row.
+    //
+    // `app_builds_by_state` is the index the worker reads: "the oldest thing
+    // still pending" is a lookup on state and then on time, in that order. It
+    // also serves the startup pass that looks for rows left `building` by a
+    // process that died.
+    "CREATE TABLE app_builds (
+        spaceport_app TEXT    NOT NULL,
+        revision      TEXT    NOT NULL,
+        connection    TEXT    NOT NULL,
+        repository    TEXT    NOT NULL,
+        branch        TEXT    NOT NULL,
+        manifest_path TEXT    NOT NULL,
+        state         TEXT    NOT NULL,
+        image_tag     TEXT,
+        image_id      TEXT,
+        reason        TEXT,
+        log           TEXT,
+        started_at    TEXT    NOT NULL,
+        finished_at   TEXT,
+        PRIMARY KEY (spaceport_app, revision)
+    ) STRICT;
+    CREATE INDEX app_builds_by_state ON app_builds (state, started_at);",
 ];
 
 /// The schema version this build writes.
@@ -345,6 +414,31 @@ mod tests {
                 "tracked_at",
                 "revision",
                 "revision_seen_at"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_sixth_migration_creates_the_builds_table() {
+        let connection = empty();
+        migrate(&connection).unwrap();
+
+        assert_eq!(
+            columns(&connection, "app_builds"),
+            [
+                "spaceport_app",
+                "revision",
+                "connection",
+                "repository",
+                "branch",
+                "manifest_path",
+                "state",
+                "image_tag",
+                "image_id",
+                "reason",
+                "log",
+                "started_at",
+                "finished_at"
             ]
         );
     }

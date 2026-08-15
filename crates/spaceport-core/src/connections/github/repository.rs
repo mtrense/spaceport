@@ -264,6 +264,19 @@ impl ConnectionRepository {
                     )
                     .context("forgetting what the connection's apps tracked")?;
 
+                // Not a `github_` table at all, and keyed by the slug rather
+                // than by GitHub's numeric id — which is exactly why it is here
+                // and not at the handler that called this. A build row names
+                // the connection it is fetched through so that it can be found
+                // once the tracking is gone, and a second call after this
+                // transaction had committed could fail with the connection
+                // already deleted, leaving pending builds nothing could ever
+                // fetch and nothing left to find them by. Inside, a disconnect
+                // is still all-or-nothing.
+                transaction
+                    .execute("DELETE FROM app_builds WHERE connection = ?1", [&slug])
+                    .context("forgetting the builds taken through the connection")?;
+
                 transaction
                     .commit()
                     .context("committing a forgotten github connection")?;
@@ -447,6 +460,49 @@ impl ConnectionRepository {
                         })
                     })
                     .collect()
+            })
+            .await
+    }
+
+    /// The installation of `app_id` that grants `repository`, and GitHub's own
+    /// spelling of its name.
+    ///
+    /// The question everything that reaches into a repository has to ask first,
+    /// because a token is minted against an installation and not against an
+    /// App: knowing that the App can see `owner/name` somewhere is not enough
+    /// to fetch a single byte of it.
+    ///
+    /// Case-insensitively, because GitHub is: an operator who types
+    /// `An-Organisation/Site` means the repository this cache spells
+    /// `an-organisation/site`, and the name that comes back is the cached one
+    /// rather than the one that was asked for — what goes on the wire has to be
+    /// GitHub's spelling, not an approximation of it.
+    ///
+    /// The lowest installation id where two grant the same repository, so that
+    /// a build which works once works every time. That happens when an App is
+    /// installed both on an organisation and on a fork's owner; either
+    /// installation can fetch it, and picking whichever the database happened
+    /// to return first would make a failure depend on the row order.
+    pub async fn installation_for(
+        &self,
+        app_id: i64,
+        repository: &str,
+    ) -> Result<Option<(i64, String)>> {
+        let repository = repository.to_owned();
+
+        self.db
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT installation_id, full_name FROM github_repositories
+                         WHERE app_id = ?1 AND full_name = ?2 COLLATE NOCASE
+                         ORDER BY installation_id
+                         LIMIT 1",
+                        rusqlite::params![app_id, repository],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .context("finding the installation that grants a repository")
             })
             .await
     }
@@ -852,6 +908,65 @@ mod tests {
         assert!(reconciled.ends_with('Z'), "{reconciled}");
         // Another app's pass is not this one's.
         assert!(repository.last_reconciled(43).await.unwrap().is_none());
+    }
+
+    /// What a build asks before it can fetch anything: which installation to
+    /// mint a token against, and how GitHub spells the name.
+    #[tokio::test]
+    async fn finds_the_installation_that_grants_a_repository() {
+        let repository = repository();
+        repository
+            .record_installations(
+                42,
+                &[
+                    installation(7, &["an-organisation/site"]),
+                    installation(9, &["another-org/docs"]),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repository
+                .installation_for(42, "another-org/docs")
+                .await
+                .unwrap(),
+            Some((9, "another-org/docs".to_owned()))
+        );
+        // A repository this App was never granted, and one another App was.
+        assert!(
+            repository
+                .installation_for(42, "an-organisation/secret")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repository
+                .installation_for(43, "an-organisation/site")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// GitHub treats a repository name as case-insensitive, and what goes back
+    /// on the wire has to be its spelling rather than the caller's.
+    #[tokio::test]
+    async fn matches_a_repository_however_it_is_spelled_and_answers_with_githubs_spelling() {
+        let repository = repository();
+        repository
+            .record_installations(42, &[installation(7, &["an-organisation/Site"])])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repository
+                .installation_for(42, "AN-ORGANISATION/site")
+                .await
+                .unwrap(),
+            Some((7, "an-organisation/Site".to_owned()))
+        );
     }
 
     #[tokio::test]

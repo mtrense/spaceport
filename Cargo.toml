@@ -22,6 +22,21 @@ serde_json = "1"
 
 # The docker engine API, over the daemon socket.
 bollard = "0.21"
+# Unpacking what GitHub hands over for a commit, and packing it back up as the
+# build context the engine wants. Both directions are needed and neither is
+# reusable from bollard, whose own `tar` and `flate2` are dev-dependencies for
+# its examples and never reach a consumer's lock file.
+#
+# `tar` changed hands: the crate moved from `alexcrichton/tar-rs` to the
+# `composefs` organisation, which is worth knowing about a crate that parses a
+# format designed in 1979 and full of ways to name a path outside the directory
+# it is being extracted into.
+tar = "0.4"
+# `rust_backend` — the default — which is `miniz_oxide`, pure Rust and no build
+# script. The zlib backends are faster and every one of them wants a C
+# toolchain, which is the same trade this workspace already refused for
+# `ring` over `aws-lc-rs`.
+flate2 = "1"
 futures-util = { version = "0.3", default-features = false }
 
 # The state store. `bundled` so the build does not depend on a system sqlite,
