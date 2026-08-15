@@ -65,11 +65,10 @@ pub const SETUP_PATH: &str = "/connections/github/setup";
 
 /// The path GitHub is told to deliver this App's webhooks to.
 ///
-/// Nothing serves this path yet — receiving deliveries, verifying their
-/// signatures and acting on them are each their own step. It is declared now
-/// because the manifest is the only chance to declare it: changing the webhook
-/// url later is an edit on the App's settings page, done by hand, on every App
-/// this ever creates.
+/// Served by [`super::webhook`], through the edge's home router. It is declared
+/// here because the manifest is the only chance to declare it: changing the
+/// webhook url afterwards is an edit on the App's settings page, done by hand,
+/// on every App this flow has ever created.
 pub const WEBHOOK_PATH: &str = "/connections/github/webhooks";
 
 /// What the App may do, and nothing beyond it.
@@ -99,13 +98,19 @@ const PERMISSIONS: [(&str, &str); 6] = [
 ///
 /// The same argument as [`PERMISSIONS`], and the same consequence: an event
 /// spaceport does not subscribe to at creation is one an operator has to tick
-/// on the settings page of every App this flow has ever made. These seven are
-/// what it takes to know where the App is installed, what it can see, and what
-/// has happened to the code inside — and no more than that. Nothing here asks
-/// for issues, comments, or anything else about the people using a repository.
-const EVENTS: [&str; 7] = [
-    "installation",
-    "installation_repositories",
+/// on the settings page of every App this flow has ever made. These five are
+/// what it takes to know what an App can see and what has happened to the code
+/// inside — and no more than that. Nothing here asks for issues, comments, or
+/// anything else about the people using a repository.
+///
+/// `installation` and `installation_repositories` are conspicuously absent, and
+/// spaceport receives them anyway. GitHub sends an App the events about its own
+/// installation whether it asked or not — there is nothing to subscribe to —
+/// and naming them here is not a harmless duplicate but a refusal: a manifest
+/// listing them is rejected outright as invalid, with "default events
+/// unsupported". So the two events the webhook receiver most needs are the two
+/// this list must not mention.
+const EVENTS: [&str; 5] = [
     "push",
     "repository",
     "check_suite",
@@ -421,7 +426,37 @@ mod tests {
     /// Subscribing to an event nobody needs is the same mistake as asking for a
     /// permission nobody needs, and just as hard to take back.
     #[test]
-    fn the_manifest_subscribes_to_exactly_seven_events() {
+    fn the_manifest_subscribes_to_exactly_five_events() {
+        assert_eq!(
+            sorted_events(),
+            [
+                "check_suite",
+                "deployment",
+                "pull_request",
+                "push",
+                "repository",
+            ]
+        );
+    }
+
+    /// GitHub delivers an App its own installation events whether it asked or
+    /// not, and rejects the whole manifest as invalid for naming them — so the
+    /// list must leave out the two events the webhook receiver most depends on.
+    /// This test is the only thing standing between that reasoning and somebody
+    /// helpfully adding them back.
+    #[test]
+    fn the_manifest_does_not_ask_for_the_events_github_sends_regardless() {
+        let events = sorted_events();
+
+        assert!(!events.contains(&"installation".to_owned()), "{events:?}");
+        assert!(
+            !events.contains(&"installation_repositories".to_owned()),
+            "{events:?}"
+        );
+    }
+
+    /// The events the manifest asks for, in a stable order.
+    fn sorted_events() -> Vec<String> {
         let mut events: Vec<String> = manifest()["default_events"]
             .as_array()
             .unwrap()
@@ -430,18 +465,7 @@ mod tests {
             .collect();
         events.sort();
 
-        assert_eq!(
-            events,
-            [
-                "check_suite",
-                "deployment",
-                "installation",
-                "installation_repositories",
-                "pull_request",
-                "push",
-                "repository",
-            ]
-        );
+        events
     }
 
     #[test]
