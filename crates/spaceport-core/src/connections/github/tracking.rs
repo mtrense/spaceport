@@ -21,6 +21,13 @@
 //! is taken and not when a push arrives — so the gap between it and what GitHub
 //! reports is what "behind" means. It resets whenever the tracking moves.
 //!
+//! The switch that says whether a successful build deploys itself lives here
+//! too, and it is the one column a re-track does not overwrite — see
+//! [`TrackingRepository::record`]. Everything else in the row describes where
+//! the app comes from and is replaced wholesale when that changes; arming is a
+//! separate decision about what to do afterwards, and moving a branch is not a
+//! statement about it.
+//!
 //! Nothing reads any of this yet. Deciding what a push means, and doing
 //! anything about it, is a later step and lives nowhere.
 
@@ -55,13 +62,22 @@ pub struct Tracking {
     /// When that revision was accepted, RFC 3339. Written and cleared with
     /// [`Tracking::revision`], never on its own.
     pub revision_seen_at: Option<String>,
+    /// Whether a build of this app deploys itself once it succeeds.
+    ///
+    /// Off unless an operator has said otherwise: arming an app means every
+    /// commit on the branch reaches production without anybody typing anything,
+    /// which is a thing to ask for rather than a thing to be given. Read as a
+    /// plain `bool` because a row always has an answer; what is *not* always
+    /// answered is a request to change it, which is why
+    /// [`TrackingRepository::record`] takes that separately.
+    pub automatic: bool,
 }
 
 /// The columns of `github_tracking`, in the order [`tracking_from`] reads them.
 ///
 /// Written once so the `SELECT`s and the row mapping cannot drift apart.
 const TRACKING_COLUMNS: &str = "spaceport_app, github_app_id, repository, branch, manifest_path, \
-                                tracked_at, revision, revision_seen_at";
+                                tracked_at, revision, revision_seen_at, automatic";
 
 /// What an app is built from, in the vocabulary of tracking, pushing and
 /// forgetting.
@@ -87,7 +103,25 @@ impl TrackingRepository {
     /// this ref", and a sha carried over from the old ref was never on the new
     /// one — it would make a first build of the new branch look like a build
     /// that had already happened.
-    pub async fn record(&self, tracking: &Tracking) -> Result<()> {
+    ///
+    /// `automatic` is the one exception to the `PUT`, and it is an
+    /// [`Option<bool>`] rather than a `bool` so that it can be. `Some` is a
+    /// request — arm this tracking, or disarm it — and `None` is a caller that
+    /// has not mentioned the subject at all, which leaves whatever the row says
+    /// exactly as it was. A `bool` could not tell those apart, and the one it
+    /// would collapse them into is the dangerous one: an operator fixing a
+    /// manifest path has not asked to disarm anything, and an app that quietly
+    /// stopped deploying itself because somebody corrected a typo is a surprise
+    /// nobody would connect to the edit that caused it — the failure is silent,
+    /// and stays silent until the commit that was supposed to go out did not.
+    /// The revision is reset because a sha from the old ref is *wrong* on the
+    /// new one; the switch is kept because it is still an answer to the same
+    /// question, and that question was never asked again.
+    ///
+    /// A tracking recorded for the first time with `None` is not armed, for the
+    /// same reason the column defaults to 0: automatic deployment is asked for,
+    /// never assumed.
+    pub async fn record(&self, tracking: &Tracking, automatic: Option<bool>) -> Result<()> {
         let app = tracking.app.to_string();
         let github_app_id = tracking.github_app_id;
         let repository = tracking.repository.clone();
@@ -99,11 +133,16 @@ impl TrackingRepository {
             .call(move |connection| {
                 connection
                     .execute(
+                        // `coalesce(?7, automatic)` is where "not mentioned"
+                        // becomes "leave it alone": a NULL parameter reads the
+                        // column's own value back into itself, so the update
+                        // touches everything the operator said and nothing they
+                        // did not.
                         "INSERT INTO github_tracking (
                              spaceport_app, github_app_id, repository, branch,
-                             manifest_path, tracked_at, revision, revision_seen_at
+                             manifest_path, tracked_at, revision, revision_seen_at, automatic
                          )
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, coalesce(?7, 0))
                          ON CONFLICT(spaceport_app) DO UPDATE SET
                              github_app_id    = excluded.github_app_id,
                              repository       = excluded.repository,
@@ -111,19 +150,74 @@ impl TrackingRepository {
                              manifest_path    = excluded.manifest_path,
                              tracked_at       = excluded.tracked_at,
                              revision         = NULL,
-                             revision_seen_at = NULL",
+                             revision_seen_at = NULL,
+                             automatic        = coalesce(?7, github_tracking.automatic)",
                         rusqlite::params![
                             app,
                             github_app_id,
                             repository,
                             branch,
                             manifest_path,
-                            tracked_at
+                            tracked_at,
+                            automatic
                         ],
                     )
                     .context("recording the repository an app tracks")?;
 
                 Ok(())
+            })
+            .await
+    }
+
+    /// Arm or disarm the automatic deployment of `app`, and say whether it
+    /// tracked anything.
+    ///
+    /// The whole request, for a caller whose only business is the switch —
+    /// [`TrackingRepository::record`] is for one that is saying where the app
+    /// comes from and happens to mention it. `false` means there was no
+    /// tracking to arm, which is an app nothing could ever deploy automatically
+    /// and worth telling an operator about rather than swallowing.
+    pub async fn set_automatic(&self, app: &AppId, automatic: bool) -> Result<bool> {
+        let app = app.to_string();
+
+        self.db
+            .call(move |connection| {
+                let updated = connection
+                    .execute(
+                        "UPDATE github_tracking SET automatic = ?2 WHERE spaceport_app = ?1",
+                        rusqlite::params![app, automatic],
+                    )
+                    .context("arming or disarming an app's automatic deployment")?;
+
+                Ok(updated > 0)
+            })
+            .await
+    }
+
+    /// Every tracking that deploys its builds itself, by app.
+    ///
+    /// What a pass over the finished builds starts from: the armed trackings
+    /// are the few, the apps are the many, and asking this way means an
+    /// unarmed app costs nothing per pass. Ordered by app, so that one pass
+    /// deploys in the same order as the next.
+    pub async fn armed(&self) -> Result<Vec<Tracking>> {
+        self.db
+            .call(|connection| {
+                let mut statement = connection
+                    .prepare(&format!(
+                        "SELECT {TRACKING_COLUMNS} FROM github_tracking
+                         WHERE automatic = 1
+                         ORDER BY spaceport_app"
+                    ))
+                    .context("preparing the armed tracking query")?;
+
+                let rows = statement
+                    .query_map([], tracking_from)
+                    .context("reading which apps deploy themselves")?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .context("reading which apps deploy themselves")?;
+
+                Ok(rows)
             })
             .await
     }
@@ -299,6 +393,7 @@ fn tracking_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tracking> {
         tracked_at: row.get(5)?,
         revision: row.get(6)?,
         revision_seen_at: row.get(7)?,
+        automatic: row.get(8)?,
     })
 }
 
@@ -324,7 +419,18 @@ mod tests {
             tracked_at: String::new(),
             revision: None,
             revision_seen_at: None,
+            automatic: false,
         }
+    }
+
+    /// Whether the row says `id` deploys its builds itself.
+    async fn is_armed(repository: &TrackingRepository, id: &str) -> bool {
+        repository
+            .by_app(&app(id))
+            .await
+            .unwrap()
+            .expect("a tracking to read the switch off")
+            .automatic
     }
 
     #[tokio::test]
@@ -339,7 +445,7 @@ mod tests {
     async fn records_and_reads_back_what_an_app_tracks() {
         let repository = repository();
         repository
-            .record(&tracking("site", 42, "an-organisation/site", "main"))
+            .record(&tracking("site", 42, "an-organisation/site", "main"), None)
             .await
             .unwrap();
 
@@ -357,11 +463,11 @@ mod tests {
     async fn re_tracking_an_app_replaces_what_it_tracked() {
         let repository = repository();
         repository
-            .record(&tracking("site", 42, "an-organisation/site", "main"))
+            .record(&tracking("site", 42, "an-organisation/site", "main"), None)
             .await
             .unwrap();
         repository
-            .record(&tracking("site", 42, "an-organisation/other", "main"))
+            .record(&tracking("site", 42, "an-organisation/other", "main"), None)
             .await
             .unwrap();
 
@@ -377,7 +483,7 @@ mod tests {
     async fn re_tracking_forgets_the_revision_that_was_never_on_the_new_ref() {
         let repository = repository();
         repository
-            .record(&tracking("site", 42, "an-organisation/site", "main"))
+            .record(&tracking("site", 42, "an-organisation/site", "main"), None)
             .await
             .unwrap();
         repository
@@ -386,7 +492,10 @@ mod tests {
             .unwrap();
 
         repository
-            .record(&tracking("site", 42, "an-organisation/site", "release"))
+            .record(
+                &tracking("site", 42, "an-organisation/site", "release"),
+                None,
+            )
             .await
             .unwrap();
 
@@ -395,11 +504,120 @@ mod tests {
         assert_eq!(read.revision_seen_at, None);
     }
 
+    /// Deploying every commit without being asked is not something to be given
+    /// by default.
+    #[tokio::test]
+    async fn a_fresh_tracking_deploys_nothing_by_itself() {
+        let repository = repository();
+        repository
+            .record(&tracking("site", 42, "an-organisation/site", "main"), None)
+            .await
+            .unwrap();
+
+        assert!(!is_armed(&repository, "site").await);
+        assert!(repository.armed().await.unwrap().is_empty());
+    }
+
+    /// The exception to the `PUT`. Correcting a manifest path is not a request
+    /// to stop deploying, and an app that silently stopped would say so only by
+    /// the commit that never went out.
+    #[tokio::test]
+    async fn the_switch_survives_a_re_track_that_says_nothing_about_it() {
+        let repository = repository();
+        repository
+            .record(
+                &tracking("site", 42, "an-organisation/site", "main"),
+                Some(true),
+            )
+            .await
+            .unwrap();
+
+        repository
+            .record(&tracking("site", 42, "an-organisation/site", "main"), None)
+            .await
+            .unwrap();
+
+        assert!(is_armed(&repository, "site").await);
+    }
+
+    /// And a re-track that does say something about it is obeyed, in both
+    /// directions.
+    #[tokio::test]
+    async fn the_switch_changes_when_a_re_track_mentions_it() {
+        let repository = repository();
+        repository
+            .record(
+                &tracking("site", 42, "an-organisation/site", "main"),
+                Some(true),
+            )
+            .await
+            .unwrap();
+        repository
+            .record(
+                &tracking("site", 42, "an-organisation/site", "main"),
+                Some(false),
+            )
+            .await
+            .unwrap();
+
+        assert!(!is_armed(&repository, "site").await);
+
+        repository
+            .record(
+                &tracking("site", 42, "an-organisation/site", "main"),
+                Some(true),
+            )
+            .await
+            .unwrap();
+
+        assert!(is_armed(&repository, "site").await);
+    }
+
+    #[tokio::test]
+    async fn arms_and_disarms_an_app_on_its_own() {
+        let repository = repository();
+        repository
+            .record(&tracking("site", 42, "an-organisation/site", "main"), None)
+            .await
+            .unwrap();
+
+        assert!(repository.set_automatic(&app("site"), true).await.unwrap());
+        assert!(is_armed(&repository, "site").await);
+        assert!(repository.set_automatic(&app("site"), false).await.unwrap());
+        assert!(!is_armed(&repository, "site").await);
+        // An app that tracks nothing has nothing to arm, and says so.
+        assert!(!repository.set_automatic(&app("ghost"), true).await.unwrap());
+    }
+
+    /// What a pass over the finished builds starts from: the armed few, in the
+    /// order they will be deployed in.
+    #[tokio::test]
+    async fn lists_only_the_armed_trackings_in_app_order() {
+        let repository = repository();
+        for id in ["zulu", "alpha", "mike"] {
+            repository
+                .record(&tracking(id, 42, "an-organisation/mono", "main"), None)
+                .await
+                .unwrap();
+        }
+        repository.set_automatic(&app("zulu"), true).await.unwrap();
+        repository.set_automatic(&app("alpha"), true).await.unwrap();
+
+        let apps: Vec<String> = repository
+            .armed()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|tracking| tracking.app.to_string())
+            .collect();
+        assert_eq!(apps, ["alpha", "zulu"]);
+    }
+
     #[tokio::test]
     async fn records_the_revision_an_app_was_built_from() {
         let repository = repository();
         repository
-            .record(&tracking("site", 42, "an-organisation/site", "main"))
+            .record(&tracking("site", 42, "an-organisation/site", "main"), None)
             .await
             .unwrap();
 
@@ -421,7 +639,7 @@ mod tests {
         let repository = repository();
         for id in ["zulu", "alpha", "mike"] {
             repository
-                .record(&tracking(id, 42, "an-organisation/mono", "main"))
+                .record(&tracking(id, 42, "an-organisation/mono", "main"), None)
                 .await
                 .unwrap();
         }
@@ -443,7 +661,7 @@ mod tests {
         let repository = repository();
         for id in ["zulu", "alpha"] {
             repository
-                .record(&tracking(id, 42, "an-organisation/mono", "main"))
+                .record(&tracking(id, 42, "an-organisation/mono", "main"), None)
                 .await
                 .unwrap();
         }
@@ -468,7 +686,7 @@ mod tests {
     async fn a_push_finds_nothing_that_merely_looks_like_the_ref() {
         let repository = repository();
         repository
-            .record(&tracking("site", 42, "an-organisation/site", "main"))
+            .record(&tracking("site", 42, "an-organisation/site", "main"), None)
             .await
             .unwrap();
 
@@ -492,7 +710,7 @@ mod tests {
     async fn forgetting_a_tracking_says_whether_there_was_one() {
         let repository = repository();
         repository
-            .record(&tracking("site", 42, "an-organisation/site", "main"))
+            .record(&tracking("site", 42, "an-organisation/site", "main"), None)
             .await
             .unwrap();
 
@@ -507,15 +725,15 @@ mod tests {
     async fn forgetting_a_connection_forgets_only_what_it_reached() {
         let repository = repository();
         repository
-            .record(&tracking("site", 42, "an-organisation/site", "main"))
+            .record(&tracking("site", 42, "an-organisation/site", "main"), None)
             .await
             .unwrap();
         repository
-            .record(&tracking("docs", 42, "an-organisation/docs", "main"))
+            .record(&tracking("docs", 42, "an-organisation/docs", "main"), None)
             .await
             .unwrap();
         repository
-            .record(&tracking("other", 43, "another-org/site", "main"))
+            .record(&tracking("other", 43, "another-org/site", "main"), None)
             .await
             .unwrap();
 

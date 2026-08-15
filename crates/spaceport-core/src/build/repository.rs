@@ -19,6 +19,15 @@
 //! recorded — and it means the queue survives a restart without anything having
 //! to be replayed into it.
 //!
+//! What became of *deploying* a revision is written on the same row, for the
+//! same reason and then one more. A deployment that ran itself off the back of
+//! a successful build has to be attempted once and never again: a revision that
+//! would not start is a revision that will not start on the next pass either,
+//! and a worker with no memory of having tried would take the app down every
+//! minute for ever. The memory has to outlive the worker, so it is a column and
+//! not a field — and `(app, revision)` is already the key it wants, because a
+//! revision is deployed at most once just as it is built at most once.
+//!
 //! Nothing here builds anything. Fetching a commit, unpacking it and asking the
 //! engine for an image live in this module's siblings; this one only writes
 //! down what they were asked to do and what came back, so that the code which
@@ -50,6 +59,25 @@ const LOG_LIMIT: usize = 16 * 1024;
 /// What replaces the output that was dropped, so a reader can see that some
 /// was.
 const LOG_ELISION: &str = "[…earlier output dropped…]\n";
+
+/// How much of the reason a deployment failed is kept.
+///
+/// A reason is meant to be one sentence, but the sentence is often an error
+/// chain from somewhere further down — an engine that refused a port, with
+/// everything that was being attempted around it — and nothing stops one of
+/// those carrying a page of output that a program printed into a message. Cut
+/// on the way in for the reason [`LOG_LIMIT`] is: the only cheap place to lose
+/// it is the one place that ever had it whole.
+///
+/// Four kilobytes is far more than a sentence and far less than a log. Unlike a
+/// log it is the *head* that is kept, because an error chain says what failed
+/// first and elaborates afterwards — the opposite way round from a build, which
+/// chatters first and fails at the end.
+const REASON_LIMIT: usize = 4 * 1024;
+
+/// What replaces the end of a reason that was too long, so a reader can see
+/// that there was more.
+const REASON_ELISION: &str = "…";
 
 /// How far a build has got.
 ///
@@ -145,6 +173,38 @@ pub struct Build {
     /// compare against their repository. `None` for a row an earlier spaceport
     /// wrote, and for a build that failed before it read one.
     pub manifest: Option<String>,
+    /// When a deployment of this revision concluded, RFC 3339, whether it
+    /// worked or not.
+    ///
+    /// `None` is a revision no deployment has ever finished for: one still
+    /// queued, one that failed to build, one an operator has not deployed. It
+    /// is what every row written before the column existed says, and it is what
+    /// makes an automatic deployment attemptable exactly once — see
+    /// [`Build::awaits_deployment`].
+    pub deployed_at: Option<String>,
+    /// Why the deployment failed, in one sentence, for an operator to read.
+    ///
+    /// `None` beside a `deployed_at` means it worked. Separate from
+    /// [`Build::reason`], which is why the *build* failed: a revision that built
+    /// an image and then could not be started has two different things to say
+    /// about it, and one column would let the second erase the first.
+    pub deploy_reason: Option<String>,
+}
+
+impl Build {
+    /// Whether an automatic deployment should still attempt this revision.
+    ///
+    /// Two conditions, and the second is the one worth writing down. There has
+    /// to be an image, so the build must have succeeded. And no deployment may
+    /// have concluded for this revision *either way* — not because a second
+    /// deployment of a working revision would be wrong, but because a second
+    /// deployment of a broken one would be: a revision whose deployment failed
+    /// is never retried, or the worker would take the app down again on every
+    /// pass, for ever, for a commit that cannot come back. The retry is the next
+    /// commit, which is a thing a person can push once they have seen why.
+    pub fn awaits_deployment(&self) -> bool {
+        self.state == BuildState::Built && self.deployed_at.is_none()
+    }
 }
 
 /// The columns of `app_builds`, in the order [`build_from`] reads them.
@@ -152,7 +212,7 @@ pub struct Build {
 /// Written once so the `SELECT`s and the row mapping cannot drift apart.
 const BUILD_COLUMNS: &str = "spaceport_app, revision, connection, repository, branch, \
                              manifest_path, state, image_tag, image_id, reason, log, \
-                             started_at, finished_at, manifest";
+                             started_at, finished_at, manifest, deployed_at, deploy_reason";
 
 /// The builds table, in the vocabulary of requesting, claiming and finishing.
 #[derive(Debug, Clone)]
@@ -331,6 +391,70 @@ impl BuildRepository {
                         rusqlite::params![app, revision, reason, log, finished_at],
                     )
                     .context("recording a failed build")?;
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// Write down that this revision has been deployed and that it worked.
+    ///
+    /// Stamped whether the deployment was automatic or an operator's, because
+    /// the question the row answers is "has anything already deployed this
+    /// revision?", and an operator who deployed a commit by hand has answered it
+    /// — a worker that came along afterwards and deployed it again would be
+    /// restarting a running app for no reason.
+    ///
+    /// Terminal in the same sense [`BuildRepository::succeeded`] is: a revision
+    /// is deployed once, and what happens to the app afterwards is the
+    /// supervisor's business rather than this row's.
+    pub async fn deployed(&self, app: &AppId, revision: &str) -> Result<()> {
+        let app = app.to_string();
+        let revision = revision.to_owned();
+        let deployed_at = crate::state::now();
+
+        self.db
+            .call(move |connection| {
+                connection
+                    .execute(
+                        "UPDATE app_builds
+                         SET deployed_at = ?3, deploy_reason = NULL
+                         WHERE spaceport_app = ?1 AND revision = ?2",
+                        rusqlite::params![app, revision, deployed_at],
+                    )
+                    .context("recording a deployed revision")?;
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// Write down that this revision was deployed, that it did not work, and
+    /// why.
+    ///
+    /// The row that stops the loop. Without it the next pass would find the same
+    /// newest built revision, deploy it again, and take the app down again —
+    /// once a minute, for a commit that cannot be made to work by being tried
+    /// harder. `reason` is the sentence an operator reads when they ask why
+    /// production is still on the commit before: a manifest that would not
+    /// apply, a container that would not start, a port already taken. It is cut
+    /// to [`REASON_LIMIT`] because an error chain is only usually a sentence.
+    pub async fn deploy_failed(&self, app: &AppId, revision: &str, reason: &str) -> Result<()> {
+        let app = app.to_string();
+        let revision = revision.to_owned();
+        let reason = head(reason);
+        let deployed_at = crate::state::now();
+
+        self.db
+            .call(move |connection| {
+                connection
+                    .execute(
+                        "UPDATE app_builds
+                         SET deployed_at = ?3, deploy_reason = ?4
+                         WHERE spaceport_app = ?1 AND revision = ?2",
+                        rusqlite::params![app, revision, deployed_at, reason],
+                    )
+                    .context("recording a failed deployment")?;
 
                 Ok(())
             })
@@ -575,6 +699,8 @@ fn build_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<Build> {
         started_at: row.get(11)?,
         finished_at: row.get(12)?,
         manifest: row.get(13)?,
+        deployed_at: row.get(14)?,
+        deploy_reason: row.get(15)?,
     })
 }
 
@@ -605,6 +731,31 @@ fn tail(log: &str) -> Option<String> {
     Some(format!("{LOG_ELISION}{}", &log[start..]))
 }
 
+/// The first [`REASON_LIMIT`] bytes of `reason`, marked so a reader can see
+/// that there was more.
+///
+/// The head rather than the tail, which is the other way round from [`tail`]
+/// and for the other reason: an error chain leads with what failed and follows
+/// with the context it failed in, so the first sentence is the one that was
+/// wanted. A `String` and never a `None`, however empty the reason is, because
+/// a NULL in that column means the deployment worked — a failure that arrived
+/// without anything to say must still read as a failure.
+fn head(reason: &str) -> String {
+    if reason.len() <= REASON_LIMIT {
+        return reason.to_owned();
+    }
+
+    // Cutting at a byte offset can land inside a character, so the cut moves
+    // back to the previous boundary — losing a few bytes rather than producing
+    // a string that is not one.
+    let mut end = REASON_LIMIT;
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    format!("{}{REASON_ELISION}", &reason[..end])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,6 +784,8 @@ mod tests {
             started_at: String::new(),
             finished_at: None,
             manifest: None,
+            deployed_at: None,
+            deploy_reason: None,
         }
     }
 
@@ -957,6 +1110,183 @@ routing:
         assert_eq!(read.log.as_deref(), Some("step 1/2\nerror\n"));
         assert_eq!(read.image_tag, None);
         assert!(read.finished_at.unwrap().ends_with('Z'));
+    }
+
+    /// A revision that has been deployed says so through every way of reading
+    /// the row back, because the worker, the operator and a listing all ask
+    /// different questions of the same fact.
+    #[tokio::test]
+    async fn a_deployed_revision_reads_back_as_deployed_everywhere() {
+        let repository = repository();
+        repository.request(&build("site", "abc")).await.unwrap();
+        repository
+            .succeeded(
+                &app("site"),
+                "abc",
+                "spaceport/site:abc",
+                "sha256:1",
+                MANIFEST,
+                "",
+            )
+            .await
+            .unwrap();
+
+        // Before anything deploys it, it is exactly what an automatic
+        // deployment is looking for.
+        assert!(
+            repository
+                .latest_built(&app("site"))
+                .await
+                .unwrap()
+                .unwrap()
+                .awaits_deployment()
+        );
+
+        repository.deployed(&app("site"), "abc").await.unwrap();
+
+        for read in [
+            repository.get(&app("site"), "abc").await.unwrap().unwrap(),
+            repository
+                .built(&app("site"), "abc")
+                .await
+                .unwrap()
+                .unwrap(),
+            repository.latest(&app("site")).await.unwrap().unwrap(),
+            repository
+                .latest_built(&app("site"))
+                .await
+                .unwrap()
+                .unwrap(),
+            repository.by_app(&app("site")).await.unwrap().remove(0),
+        ] {
+            assert!(read.deployed_at.as_deref().unwrap().ends_with('Z'));
+            assert_eq!(read.deploy_reason, None);
+            assert!(!read.awaits_deployment());
+        }
+    }
+
+    /// The row that stops the loop: a revision that would not start is not
+    /// tried again, and what it said is still there for an operator to read.
+    #[tokio::test]
+    async fn a_deployment_that_failed_keeps_its_reason_and_is_not_attempted_again() {
+        let repository = repository();
+        repository.request(&build("site", "abc")).await.unwrap();
+        repository
+            .succeeded(
+                &app("site"),
+                "abc",
+                "spaceport/site:abc",
+                "sha256:1",
+                MANIFEST,
+                "",
+            )
+            .await
+            .unwrap();
+
+        repository
+            .deploy_failed(&app("site"), "abc", "the container exited immediately")
+            .await
+            .unwrap();
+
+        let read = repository.get(&app("site"), "abc").await.unwrap().unwrap();
+        assert_eq!(
+            read.deploy_reason.as_deref(),
+            Some("the container exited immediately")
+        );
+        assert!(read.deployed_at.as_deref().unwrap().ends_with('Z'));
+        assert!(!read.awaits_deployment());
+        // The build itself still says it produced an image, and why it failed
+        // to deploy has not overwritten why it failed to build.
+        assert_eq!(read.state, BuildState::Built);
+        assert_eq!(read.reason, None);
+    }
+
+    /// A revision nothing has an image for is not one to deploy, whatever else
+    /// is true of it.
+    #[tokio::test]
+    async fn only_a_built_revision_awaits_deployment() {
+        let repository = repository();
+        repository.request(&build("site", "pending")).await.unwrap();
+        repository.request(&build("site", "broken")).await.unwrap();
+        repository
+            .failed(&app("site"), "broken", "the build refused", "")
+            .await
+            .unwrap();
+
+        for revision in ["pending", "broken"] {
+            assert!(
+                !repository
+                    .get(&app("site"), revision)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .awaits_deployment(),
+                "{revision}"
+            );
+        }
+    }
+
+    /// A reason that arrived as a page of error chain must not put a page in
+    /// the database, and what is kept is the beginning, where the failure is
+    /// named.
+    #[tokio::test]
+    async fn a_long_deployment_reason_is_cut_down_to_its_head() {
+        let repository = repository();
+        repository.request(&build("site", "abc")).await.unwrap();
+        let chatty = format!("the first thing\n{}", "context\n".repeat(REASON_LIMIT / 4));
+
+        repository
+            .deploy_failed(&app("site"), "abc", &chatty)
+            .await
+            .unwrap();
+
+        let reason = repository
+            .get(&app("site"), "abc")
+            .await
+            .unwrap()
+            .unwrap()
+            .deploy_reason
+            .unwrap();
+        assert!(
+            reason.len() <= REASON_LIMIT + REASON_ELISION.len(),
+            "{}",
+            reason.len()
+        );
+        assert!(reason.starts_with("the first thing\n"), "{}", &reason[..40]);
+        assert!(reason.ends_with(REASON_ELISION));
+    }
+
+    /// A build recorded before these columns existed has never been deployed,
+    /// which is what makes it one an automatic deployment may still act on
+    /// rather than one it has to guess about.
+    #[tokio::test]
+    async fn a_build_written_before_deployments_were_recorded_reads_as_never_deployed() {
+        let repository = repository();
+        repository.request(&build("site", "abc")).await.unwrap();
+        // Exactly the row an older spaceport left behind: built, with an image,
+        // and nothing at all to say about deploying it.
+        repository
+            .db
+            .call(move |connection| {
+                connection
+                    .execute(
+                        "UPDATE app_builds
+                         SET state = 'built', image_tag = 'spaceport/site:abc',
+                             image_id = 'sha256:1', finished_at = '2026-01-01T00:00:00Z'
+                         WHERE spaceport_app = 'site' AND revision = 'abc'",
+                        [],
+                    )
+                    .context("writing a build as an older spaceport did")?;
+
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let read = repository.get(&app("site"), "abc").await.unwrap().unwrap();
+        assert_eq!(read.deployed_at, None);
+        assert_eq!(read.deploy_reason, None);
+        assert!(read.awaits_deployment());
     }
 
     /// What a restart is for: a row nothing is building any more goes back in

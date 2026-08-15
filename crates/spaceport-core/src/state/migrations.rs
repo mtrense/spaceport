@@ -259,6 +259,49 @@ const MIGRATIONS: &[&str] = &[
     // there is no revision to remember.
     "ALTER TABLE app_builds ADD COLUMN manifest TEXT;
     ALTER TABLE apps ADD COLUMN revision TEXT;",
+    // 8 — whether a successful build deploys itself, and what came of it when
+    // one did.
+    //
+    // `github_tracking.automatic` is the switch, per tracking and off by
+    // default, spelled exactly as `apps.suspended` is: an `INTEGER NOT NULL
+    // DEFAULT`, because a boolean in this schema is a column with two values
+    // and not a second table to join. Defaulting to 0 makes every tracking an
+    // older build recorded one that deploys nothing, which is what it was —
+    // and, unlike suspension, it is the answer an operator who has never asked
+    // for automatic deployment would want anyway. It sits on the tracking and
+    // not on `apps` because it is a property of where an app comes from: an app
+    // that is built from nowhere has no build that could deploy itself, and a
+    // column on `apps` would be that absence spelled the long way.
+    //
+    // The two columns on `app_builds` are the outcome of deploying a revision,
+    // and they are on the build row because `(spaceport_app, revision)` is
+    // already the key that outcome wants — the deployment of a revision is one
+    // thing that happens at most once, exactly as the build of it is. A table
+    // of its own would repeat that key and buy nothing; a column on `apps`
+    // could only hold the last one and would forget which revision it was about
+    // the moment the next commit arrived.
+    //
+    // Two columns and not three. `deployed_at` NULL means no automatic deploy
+    // has concluded for this revision, which is what every row written before
+    // this step says and what a freshly built one says. Non-NULL with
+    // `deploy_reason` NULL is a deployment that worked; non-NULL with a reason
+    // is one that did not, and the reason is why. That answers both halves of
+    // "has this revision been deployed, and did it work?" without a state word
+    // to parse, and it is what stops the worker attempting a doomed revision
+    // every pass and taking the app down each time: a revision whose deployment
+    // failed is written down as failed for ever, and the retry is the next
+    // commit. A third column naming the revision would restate the key, and a
+    // fourth naming a state would be a second answer to a question the two
+    // NULLs already answer exactly once.
+    //
+    // `deploy_reason` is separate from `reason`, which is why the *build*
+    // failed. A build that produced an image and a deployment that then refused
+    // it are different sentences about the same revision, and one column would
+    // make the second overwrite the first — leaving an operator reading `built`
+    // beside a reason about a port collision.
+    "ALTER TABLE github_tracking ADD COLUMN automatic INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE app_builds ADD COLUMN deployed_at TEXT;
+    ALTER TABLE app_builds ADD COLUMN deploy_reason TEXT;",
 ];
 
 /// The schema version this build writes.
@@ -439,7 +482,8 @@ mod tests {
                 "manifest_path",
                 "tracked_at",
                 "revision",
-                "revision_seen_at"
+                "revision_seen_at",
+                "automatic"
             ]
         );
     }
@@ -465,7 +509,9 @@ mod tests {
                 "log",
                 "started_at",
                 "finished_at",
-                "manifest"
+                "manifest",
+                "deployed_at",
+                "deploy_reason"
             ]
         );
     }
@@ -492,6 +538,57 @@ mod tests {
                 })
                 .unwrap(),
             None
+        );
+    }
+
+    /// Nothing an earlier spaceport recorded asked to be deployed
+    /// automatically, and nothing it built has been deployed by anything.
+    #[test]
+    fn the_eighth_migration_arms_nothing_and_deploys_nothing() {
+        let connection = empty();
+        migrate(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO github_tracking
+                     (spaceport_app, github_app_id, repository, branch, manifest_path, tracked_at)
+                 VALUES ('hello', 42, 'an-organisation/site', 'main', 'spaceport.yaml',
+                         '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO app_builds
+                     (spaceport_app, revision, connection, repository, branch, manifest_path,
+                      state, started_at)
+                 VALUES ('hello', 'abc', 'spaceport', 'an-organisation/site', 'main',
+                         'spaceport.yaml', 'built', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT automatic FROM github_tracking WHERE spaceport_app = 'hello'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT deployed_at, deploy_reason FROM app_builds WHERE revision = 'abc'",
+                    [],
+                    |row| Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?
+                    ))
+                )
+                .unwrap(),
+            (None, None)
         );
     }
 

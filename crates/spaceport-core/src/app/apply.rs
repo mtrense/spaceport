@@ -2132,6 +2132,8 @@ container:
                 started_at: String::new(),
                 finished_at: None,
                 manifest: None,
+                deployed_at: None,
+                deploy_reason: None,
             })
             .await
             .unwrap();

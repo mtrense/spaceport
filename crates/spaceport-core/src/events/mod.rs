@@ -138,6 +138,13 @@ pub struct Category(String);
 /// category: it means spaceport grew a module and nobody said where it belongs.
 const CATEGORIES: &[(&str, &str)] = &[
     ("spaceport_core::app::apply", "app.apply"),
+    // Under `app` beside the apply it performs, rather than under `build`: what
+    // an automatic deployment does to a host is start and stop containers and
+    // move routes, which is the apply story and not the story of turning a
+    // commit into an image. Its own leaf all the same, because "why did my app
+    // restart on its own" is a question `--category app.deploy` should answer
+    // without every hand-applied manifest in the way.
+    ("spaceport_core::app::deploy", "app.deploy"),
     ("spaceport_core::app::reconcile", "app.reconcile"),
     ("spaceport_core::app::health", "app.health"),
     ("spaceport_core::app::store", "route"),
@@ -389,6 +396,20 @@ mod tests {
             Category::for_target("spaceport_core::runtime::docker").as_str(),
             "container"
         );
+    }
+
+    /// A deployment spaceport made for itself is worth telling apart from the
+    /// applies an operator asked for — it is the one an operator did not see
+    /// happen — while still being an app event, which is what `--category app`
+    /// selects.
+    #[test]
+    fn categorises_a_deployment_spaceport_made_for_itself() {
+        assert_eq!(
+            Category::for_target("spaceport_core::app::deploy").as_str(),
+            "app.deploy"
+        );
+        assert!(Category::new("app.deploy").within(&Category::new("app")));
+        assert!(!Category::new("app.deploy").within(&Category::new("app.apply")));
     }
 
     /// The specific entries have to win over the module they sit in, or every

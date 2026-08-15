@@ -29,10 +29,15 @@
 //! for shutdown between builds, so stopping a spaceport does not mean waiting
 //! out a queue.
 //!
-//! Nothing here deploys anything. The image is built, tagged and recorded
-//! against the app and the revision it came from, and the app goes on running
-//! whatever it was running: pointing it at a fresh image is a later step and
-//! lives nowhere yet.
+//! Nothing here deploys anything, and it shoves something that does. The image
+//! is built, tagged and recorded against the app and the revision it came from,
+//! and the app goes on running whatever it was running; pointing it at the
+//! fresh image is [`crate::app::deploy`]'s, and only for an app whose operator
+//! armed it. The [`Worker::deploys`] nudge is the whole of what this loop has
+//! to do with that — the shove says "go and look", never "deploy this", so a
+//! shove that goes missing costs the interval that loop runs on and nothing
+//! else, and the deployment itself waits on a container becoming ready
+//! somewhere that is not holding the one build slot.
 //!
 //! A failure is written down and never propagated. There is nobody above this
 //! loop to return an error to — a worker that gave up on a bad manifest would
@@ -178,6 +183,19 @@ pub struct Worker {
     pub images: Arc<dyn ImageBuilder>,
     /// Where a commit is unpacked.
     pub directory: BuildDir,
+    /// Shoved once a build has been recorded as having succeeded, so that an
+    /// armed app's commit is deployed in seconds rather than at the deploying
+    /// loop's next interval.
+    ///
+    /// A [`Nudge`] of the same type this loop is woken by and emphatically not
+    /// the same *instance* — the reasoning
+    /// [`crate::connections::github::webhook`] makes about the reconciler's and
+    /// the builder's holds again here. Waking
+    /// the builder when a build has just finished would put every finished
+    /// build back through the queue it came out of; waking the reconciler would
+    /// make an image finishing into a GitHub round trip per connection. Three
+    /// loops with three different costs per wake-up need three signals.
+    pub deploys: Nudge,
 }
 
 /// Keep building the revisions this spaceport's apps track, until `shutdown` is
@@ -360,6 +378,8 @@ async fn request_what_is_tracked(worker: &Worker) {
             started_at: String::new(),
             finished_at: None,
             manifest: None,
+            deployed_at: None,
+            deploy_reason: None,
         };
 
         match worker.builds.request(&build).await {
@@ -390,7 +410,7 @@ async fn request_what_is_tracked(worker: &Worker) {
 async fn run(worker: &Worker, policy: &Policy, build: &Build) {
     match produce(worker, policy, build).await {
         Ok(produced) => {
-            if let Err(error) = worker
+            match worker
                 .builds
                 .succeeded(
                     &build.app,
@@ -402,11 +422,18 @@ async fn run(worker: &Worker, policy: &Policy, build: &Build) {
                 )
                 .await
             {
-                warn!(
+                // After the row and never before, and only when there is one:
+                // the deploying loop reads the builds for itself, so a shove
+                // that arrived first would send it to look at a revision that
+                // is not recorded as built yet — and it would find the one
+                // before it and believe it. The same order a push writes a
+                // revision down in before waking this loop.
+                Ok(()) => worker.deploys.nudge(),
+                Err(error) => warn!(
                     app = %build.app,
                     error = %format!("{error:#}"),
                     "could not record a build that succeeded",
-                );
+                ),
             }
 
             // After the record and not before: a sweep that fails must not cost
@@ -912,6 +939,9 @@ routing:
         worker: Arc<Worker>,
         archives: Arc<FakeArchives>,
         engine: Arc<FakeEngine>,
+        /// The same signal the worker holds, so a test can ask whether an image
+        /// finishing woke the loop that would run it.
+        deploys: Nudge,
         root: PathBuf,
     }
 
@@ -941,6 +971,7 @@ routing:
 
             let archives = FakeArchives::new();
             let engine = FakeEngine::new();
+            let deploys = Nudge::new();
             let root = temp_dir(name);
 
             Self {
@@ -952,9 +983,11 @@ routing:
                     archives: archives.clone(),
                     images: engine.clone(),
                     directory: BuildDir::new(root.join("builds")),
+                    deploys: deploys.clone(),
                 }),
                 archives,
                 engine,
+                deploys,
                 root,
             }
         }
@@ -970,16 +1003,20 @@ routing:
         async fn track(&self, id: &str, revision: Option<&str>) {
             self.worker
                 .trackings
-                .record(&Tracking {
-                    app: app(id),
-                    github_app_id: APP_ID,
-                    repository: REPOSITORY.to_owned(),
-                    branch: "main".to_owned(),
-                    manifest_path: "spaceport.yaml".to_owned(),
-                    tracked_at: String::new(),
-                    revision: None,
-                    revision_seen_at: None,
-                })
+                .record(
+                    &Tracking {
+                        app: app(id),
+                        github_app_id: APP_ID,
+                        repository: REPOSITORY.to_owned(),
+                        branch: "main".to_owned(),
+                        manifest_path: "spaceport.yaml".to_owned(),
+                        tracked_at: String::new(),
+                        revision: None,
+                        revision_seen_at: None,
+                        automatic: false,
+                    },
+                    None,
+                )
                 .await
                 .unwrap();
 
@@ -1118,6 +1155,42 @@ routing:
         fixture.clean_up();
     }
 
+    /// An image that exists is the moment an armed app's commit can be run, and
+    /// an operator watching a push should not wait out the deploying loop's
+    /// interval to see it happen.
+    #[tokio::test]
+    async fn a_build_that_succeeded_wakes_the_deploying_loop() {
+        let fixture = Fixture::new("wakes-the-deployer").await;
+        fixture.track("site", Some(REVISION)).await;
+        fixture.archives.holds(LOCATION, a_commit(BUILT_MANIFEST));
+        let woken = fixture.deploys.changed();
+
+        fixture.pass().await;
+
+        assert!(woken.has_changed().unwrap());
+
+        fixture.clean_up();
+    }
+
+    /// A build that produced no image is nothing to deploy, and the loop it
+    /// would wake would read the same rows it read last time.
+    #[tokio::test]
+    async fn a_build_that_failed_wakes_the_deploying_loop_for_nothing() {
+        let fixture = Fixture::new("does-not-wake-the-deployer").await;
+        fixture.track("site", Some(REVISION)).await;
+        let woken = fixture.deploys.changed();
+
+        fixture.pass().await;
+
+        assert_eq!(
+            fixture.build_of("site", REVISION).await.state,
+            BuildState::Failed
+        );
+        assert!(!woken.has_changed().unwrap());
+
+        fixture.clean_up();
+    }
+
     /// Spaceport's copy of what an installation reaches can be older than the
     /// installation is, and the sentence has to say so — this is the failure an
     /// operator hits the day they move a repository between organisations.
@@ -1210,16 +1283,20 @@ routing:
         fixture
             .worker
             .trackings
-            .record(&Tracking {
-                app: app("site"),
-                github_app_id: APP_ID,
-                repository: REPOSITORY.to_owned(),
-                branch: "main".to_owned(),
-                manifest_path: "../../../etc/spaceport/spaceport.yaml".to_owned(),
-                tracked_at: String::new(),
-                revision: None,
-                revision_seen_at: None,
-            })
+            .record(
+                &Tracking {
+                    app: app("site"),
+                    github_app_id: APP_ID,
+                    repository: REPOSITORY.to_owned(),
+                    branch: "main".to_owned(),
+                    manifest_path: "../../../etc/spaceport/spaceport.yaml".to_owned(),
+                    tracked_at: String::new(),
+                    revision: None,
+                    revision_seen_at: None,
+                    automatic: false,
+                },
+                None,
+            )
             .await
             .unwrap();
         fixture
@@ -1336,6 +1413,8 @@ routing:
             started_at: String::new(),
             finished_at: None,
             manifest: None,
+            deployed_at: None,
+            deploy_reason: None,
         }
     }
 

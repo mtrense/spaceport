@@ -10,7 +10,7 @@ use render::Colour;
 use spaceport_core::acme::account::{AcmeCa, Transport};
 use spaceport_core::acme::{CertificateRepository, Certificates, Challenges};
 use spaceport_core::app::{
-    AppId, AppRepository, AppStore, Applier, DataDir, Pattern, reconcile, supervise,
+    self, AppId, AppRepository, AppStore, Applier, DataDir, Pattern, reconcile, supervise,
 };
 use spaceport_core::build;
 use spaceport_core::build::dir::BuildDir;
@@ -131,9 +131,10 @@ enum AppsCommand {
     /// last commit is older than the tracking would otherwise wait for a push
     /// that may never arrive.
     ///
-    /// Built, and no more than that: what a build produces is an image, and
-    /// running it is `spaceport apps deploy` — a step an operator takes when
-    /// they are ready for it rather than one a push takes for them.
+    /// Built, and no more than that, unless `--deploy` says otherwise: what a
+    /// build produces is an image, and running it is `spaceport apps deploy` —
+    /// a step an operator takes when they are ready for it rather than one a
+    /// push takes for them.
     Track(TrackArgs),
     /// Run what spaceport built from the app's repository.
     Deploy(DeployArgs),
@@ -369,8 +370,45 @@ struct TrackArgs {
     #[arg(short, long, value_name = "FILE", default_value = "spaceport.yaml")]
     manifest_path: String,
 
+    /// Run every build of this app as soon as it succeeds, without anybody
+    /// typing `spaceport apps deploy`.
+    ///
+    /// Every commit on the branch reaches production on its own from then on,
+    /// replacing whatever manifest the app was applied with — which is what
+    /// makes it a thing to ask for rather than the default. A suspended app is
+    /// left suspended, and a deployment that fails puts the app back on the
+    /// revision it was running.
+    #[arg(long, conflicts_with = "no_deploy")]
+    deploy: bool,
+
+    /// Stop running this app's builds on their own, leaving `spaceport apps
+    /// deploy` as the only thing that puts one in front of the traffic.
+    ///
+    /// There is no `spaceport apps autodeploy`, so re-tracking with this is how
+    /// an armed app is disarmed. Mentioning neither flag leaves the switch
+    /// exactly as it was, so correcting a branch or a manifest path never
+    /// silently stops an app deploying itself.
+    #[arg(long)]
+    no_deploy: bool,
+
     #[command(flatten)]
     server: ServerArgs,
+}
+
+impl TrackArgs {
+    /// Whether the operator said anything about automatic deployment, and what.
+    ///
+    /// `None` is the answer that matters: the two flags are the only way the
+    /// switch is set, and a re-track that mentions neither is not an answer to
+    /// the question at all — so the spaceport is told nothing rather than told
+    /// `false`, and leaves the app as armed as it already was.
+    fn deploy(&self) -> Option<bool> {
+        match (self.deploy, self.no_deploy) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -686,6 +724,13 @@ async fn run(args: RunArgs) -> Result<()> {
     // a GitHub round trip per connection.
     let building = github::Nudge::new();
 
+    // And the deploying loop's own signal, which is neither of the other two.
+    // The builder shoves this one when an image exists; waking the builder
+    // instead would put a finished build back through the queue it came out of,
+    // and waking the reconciler would make every image into a GitHub round trip
+    // per connection.
+    let deploying = github::Nudge::new();
+
     // One store, cloned into the worker that writes the rows and held by the
     // operator interface that reads them back: `spaceport apps show` reports
     // what a build came to, and it has to be looking at the same table the
@@ -705,6 +750,7 @@ async fn run(args: RunArgs) -> Result<()> {
             archives: Arc::new(build::archive::Downloads::new()?),
             images: runtime,
             directory: builds,
+            deploys: deploying.clone(),
         }),
         build::worker::Policy {
             max_archive_bytes: config.build.max_archive_bytes,
@@ -712,6 +758,23 @@ async fn run(args: RunArgs) -> Result<()> {
             ..build::worker::Policy::default()
         },
         building.clone(),
+        shutdown.clone(),
+    ));
+
+    // What runs an image once there is one, for the apps whose operator armed
+    // them. Started unconditionally, for the reason the two loops above are: an
+    // app can be armed while spaceport is running, and a pass over no armed
+    // trackings is one local query. It is also what makes a build recorded by a
+    // spaceport that was then killed still reach production — the row it left
+    // behind is the trigger, so the first pass after the restart finds it.
+    tokio::spawn(app::deploy::maintain(
+        Arc::new(app::deploy::Worker {
+            applier: applier.clone(),
+            trackings: tracking.clone(),
+            builds: (*build_records).clone(),
+        }),
+        app::deploy::Policy::default(),
+        deploying,
         shutdown.clone(),
     ));
 
@@ -847,6 +910,7 @@ async fn track(args: TrackArgs) -> Result<()> {
             &args.connection,
             args.branch.as_deref(),
             Some(&args.manifest_path),
+            args.deploy(),
         )
         .await?
     );

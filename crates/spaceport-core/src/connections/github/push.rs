@@ -242,16 +242,20 @@ mod tests {
     /// An app tracking `branch` of [`REPOSITORY`] through the App `github_app_id`.
     async fn track(tracking: &TrackingRepository, id: &str, github_app_id: i64, branch: &str) {
         tracking
-            .record(&Tracking {
-                app: app(id),
-                github_app_id,
-                repository: REPOSITORY.to_owned(),
-                branch: branch.to_owned(),
-                manifest_path: "spaceport.yaml".to_owned(),
-                tracked_at: String::new(),
-                revision: None,
-                revision_seen_at: None,
-            })
+            .record(
+                &Tracking {
+                    app: app(id),
+                    github_app_id,
+                    repository: REPOSITORY.to_owned(),
+                    branch: branch.to_owned(),
+                    manifest_path: "spaceport.yaml".to_owned(),
+                    tracked_at: String::new(),
+                    revision: None,
+                    revision_seen_at: None,
+                    automatic: false,
+                },
+                None,
+            )
             .await
             .unwrap();
     }

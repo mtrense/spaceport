@@ -2,6 +2,7 @@
 
 pub mod apply;
 pub mod data;
+pub mod deploy;
 pub mod health;
 pub mod manifest;
 pub mod pattern;

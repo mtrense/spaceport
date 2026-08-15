@@ -678,6 +678,14 @@ struct Deployment {
     deployed: Option<String>,
     /// The newest revision there is an image for.
     built: Option<String>,
+    /// Why the deployment of that newest revision failed, if one was tried and
+    /// did not take.
+    ///
+    /// Off the same row as [`Deployment::built`], because the deployment that
+    /// matters is the one an operator is waiting on. It has nowhere else to
+    /// appear: the build stanza above says the image was made, which is true and
+    /// is not the answer to why the app is still on the commit before.
+    failed: Option<String>,
 }
 
 /// What is deployed against what is waiting, for one app's report.
@@ -686,14 +694,12 @@ struct Deployment {
 /// the rest of the report is still worth having, and the build stanza above
 /// this one has already said that the store would not answer.
 async fn deployment(builds: &BuildRepository, id: &AppId, deployed: Option<String>) -> Deployment {
+    let latest = builds.latest_built(id).await.ok().flatten();
+
     Deployment {
         deployed,
-        built: builds
-            .latest_built(id)
-            .await
-            .ok()
-            .flatten()
-            .map(|build| build.revision),
+        built: latest.as_ref().map(|build| build.revision.clone()),
+        failed: latest.and_then(|build| build.deploy_reason),
     }
 }
 
@@ -852,7 +858,12 @@ fn report(
 fn came_from(out: &mut Report, id: &AppId, origin: &Origin<'_>) {
     tracks(out, origin.tracked);
     builds(out, origin.built);
-    deploys(out, id, origin.deployment);
+    deploys(
+        out,
+        id,
+        origin.deployment,
+        origin.tracked.tracking.automatic,
+    );
 }
 
 /// Everything known about an app that is only tracked.
@@ -876,12 +887,19 @@ fn tracked_report(id: &AppId, origin: &Origin<'_>) -> String {
     // tracked app is one whose manifest is in its repository, so deploying a
     // build is the ordinary answer and writing a manifest by hand is the other
     // one. The deploy stanza above has already named the revision if there is
-    // one, so this says nothing about which.
+    // one, so this says nothing about which. An armed app is on its way out of
+    // this state without anybody typing, and telling its operator to type
+    // something would have them race a worker for it.
     out.field(
         "",
-        format!(
-            "run what a build produced with `spaceport apps deploy {id}`, which applies the manifest the commit carried — or apply one of your own with `spaceport apps apply {id} …`"
-        ),
+        match origin.tracked.tracking.automatic {
+            true => format!(
+                "spaceport runs what a build produces as soon as there is one, manifest and all — or apply one of your own with `spaceport apps apply {id} …`"
+            ),
+            false => format!(
+                "run what a build produced with `spaceport apps deploy {id}`, which applies the manifest the commit carried — or apply one of your own with `spaceport apps apply {id} …`"
+            ),
+        },
     );
 
     out.render()
@@ -911,6 +929,18 @@ fn tracks(out: &mut Report, tracked: &Tracked) {
     if let Some(revision) = &tracking.revision {
         out.field("", format!("  last saw {revision}"));
     }
+    // Both ways round, unlike most of this report, which leaves out the
+    // sections an app does not use. Whether a push reaches production on its
+    // own is not a feature an app either has or does not — it is the answer to
+    // "when I push this, what happens?", and an operator reading a stanza that
+    // said nothing would have to go and find out which of the two it was.
+    out.field(
+        "",
+        match tracking.automatic {
+            true => "  deploys its own builds — a build that succeeds is run without being asked".to_owned(),
+            false => "  deploys nothing on its own — a build that succeeds waits for `spaceport apps deploy`".to_owned(),
+        },
+    );
 }
 
 /// How many lines of a failed build's output the report prints.
@@ -982,14 +1012,14 @@ fn builds(out: &mut Report, built: &Built) {
 /// A stanza of its own under the build, because the build stanza answers "did
 /// it build?" and this answers "is it live?" — and an operator watching a
 /// change reach production is asking the second one. A build that says `built`
-/// looks like an answer to it and is not: spaceport builds every push and
-/// deploys none of them, so an image finishing is exactly the moment at which
-/// the two numbers part company.
+/// looks like an answer to it and is not: an image finishing is exactly the
+/// moment at which the two numbers can part company, whether because nothing
+/// has been asked to run it or because running it was tried and did not take.
 ///
 /// Nothing at all when neither is known, like every other section here: an app
 /// tracked a minute ago has nothing to say on this and should not be given a
 /// line saying so.
-fn deploys(out: &mut Report, id: &AppId, deployment: &Deployment) {
+fn deploys(out: &mut Report, id: &AppId, deployment: &Deployment, armed: bool) {
     match (&deployment.deployed, &deployment.built) {
         (Some(deployed), Some(built)) if deployed == built => out.field(
             "deployed",
@@ -1000,7 +1030,8 @@ fn deploys(out: &mut Report, id: &AppId, deployment: &Deployment) {
             out.field(
                 "",
                 format!(
-                    "  a newer build is waiting at {built} — run it with `spaceport apps deploy {id}`"
+                    "  a newer build is waiting at {built} — {}",
+                    waiting(id, armed)
                 ),
             );
         }
@@ -1011,10 +1042,43 @@ fn deploys(out: &mut Report, id: &AppId, deployment: &Deployment) {
         (None, Some(built)) => out.field(
             "deployed",
             format!(
-                "nothing built here is running — {built} is waiting, run it with `spaceport apps deploy {id}`"
+                "nothing built here is running — {built} is waiting, {}",
+                waiting(id, armed)
             ),
         ),
         (None, None) => {}
+    }
+
+    // The one thing `deploy_reason` is for. A build that succeeded and a
+    // deployment that failed are two different sentences, and every other line
+    // in this report tells the first story: the image exists, the app is on the
+    // commit before, and nothing says why. Under the stanza rather than beside
+    // it, because it is the second half of the line above — the newer build
+    // that is waiting is waiting for this reason.
+    if let (Some(built), Some(reason)) = (&deployment.built, &deployment.failed) {
+        out.field("", format!("  deploying {built} failed: {reason}"));
+        out.field(
+            "",
+            format!(
+                "  it is not deployed again on its own — push over it, or ask for it by name with `spaceport apps deploy {id} --revision {built}`"
+            ),
+        );
+    }
+}
+
+/// What to do about an image nothing is running, in the voice the app's own
+/// switch calls for.
+///
+/// An armed app has already been told to run this one, so naming the command
+/// again would be telling an operator to do spaceport's job. What is worth
+/// saying instead is that a build still waiting is a symptom rather than the
+/// ordinary state: either the pass that runs it has not come round yet, which
+/// is minutes, or it came round and the deployment failed — and the line under
+/// this one then says so.
+fn waiting(id: &AppId, armed: bool) -> String {
+    match armed {
+        true => "which this app deploys on its own, so it is either about to run or the line below says why it did not".to_owned(),
+        false => format!("run it with `spaceport apps deploy {id}`"),
     }
 }
 
@@ -1362,6 +1426,11 @@ struct ApplyQuery {
 /// as applying to one does — the rule belongs to [`Applier::deploy`] and is not
 /// restated here. Deciding what an app runs and deciding whether it is being
 /// run stay two decisions.
+///
+/// However it goes, the revision is stamped as having had its deployment. An
+/// operator's deploy and an armed app's are the same event to the row that
+/// records it, and the alternative is the two of them disagreeing about whether
+/// a revision has been tried.
 async fn deploy(
     State(instance): State<Arc<Instance>>,
     State(applier): State<Arc<Applier>>,
@@ -1427,10 +1496,45 @@ async fn deploy(
         );
     };
 
-    match applier
-        .deploy(id, manifest, Some(&build.revision), false)
-        .await
-    {
+    let outcome = applier
+        .deploy(id.clone(), manifest, Some(&build.revision), false)
+        .await;
+
+    // Recorded either way, before a word of the response is written.
+    //
+    // On success, because otherwise the revision an operator has just put in
+    // front of the traffic still reads as awaiting deployment, and the worker
+    // behind an armed app would come along within minutes and deploy it again —
+    // restarting a running app to arrive where it already is.
+    //
+    // On failure too, and that is the argued half. It looks redundant: this
+    // operator is at a terminal, is being handed the reason in the response, and
+    // is not the audience `deploy_reason` was written for. But the row is not a
+    // message to them — it is what stops the deployment being *retried*, and an
+    // armed app has a worker that would find this same revision built,
+    // undeployed and newest, and take the app down with the exact failure a
+    // person just watched. Leaving the column clear would mean a manual attempt
+    // and an automatic one disagreeing about whether a revision has had its go.
+    // The cost of writing it is that `spaceport apps deploy --revision` is the
+    // way back to a revision recorded as failed, which is a command an operator
+    // can type; the cost of not writing it is an outage on a timer.
+    match &outcome {
+        Ok(_) => {
+            if let Err(error) = builds.deployed(&id, &build.revision).await {
+                warn!(app = %id, %error, "could not record a deployment that worked");
+            }
+        }
+        Err(error) => {
+            if let Err(error) = builds
+                .deploy_failed(&id, &build.revision, &error.to_string())
+                .await
+            {
+                warn!(app = %id, %error, "could not record a deployment that failed");
+            }
+        }
+    }
+
+    match outcome {
         Ok(Applied::Running(app)) => {
             let hosts: Vec<&str> = app.hosts().iter().map(|host| host.as_str()).collect();
             let body = format!(
@@ -1769,10 +1873,18 @@ const DEFAULT_MANIFEST_PATH: &str = "spaceport.yaml";
 /// down beside a tracking, and a repository whose last push is older than the
 /// tracking would otherwise wait for a push that may never come.
 ///
-/// None of it is deployed by anything: what a build produces is an image, and
-/// running it is `spaceport apps deploy`, which is a decision an operator takes.
-/// The response says so, because an operator who has just pointed an app at a
-/// branch would otherwise sit waiting for a deployment that is not coming.
+/// What becomes of those builds is `deploy`'s to say. Without it, none of them
+/// is deployed by anything: what a build produces is an image, and running it is
+/// `spaceport apps deploy`, which is a decision an operator takes. With it, a
+/// build that succeeds is run as soon as it exists, this one included. The
+/// response says which of the two the app is now in, because an operator who has
+/// just pointed an app at a branch would otherwise sit waiting for a deployment
+/// that is not coming — or not be waiting for one that is.
+///
+/// `deploy` is optional, and the missing case is the interesting one: it means
+/// the request did not raise the subject, so whatever the app was set to stays
+/// as it was. See [`TrackingRepository::record`], which is where that is
+/// enforced. Correcting a manifest path is not a request to stop deploying.
 ///
 /// The app does not have to have been applied first. Applying and tracking are
 /// the two ways an app comes to exist: one hands spaceport a manifest, the other
@@ -1909,19 +2021,45 @@ async fn track(
         Err(error) => return refuse(StatusCode::BAD_GATEWAY, &format!("{error:#}")),
     };
 
+    // Read before the row is rewritten, because the answer to "is this app
+    // armed now?" is the operator's request where they made one and the old row
+    // where they did not — which is exactly what `record` does to the column,
+    // said here so the response can be written from it. Reading it back
+    // afterwards would be a second query for a fact already in hand, and a read
+    // that failed would leave the response with nothing to say. A read that
+    // fails here is taken as unarmed, which is the state the response makes the
+    // smaller promise about.
+    let armed = match query.deploy {
+        Some(deploy) => deploy,
+        None => tracking
+            .by_app(&id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|recorded| recorded.automatic),
+    };
+
     if let Err(error) = tracking
-        .record(&Tracking {
-            app: id.clone(),
-            github_app_id: connection.app_id,
-            repository: repository.clone(),
-            branch: branch.clone(),
-            manifest_path: manifest_path.clone(),
-            // Stamped by the store as it writes the row, so what is recorded is
-            // when it was recorded.
-            tracked_at: String::new(),
-            revision: None,
-            revision_seen_at: None,
-        })
+        .record(
+            &Tracking {
+                app: id.clone(),
+                github_app_id: connection.app_id,
+                repository: repository.clone(),
+                branch: branch.clone(),
+                manifest_path: manifest_path.clone(),
+                // Stamped by the store as it writes the row, so what is recorded is
+                // when it was recorded.
+                tracked_at: String::new(),
+                revision: None,
+                revision_seen_at: None,
+                // Ignored by the store, which takes the switch from the
+                // argument beside this one so that "not mentioned" can be said
+                // at all. Written as the state the request settled on, so the
+                // struct is not a lie for the length of the call.
+                automatic: armed,
+            },
+            query.deploy,
+        )
         .await
     {
         return refuse(
@@ -1949,19 +2087,37 @@ async fn track(
 
     let head = abbreviated(&head);
 
-    // What the last lines say turns on whether there is anything to deploy to.
-    // A read that fails is taken as the app having a manifest, because that is
-    // the case the sentence is vaguest about and so the safer one to be wrong
-    // in: it promises nothing that is not true of both.
-    let last = if holds(&instance, &id).await.unwrap_or(true) {
-        format!(
-            "  `{branch}` is at {head}, which is being built now, and every push to it is built from here on\n  what comes out is deployed by nothing — run it with `spaceport apps deploy {id}`\n"
-        )
-    } else {
-        format!(
-            "  nothing has been applied under `{id}`, so spaceport knows where its code is and has nothing to run\n  `{branch}` is at {head}, which is being built now, and every push to it is built from here on\n  `spaceport apps deploy {id}` then runs what came out, manifest and all\n"
-        )
+    // What the last lines say turns on two things: whether there is anything to
+    // deploy to, and whether the operator armed the app. A read that fails is
+    // taken as the app having a manifest, because that is the case the sentence
+    // is vaguest about and so the safer one to be wrong in: it promises nothing
+    // that is not true of both.
+    let applied = holds(&instance, &id).await.unwrap_or(true);
+    let nothing_applied = match applied {
+        true => String::new(),
+        false => format!(
+            "  nothing has been applied under `{id}`, so spaceport knows where its code is and has nothing to run\n"
+        ),
     };
+    // Said before the deployment line either way, because the build is what
+    // happens first and the sentence after it is about what becomes of it.
+    let building = format!(
+        "  `{branch}` is at {head}, which is being built now, and every push to it is built from here on\n"
+    );
+    // The head is already on its way through the builder, so an armed app is
+    // told about *this* build rather than about the pushes to come: what the
+    // operator is about to watch is a deployment nobody is going to ask for.
+    let deployment = match (armed, applied) {
+        (true, true) => "  what comes out is deployed without being asked, this build and every one after it\n".to_owned(),
+        (true, false) => "  what comes out is deployed without being asked, manifest and all, so this build is what starts the app\n".to_owned(),
+        (false, true) => format!(
+            "  what comes out is deployed by nothing — run it with `spaceport apps deploy {id}`\n"
+        ),
+        (false, false) => format!(
+            "  `spaceport apps deploy {id}` then runs what came out, manifest and all\n"
+        ),
+    };
+    let last = format!("{nothing_applied}{building}{deployment}");
 
     let body = format!(
         "app `{id}` tracks {repository}\n  branch     {branch}\n  manifest   {manifest_path}\n  connection {}\n{last}",
@@ -2109,6 +2265,13 @@ struct TrackQuery {
     connection: String,
     branch: Option<String>,
     manifest_path: Option<String>,
+    /// Whether a build that succeeds is run without being asked, if the request
+    /// says anything about it at all.
+    ///
+    /// Absent is not `false`. It is the request declining to answer, and it
+    /// leaves an armed app armed — which is why this is an `Option` all the way
+    /// down to [`TrackingRepository::record`] rather than being defaulted here.
+    deploy: Option<bool>,
 }
 
 /// Where GitHub takes an operator to install an app on an account.
@@ -4498,6 +4661,130 @@ container:
         assert!(!shown.contains(" on main"), "{shown}");
     }
 
+    /// Whether a build reaches production on its own is the question an
+    /// operator is really asking when they track something, so the answer to
+    /// it is in the same breath as the branch.
+    #[tokio::test]
+    async fn tracking_with_the_deploy_flag_arms_the_app_and_says_so() {
+        let (router, _, tracking, _, _) = tracking_parts().await;
+
+        let (status, body) = track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main&deploy=true",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            tracking
+                .by_app(&"site".parse().unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .automatic
+        );
+        // The head is already on its way through the builder, so what the
+        // operator is about to watch is this build being deployed.
+        assert!(body.contains("being built now"), "{body}");
+        assert!(
+            body.contains("deployed without being asked, this build and every one after it"),
+            "{body}"
+        );
+        assert!(!body.contains("deployed by nothing"), "{body}");
+    }
+
+    /// An app with no manifest here is one an armed tracking *starts*, and the
+    /// answer says so rather than naming a command nobody has to run.
+    #[tokio::test]
+    async fn arming_an_app_nobody_applied_says_the_build_is_what_starts_it() {
+        let (router, _) = tracking_router().await;
+
+        let (status, body) = track_app(
+            &router,
+            "echo",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main&deploy=true",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("nothing has been applied under `echo`"),
+            "{body}"
+        );
+        assert!(
+            body.contains("manifest and all, so this build is what starts the app"),
+            "{body}"
+        );
+        assert!(!body.contains("spaceport apps deploy echo"), "{body}");
+    }
+
+    /// The whole reason the switch travels as an option. Correcting a manifest
+    /// path is not a request to stop deploying, and an app that quietly stopped
+    /// would stay stopped until a commit that was supposed to go out did not.
+    #[tokio::test]
+    async fn re_tracking_without_mentioning_deployment_leaves_an_armed_app_armed() {
+        let (router, _, tracking, _, _) = tracking_parts().await;
+        track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main&deploy=true",
+        )
+        .await;
+
+        let (status, body) = track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main&manifest_path=apps/site/spaceport.yaml",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            tracking
+                .by_app(&"site".parse().unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .automatic
+        );
+        // And the answer to a request that said nothing about it still says
+        // what is true, which is that the app deploys itself.
+        assert!(body.contains("deployed without being asked"), "{body}");
+    }
+
+    /// There is no `spaceport apps autodeploy`, so re-tracking with the
+    /// negative flag is the only way back — and it has to actually work.
+    #[tokio::test]
+    async fn re_tracking_with_the_negative_flag_disarms_the_app() {
+        let (router, _, tracking, _, _) = tracking_parts().await;
+        track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main&deploy=true",
+        )
+        .await;
+
+        let (status, body) = track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main&deploy=false",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !tracking
+                .by_app(&"site".parse().unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .automatic
+        );
+        assert!(body.contains("deployed by nothing"), "{body}");
+        assert!(body.contains("spaceport apps deploy site"), "{body}");
+    }
+
     /// The report is where an operator finds out what a push to this app would
     /// be about, and the connection is named by the slug every command takes.
     #[tokio::test]
@@ -4523,6 +4810,31 @@ container:
         // Tracking resolved the branch's head, so there is a revision from the
         // moment the tracking was made rather than only after a push.
         assert!(body.contains(&format!("last saw {HEAD}")), "{body}");
+    }
+
+    /// "When I push this, what happens?" is the question the stanza exists to
+    /// answer, and both answers are worth a line: an operator reading nothing
+    /// would have to go and find out which of the two they had.
+    #[tokio::test]
+    async fn shows_whether_an_app_deploys_its_own_builds() {
+        let (router, _) = tracking_router().await;
+        let base = "?repository=an-organisation/site&connection=spaceport-acme&branch=main";
+        track_app(&router, "site", base).await;
+
+        let (_, by_hand) = show_app(&router, "site", "").await;
+        assert!(by_hand.contains("deploys nothing on its own"), "{by_hand}");
+        assert!(
+            by_hand.contains("waits for `spaceport apps deploy`"),
+            "{by_hand}"
+        );
+
+        track_app(&router, "site", &format!("{base}&deploy=true")).await;
+
+        let (status, armed) = show_app(&router, "site", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(armed.contains("deploys its own builds"), "{armed}");
+        assert!(armed.contains("without being asked"), "{armed}");
+        assert!(!armed.contains("deploys nothing on its own"), "{armed}");
     }
 
     /// Most apps are an image somebody applied, and a line telling them they
@@ -4554,6 +4866,8 @@ container:
             started_at: String::new(),
             finished_at: None,
             manifest: None,
+            deployed_at: None,
+            deploy_reason: None,
         }
     }
 
@@ -4980,6 +5294,128 @@ container:
             "{waiting}"
         );
         assert!(waiting.contains("spaceport apps deploy echo"), "{waiting}");
+    }
+
+    /// A build that succeeded and a deployment that failed are two different
+    /// sentences, and until now only the first had anywhere to appear: the
+    /// image exists, the app is on the commit before, and nothing said why.
+    #[tokio::test]
+    async fn shows_a_deployment_that_failed_with_its_reason() {
+        let (_, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
+        connected_and_reaching(&router, &connections).await;
+        tracked_app(&router, "echo").await;
+        build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
+        deploy_app(&router, "echo", "").await;
+        build_succeeded(&builds, "echo", "89abcde", FROM_A_BUILD).await;
+        builds
+            .deploy_failed(
+                &"echo".parse().unwrap(),
+                "89abcde",
+                "the container stopped before it answered",
+            )
+            .await
+            .unwrap();
+
+        let (status, body) = show_app(&router, "echo", "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        // The build worked, and is still reported as having worked.
+        assert!(body.contains("build      built at 89abcde"), "{body}");
+        // What is running is what was running before it.
+        assert!(body.contains("deployed   0123abc"), "{body}");
+        assert!(
+            body.contains("deploying 89abcde failed: the container stopped before it answered"),
+            "{body}"
+        );
+        // And the way out, since nothing will try this revision again.
+        assert!(
+            body.contains("spaceport apps deploy echo --revision 89abcde"),
+            "{body}"
+        );
+    }
+
+    /// Under automatic deployment a newer build still waiting is a symptom
+    /// rather than the ordinary state, so the sentence about it stops telling
+    /// an operator to race the worker for it.
+    #[tokio::test]
+    async fn a_waiting_build_reads_differently_for_an_app_that_deploys_itself() {
+        let (_, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
+        connected_and_reaching(&router, &connections).await;
+        track_app(
+            &router,
+            "echo",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main&deploy=true",
+        )
+        .await;
+        build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
+
+        let (status, body) = show_app(&router, "echo", "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("nothing built here is running — 0123abc is waiting"),
+            "{body}"
+        );
+        assert!(body.contains("which this app deploys on its own"), "{body}");
+        assert!(!body.contains("spaceport apps deploy echo`"), "{body}");
+    }
+
+    /// An operator's deploy and an armed app's are the same event to the row
+    /// that records one: without this, the worker would find the revision
+    /// undeployed and restart a running app to arrive where it already is.
+    #[tokio::test]
+    async fn deploying_by_hand_marks_the_revision_deployed() {
+        let (_, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
+        connected_and_reaching(&router, &connections).await;
+        tracked_app(&router, "echo").await;
+        build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
+
+        let (status, _) = deploy_app(&router, "echo", "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        let read = builds
+            .built(&"echo".parse().unwrap(), "0123abc")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            read.deployed_at.as_deref().unwrap().ends_with('Z'),
+            "{read:?}"
+        );
+        // Nothing failed, so there is no reason recorded beside it.
+        assert_eq!(read.deploy_reason, None);
+        assert!(!read.awaits_deployment());
+    }
+
+    /// The argued half: the operator is watching and is being told anyway, but
+    /// the row is what stops an armed app's worker taking production down with
+    /// the very failure a person has just read.
+    #[tokio::test]
+    async fn a_deploy_that_fails_by_hand_is_not_left_for_a_worker_to_repeat() {
+        let (_, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
+        connected_and_reaching(&router, &connections).await;
+        tracked_app(&router, "echo").await;
+        build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
+        // Somebody else is already on the host this app's manifest claims.
+        put_app(&router, "occupant", &manifest_for("gamma.test")).await;
+
+        let (status, body) = deploy_app(&router, "echo", "").await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.contains("already claimed by app `occupant`"), "{body}");
+        let read = builds
+            .built(&"echo".parse().unwrap(), "0123abc")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            read.deploy_reason
+                .as_deref()
+                .unwrap()
+                .contains("already claimed"),
+            "{read:?}"
+        );
+        assert!(!read.awaits_deployment());
     }
 
     /// An app that is only tracked and has an image waiting is one command away

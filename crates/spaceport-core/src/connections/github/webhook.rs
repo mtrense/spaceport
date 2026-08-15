@@ -685,16 +685,20 @@ mod tests {
     async fn a_push_to_a_tracked_branch_records_the_head_it_moved_to() {
         let (connections, tracking) = connected().await;
         tracking
-            .record(&Tracking {
-                app: "site".parse().unwrap(),
-                github_app_id: APP_ID,
-                repository: "an-organisation/site".to_owned(),
-                branch: "main".to_owned(),
-                manifest_path: "spaceport.yaml".to_owned(),
-                tracked_at: String::new(),
-                revision: None,
-                revision_seen_at: None,
-            })
+            .record(
+                &Tracking {
+                    app: "site".parse().unwrap(),
+                    github_app_id: APP_ID,
+                    repository: "an-organisation/site".to_owned(),
+                    branch: "main".to_owned(),
+                    manifest_path: "spaceport.yaml".to_owned(),
+                    tracked_at: String::new(),
+                    revision: None,
+                    revision_seen_at: None,
+                    automatic: false,
+                },
+                None,
+            )
             .await
             .unwrap();
 
@@ -767,16 +771,20 @@ mod tests {
     async fn a_push_to_a_tracked_branch_wakes_the_builder_and_not_the_reconciler() {
         let (connections, tracking) = connected().await;
         tracking
-            .record(&Tracking {
-                app: "site".parse().unwrap(),
-                github_app_id: APP_ID,
-                repository: "an-organisation/site".to_owned(),
-                branch: "main".to_owned(),
-                manifest_path: "spaceport.yaml".to_owned(),
-                tracked_at: String::new(),
-                revision: None,
-                revision_seen_at: None,
-            })
+            .record(
+                &Tracking {
+                    app: "site".parse().unwrap(),
+                    github_app_id: APP_ID,
+                    repository: "an-organisation/site".to_owned(),
+                    branch: "main".to_owned(),
+                    manifest_path: "spaceport.yaml".to_owned(),
+                    tracked_at: String::new(),
+                    revision: None,
+                    revision_seen_at: None,
+                    automatic: false,
+                },
+                None,
+            )
             .await
             .unwrap();
         let nudge = Nudge::new();

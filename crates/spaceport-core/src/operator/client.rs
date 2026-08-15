@@ -102,6 +102,14 @@ pub async fn resume(endpoint: &OperatorEndpoint, id: &AppId) -> Result<String> {
 /// is and records the commit — so what comes back names a build that has been
 /// asked for, not only the pushes to come.
 ///
+/// `deploy` is three answers and not two. `Some` arms or disarms the app, so
+/// that a build which succeeds is run without anybody asking, or is not; `None`
+/// is a caller who has not raised the subject, and leaves the app exactly as
+/// armed as it already was. That is why it goes into the query string only when
+/// it is `Some`: an absent parameter is what the far end reads as "not
+/// mentioned", and sending `deploy=false` for a re-track that only corrected a
+/// manifest path would quietly stop an app deploying itself.
+///
 /// The values go into the query string as they are, which is what every other
 /// call here does and is enough for these: a full name and a slug are github's
 /// own characters, a path is a path, and a branch may hold `/`, which a query
@@ -117,6 +125,7 @@ pub async fn track(
     connection: &str,
     branch: Option<&str>,
     manifest_path: Option<&str>,
+    deploy: Option<bool>,
 ) -> Result<String> {
     let mut uri = format!("/apps/{id}/tracking?repository={repository}&connection={connection}");
     if let Some(branch) = branch {
@@ -124,6 +133,9 @@ pub async fn track(
     }
     if let Some(manifest_path) = manifest_path {
         let _ = write!(uri, "&manifest_path={manifest_path}");
+    }
+    if let Some(deploy) = deploy {
+        let _ = write!(uri, "&deploy={deploy}");
     }
 
     send_to(endpoint, builder("PUT", &uri).body(Full::default())?).await
