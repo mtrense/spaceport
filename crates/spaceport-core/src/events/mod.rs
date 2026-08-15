@@ -147,6 +147,7 @@ const CATEGORIES: &[(&str, &str)] = &[
     ("spaceport_core::edge::tls", "tls"),
     ("spaceport_core::acme::resolver", "tls"),
     ("spaceport_core::acme", "acme"),
+    ("spaceport_core::connections", "connection"),
     ("spaceport_core::edge", "edge"),
     ("spaceport_core::operator", "operator"),
     ("spaceport_core::state", "state"),
@@ -292,6 +293,21 @@ mod tests {
         assert_eq!(
             Category::for_target("spaceport_core::acme").as_str(),
             "acme"
+        );
+    }
+
+    /// A spaceport's own registration with a forge is its own kind of thing,
+    /// and an operator watching one wants neither the app stream nor the whole
+    /// firehose.
+    #[test]
+    fn categorises_what_a_connection_does() {
+        assert_eq!(
+            Category::for_target("spaceport_core::connections").as_str(),
+            "connection"
+        );
+        assert_eq!(
+            Category::for_target("spaceport_core::connections::github::repository").as_str(),
+            "connection"
         );
     }
 

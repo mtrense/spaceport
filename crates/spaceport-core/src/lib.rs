@@ -3,6 +3,7 @@
 pub mod acme;
 pub mod app;
 pub mod config;
+pub mod connections;
 pub mod duration;
 pub mod edge;
 pub mod events;

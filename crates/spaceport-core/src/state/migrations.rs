@@ -60,6 +60,68 @@ const MIGRATIONS: &[&str] = &[
     // engine's to answer, and asking it is the only way to get an answer that
     // is still true after somebody used `docker` by hand.
     "ALTER TABLE apps ADD COLUMN suspended INTEGER NOT NULL DEFAULT 0;",
+    // 4 — the GitHub Apps a spaceport has registered for itself, and what it
+    // has since learned about where they are installed.
+    //
+    // A connection is keyed by slug because that is the name an operator reads
+    // on GitHub and types on the command line. `app_id` is unique as well,
+    // because it is what a webhook header carries and what an installation
+    // token is minted against — both are legitimate ways in, so both are
+    // indexed rather than one being derived from the other at read time.
+    //
+    // The four secrets sit in plain columns, exactly as `acme_accounts`
+    // .credentials does: the protection is a `0700` directory and a `0600`
+    // file. Encrypting them here would only move the question to where the
+    // key that decrypts them lives, and on a single host that key would end up
+    // in the same directory.
+    //
+    // Installations and repositories are a cache of what GitHub says, not a
+    // record of what an operator wants. Reconciliation discovers them,
+    // refreshes them and drops them, and losing the lot costs exactly one
+    // pass. They are written down anyway so that a spaceport which has just
+    // restarted does not look like one that has never heard of anything.
+    //
+    // There is deliberately no foreign key from `github_installations.app_id`
+    // to `github_apps.app_id`. Forgetting a connection deletes its rows
+    // explicitly, which is the honest place for that knowledge, and a
+    // constraint would turn a reconciliation interrupted half way into a
+    // failed one rather than a stale one.
+    //
+    // `github_deliveries` exists for one purpose: a delivery GitHub sends
+    // twice must be acted on once. Rows are pruned by age, so it is a window
+    // on recent deliveries rather than a log of every one.
+    "CREATE TABLE github_apps (
+        slug           TEXT    PRIMARY KEY,
+        app_id         INTEGER NOT NULL UNIQUE,
+        name           TEXT    NOT NULL,
+        owner          TEXT    NOT NULL,
+        client_id      TEXT    NOT NULL,
+        client_secret  TEXT    NOT NULL,
+        webhook_secret TEXT    NOT NULL,
+        private_key    TEXT    NOT NULL,
+        connected_at   TEXT    NOT NULL
+    ) STRICT;
+    CREATE TABLE github_installations (
+        app_id          INTEGER NOT NULL,
+        installation_id INTEGER NOT NULL,
+        account         TEXT    NOT NULL,
+        account_type    TEXT    NOT NULL,
+        seen_at         TEXT    NOT NULL,
+        PRIMARY KEY (app_id, installation_id)
+    ) STRICT;
+    CREATE TABLE github_repositories (
+        app_id          INTEGER NOT NULL,
+        installation_id INTEGER NOT NULL,
+        full_name       TEXT    NOT NULL,
+        seen_at         TEXT    NOT NULL,
+        PRIMARY KEY (app_id, installation_id, full_name)
+    ) STRICT;
+    CREATE TABLE github_deliveries (
+        delivery_id TEXT    PRIMARY KEY,
+        app_id      INTEGER NOT NULL,
+        event       TEXT    NOT NULL,
+        received_at TEXT    NOT NULL
+    ) STRICT;",
 ];
 
 /// The schema version this build writes.
@@ -182,6 +244,45 @@ mod tests {
         assert_eq!(
             columns(&connection, "certificates"),
             ["host", "chain", "private_key", "issued_at"]
+        );
+    }
+
+    #[test]
+    fn the_fourth_migration_creates_the_connection_tables() {
+        let connection = empty();
+        migrate(&connection).unwrap();
+
+        assert_eq!(
+            columns(&connection, "github_apps"),
+            [
+                "slug",
+                "app_id",
+                "name",
+                "owner",
+                "client_id",
+                "client_secret",
+                "webhook_secret",
+                "private_key",
+                "connected_at"
+            ]
+        );
+        assert_eq!(
+            columns(&connection, "github_installations"),
+            [
+                "app_id",
+                "installation_id",
+                "account",
+                "account_type",
+                "seen_at"
+            ]
+        );
+        assert_eq!(
+            columns(&connection, "github_repositories"),
+            ["app_id", "installation_id", "full_name", "seen_at"]
+        );
+        assert_eq!(
+            columns(&connection, "github_deliveries"),
+            ["delivery_id", "app_id", "event", "received_at"]
         );
     }
 
