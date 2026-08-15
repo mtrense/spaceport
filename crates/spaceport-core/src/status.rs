@@ -24,6 +24,7 @@ use crate::acme::{CertificateRepository, Certificates};
 use crate::app::reconcile::Report;
 use crate::app::{AppId, Applier, health};
 use crate::config::{Config, TlsProvider};
+use crate::connections::github::ConnectionRepository;
 use crate::operator::OperatorEndpoint;
 use crate::state::Db;
 
@@ -46,6 +47,10 @@ pub struct Instance {
     pub operator: OperatorEndpoint,
     pub applier: Arc<Applier>,
     pub db: Db,
+    /// The GitHub Apps this spaceport has registered as itself. Held here
+    /// rather than made on demand so that every handler which needs one gets
+    /// the same one, over the same database.
+    pub connections: Arc<ConnectionRepository>,
     /// Absent when tls is self-signed: then nothing ever orders a certificate.
     pub certificates: Option<Arc<Certificates>>,
     /// What the reconciliation at startup did. Kept because it is the only
@@ -94,6 +99,11 @@ impl Instance {
                 failed: self.reconciled.failed.len(),
                 swept: self.reconciled.swept,
             },
+            // A count and no more: which apps they are is `spaceport connect
+            // list`, and a status that named them would be repeating it.
+            // Unreadable connections count as none rather than failing the
+            // report, which is what every other part of this does.
+            connections: self.connections.all().await.map_or(0, |all| all.len()),
         }
     }
 
@@ -303,6 +313,12 @@ pub struct Status {
     pub apps: Apps,
     pub certificates: CertificateStatus,
     pub reconcile: Reconcile,
+    /// How many GitHub Apps this spaceport is connected as.
+    ///
+    /// Defaulted rather than required, so a status from a spaceport that
+    /// predates connections still reads.
+    #[serde(default)]
+    pub connections: usize,
 }
 
 /// Where spaceport keeps what it must not forget.
@@ -496,6 +512,7 @@ container:
             config: Config::parse(CONFIG).unwrap(),
             operator: "/run/spaceport.sock".parse().unwrap(),
             applier,
+            connections: Arc::new(ConnectionRepository::new(db.clone())),
             db,
             certificates: None,
             reconciled,
@@ -612,5 +629,33 @@ container:
 
         assert_eq!(status.certificates.held, 0);
         assert!(status.certificates.uncertified.is_empty());
+    }
+
+    /// A spaceport is connected as nothing until somebody connects it, and the
+    /// count is what says which of the two it is.
+    #[tokio::test]
+    async fn counts_the_github_apps_this_spaceport_is_connected_as() {
+        let (db, applier) = empty();
+        let instance = instance(db, applier, Report::default());
+        assert_eq!(instance.snapshot().await.connections, 0);
+
+        crate::connections::github::connect(
+            &instance.connections,
+            serde_json::from_value(serde_json::json!({
+                "slug": "spaceport-acme",
+                "app_id": 42,
+                "name": "Spaceport for Acme",
+                "owner": "an-organisation",
+                "client_id": "Iv1.0123456789abcdef",
+                "client_secret": "a-client-secret",
+                "webhook_secret": "a-webhook-secret",
+                "private_key": crate::connections::github::key::testing::PKCS1,
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(instance.snapshot().await.connections, 1);
     }
 }

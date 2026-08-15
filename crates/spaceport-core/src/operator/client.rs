@@ -14,6 +14,7 @@ use http::{Request, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
+use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
 
@@ -111,6 +112,68 @@ pub async fn destroy(endpoint: &OperatorEndpoint, id: &AppId) -> Result<String> 
     let request = builder("DELETE", &format!("/apps/{id}")).body(Full::default())?;
 
     send_to(endpoint, request).await
+}
+
+/// Ask it to hold a GitHub App an operator registered by hand.
+///
+/// The registration is sent as JSON rather than as a document, because it is a
+/// handful of typed fields and three of them are secrets that should not have
+/// to touch a file on the way.
+pub async fn connect_github(
+    endpoint: &OperatorEndpoint,
+    registration: &GithubRegistration,
+) -> Result<String> {
+    let body = serde_json::to_vec(registration).context("writing the github app registration")?;
+    let request = builder("POST", "/connections/github")
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(body)))?;
+
+    send_to(endpoint, request).await
+}
+
+/// Ask for the connections it holds.
+pub async fn connections(endpoint: &OperatorEndpoint) -> Result<String> {
+    send_to(
+        endpoint,
+        builder("GET", "/connections").body(Full::default())?,
+    )
+    .await
+}
+
+/// Ask for everything it knows about the connection named `slug`.
+pub async fn connection(endpoint: &OperatorEndpoint, slug: &str) -> Result<String> {
+    let request = builder("GET", &format!("/connections/{slug}")).body(Full::default())?;
+
+    send_to(endpoint, request).await
+}
+
+/// Ask it to forget the connection named `slug`, and everything cached under
+/// it.
+pub async fn forget_connection(endpoint: &OperatorEndpoint, slug: &str) -> Result<String> {
+    let request = builder("DELETE", &format!("/connections/{slug}")).body(Full::default())?;
+
+    send_to(endpoint, request).await
+}
+
+/// A GitHub App registration on its way to a spaceport.
+///
+/// A type of this side's own rather than
+/// [`crate::connections::github::Registration`], because that one deliberately
+/// cannot be serialised: its secrets are [`crate::connections::Secret`]s, and
+/// the whole point of that type is that nothing writes one out by accident.
+/// Writing one out is exactly what this does, so it says so.
+#[derive(Debug, Clone, Serialize)]
+pub struct GithubRegistration {
+    pub slug: String,
+    pub app_id: i64,
+    pub name: String,
+    pub owner: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub webhook_secret: String,
+    /// The contents of the `.pem` file, not a path to it: the spaceport being
+    /// talked to may be on another host entirely.
+    pub private_key: String,
 }
 
 /// Which events `stream` asks for.

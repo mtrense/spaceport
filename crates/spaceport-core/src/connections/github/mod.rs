@@ -8,13 +8,17 @@
 //! the repositories they chose — which is what an operator means when they say
 //! a spaceport should be able to see their code.
 //!
-//! What lives here for now is the persistence: the connection an operator
+//! What lives here for now is the persistence — the connection an operator
 //! registered, the installations reconciliation has discovered, and the recent
-//! webhook deliveries that let a redelivery be recognised as one. Registering
-//! the App, minting installation tokens, verifying signatures and serving the
-//! webhook route are each their own module, and each arrives with the step that
-//! needs it.
+//! webhook deliveries that let a redelivery be recognised as one — together
+//! with registering an App an operator created by hand and reading the key it
+//! signs with. Minting installation tokens, verifying signatures and serving
+//! the webhook route are each their own module, and each arrives with the step
+//! that needs it.
 
+pub mod key;
+pub mod register;
 pub mod repository;
 
+pub use register::{Registration, connect};
 pub use repository::{Connection, ConnectionRepository, Installation};

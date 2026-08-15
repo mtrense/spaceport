@@ -13,6 +13,7 @@ use spaceport_core::app::{
     AppId, AppRepository, AppStore, Applier, DataDir, Pattern, reconcile, supervise,
 };
 use spaceport_core::config::TlsProvider;
+use spaceport_core::connections::github::ConnectionRepository;
 use spaceport_core::events::{self, Category, Event, EventBus, Level};
 use spaceport_core::operator::client::Watch;
 use spaceport_core::operator::{DEFAULT_OPERATOR_ENDPOINT, client, server};
@@ -66,6 +67,11 @@ enum Command {
     Apps {
         #[command(subcommand)]
         command: AppsCommand,
+    },
+    /// Manage what a running spaceport is registered as, out on the internet.
+    Connect {
+        #[command(subcommand)]
+        command: ConnectCommand,
     },
     /// Watch what a running spaceport is doing, as it does it.
     Stream(StreamArgs),
@@ -121,6 +127,102 @@ enum AppsCommand {
     Resume(ResumeArgs),
     /// Stop an app and remove it.
     Destroy(DestroyArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ConnectCommand {
+    /// Hold a GitHub App as this spaceport's own identity on github.com.
+    Github(ConnectGithubArgs),
+    /// List the GitHub Apps spaceport is connected as.
+    List(ConnectListArgs),
+    /// Report everything spaceport knows about one connection.
+    Show(ConnectShowArgs),
+    /// Forget a connection, and everything cached under it.
+    Forget(ConnectForgetArgs),
+}
+
+#[derive(Debug, Args)]
+struct ConnectGithubArgs {
+    /// Register an app that was created by hand on github.com, with the
+    /// details from its settings page.
+    ///
+    /// Required for now. Without it there is nothing to register from: the
+    /// flow that has GitHub create the app is not implemented yet.
+    #[arg(long)]
+    manual: bool,
+
+    /// The `App ID` on the app's settings page.
+    #[arg(long, value_name = "ID")]
+    app_id: Option<i64>,
+
+    /// The name in the app's url on github.com, which is what spaceport knows
+    /// it by from here on.
+    #[arg(long)]
+    slug: Option<String>,
+
+    /// The app's display name.
+    #[arg(long)]
+    name: Option<String>,
+
+    /// The user or organisation the app belongs to.
+    #[arg(long)]
+    owner: Option<String>,
+
+    /// The `Client ID` on the app's settings page.
+    #[arg(long, value_name = "ID")]
+    client_id: Option<String>,
+
+    /// A client secret generated on the app's settings page.
+    ///
+    /// The environment variable is there so a secret does not end up in shell
+    /// history, which is a file that outlives the terminal and is rarely
+    /// treated as one that holds credentials.
+    #[arg(long, value_name = "SECRET", env = "SPACEPORT_GITHUB_CLIENT_SECRET")]
+    client_secret: Option<String>,
+
+    /// The webhook secret set on the app's settings page.
+    ///
+    /// The environment variable exists for the same reason as
+    /// `--client-secret`'s: a value pasted on a command line is written to
+    /// shell history and stays there.
+    #[arg(long, value_name = "SECRET", env = "SPACEPORT_GITHUB_WEBHOOK_SECRET")]
+    webhook_secret: Option<String>,
+
+    /// Path to the `.pem` file GitHub downloaded when the private key was
+    /// generated.
+    ///
+    /// A path rather than the key itself, because a path is what an operator
+    /// has after clicking "generate a private key" — the file is in their
+    /// downloads and nobody wants to paste it.
+    #[arg(long, value_name = "FILE", env = "SPACEPORT_GITHUB_PRIVATE_KEY")]
+    private_key: Option<PathBuf>,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
+struct ConnectListArgs {
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
+struct ConnectShowArgs {
+    /// The slug of the connection to report on.
+    slug: String,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
+struct ConnectForgetArgs {
+    /// The slug of the connection to forget.
+    slug: String,
+
+    #[command(flatten)]
+    server: ServerArgs,
 }
 
 #[derive(Debug, Args)]
@@ -293,6 +395,12 @@ async fn main() -> Result<()> {
             AppsCommand::Resume(args) => resume(args).await,
             AppsCommand::Destroy(args) => destroy(args).await,
         },
+        Command::Connect { command } => match command {
+            ConnectCommand::Github(args) => connect_github(args).await,
+            ConnectCommand::List(args) => connections(args).await,
+            ConnectCommand::Show(args) => connection(args).await,
+            ConnectCommand::Forget(args) => forget_connection(args).await,
+        },
         Command::Stream(args) => stream(args).await,
         Command::Status(args) => status(args).await,
     }
@@ -438,6 +546,7 @@ async fn run(args: RunArgs) -> Result<()> {
             config: config.clone(),
             operator: endpoint.clone(),
             applier,
+            connections: Arc::new(ConnectionRepository::new(db.clone())),
             db,
             certificates: certificates.clone(),
             reconciled: report,
@@ -570,6 +679,74 @@ async fn stream(args: StreamArgs) -> Result<()> {
         result = client::stream(&args.server.server, &watch, print) => result,
         _ = tokio::signal::ctrl_c() => Ok(()),
     }
+}
+
+/// Hand a running spaceport a GitHub App an operator created by hand.
+///
+/// The private key is read here rather than sent as a path: the spaceport being
+/// talked to may be on another host, where the file an operator just downloaded
+/// does not exist.
+async fn connect_github(args: ConnectGithubArgs) -> Result<()> {
+    if !args.manual {
+        anyhow::bail!("`--auto` is not implemented yet; pass `--manual` with the app's details");
+    }
+
+    let private_key = required(args.private_key, "--private-key")?;
+    let registration = client::GithubRegistration {
+        slug: required(args.slug, "--slug")?,
+        app_id: required(args.app_id, "--app-id")?,
+        name: required(args.name, "--name")?,
+        owner: required(args.owner, "--owner")?,
+        client_id: required(args.client_id, "--client-id")?,
+        client_secret: required(args.client_secret, "--client-secret")?,
+        webhook_secret: required(args.webhook_secret, "--webhook-secret")?,
+        private_key: std::fs::read_to_string(&private_key).with_context(|| {
+            format!(
+                "reading the app's private key `{}` — it is the `.pem` github downloaded",
+                private_key.display()
+            )
+        })?,
+    };
+
+    print!(
+        "{}",
+        client::connect_github(&args.server.server, &registration).await?
+    );
+
+    Ok(())
+}
+
+/// The value of an option `--manual` cannot do without.
+///
+/// Optional to clap and required here, because what has to be given depends on
+/// which half of the flow was asked for — and a missing one is worth a sentence
+/// naming the flag rather than a panic.
+fn required<T>(value: Option<T>, flag: &str) -> Result<T> {
+    value.with_context(|| format!("`{flag}` is required with `--manual`"))
+}
+
+async fn connections(args: ConnectListArgs) -> Result<()> {
+    print!("{}", client::connections(&args.server.server).await?);
+
+    Ok(())
+}
+
+async fn connection(args: ConnectShowArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::connection(&args.server.server, &args.slug).await?
+    );
+
+    Ok(())
+}
+
+async fn forget_connection(args: ConnectForgetArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::forget_connection(&args.server.server, &args.slug).await?
+    );
+
+    Ok(())
 }
 
 async fn destroy(args: DestroyArgs) -> Result<()> {

@@ -28,6 +28,7 @@ use tracing::{info, warn};
 use super::OperatorEndpoint;
 use crate::app::apply::{Applied, Applier, ApplyError, DestroyError, ResumeError, SuspendError};
 use crate::app::{App, AppId, AppManifest, AppRepository, DataDir, Pattern, health};
+use crate::connections::github::{ConnectionRepository, Registration, register};
 use crate::events::{Event, EventBus, EventFilter, Level};
 use crate::runtime::Adopted;
 use crate::status::Instance;
@@ -121,6 +122,12 @@ fn router(instance: Arc<Instance>, events: Arc<EventBus>, shutdown: Cancellation
         .route("/apps/{id}", get(show).put(apply).delete(destroy))
         .route("/apps/{id}/suspend", post(suspend))
         .route("/apps/{id}/resume", post(resume))
+        .route("/connections", get(connections))
+        .route("/connections/github", post(connect_github))
+        .route(
+            "/connections/{slug}",
+            get(connection).delete(forget_connection),
+        )
         .route("/events", get(events_stream))
         .route("/status", get(status))
         .with_state(Operator {
@@ -149,6 +156,12 @@ impl FromRef<Operator> for Arc<Applier> {
 impl FromRef<Operator> for Arc<Instance> {
     fn from_ref(operator: &Operator) -> Self {
         operator.instance.clone()
+    }
+}
+
+impl FromRef<Operator> for Arc<ConnectionRepository> {
+    fn from_ref(operator: &Operator) -> Self {
+        operator.instance.connections.clone()
     }
 }
 
@@ -667,12 +680,12 @@ async fn statuses(apps: &[Arc<App>]) -> Vec<&'static str> {
 
 /// Render the apps as columns, wide enough for what is in them.
 fn table(apps: &[Listed]) -> String {
-    let rows: Vec<[String; 4]> = apps
+    let rows: Vec<Vec<String>> = apps
         .iter()
         .map(|app| {
             let hosts: Vec<&str> = app.hosts.iter().map(|host| host.as_str()).collect();
 
-            [
+            vec![
                 app.id.to_string(),
                 app.source.clone(),
                 app.status.to_owned(),
@@ -681,18 +694,23 @@ fn table(apps: &[Listed]) -> String {
         })
         .collect();
 
-    let headers = ["APP", "SOURCE", "STATUS", "HOSTS"];
-    let mut widths = headers.map(str::len);
-    for row in &rows {
+    columns(&["APP", "SOURCE", "STATUS", "HOSTS"], &rows)
+}
+
+/// A header row and its rows, each column as wide as the widest thing in it.
+fn columns(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let mut widths: Vec<usize> = headers.iter().map(|header| header.len()).collect();
+    for row in rows {
         for (width, cell) in widths.iter_mut().zip(row) {
             *width = (*width).max(cell.len());
         }
     }
 
+    let header: Vec<String> = headers.iter().map(|header| (*header).to_owned()).collect();
     let mut out = String::new();
-    for row in std::iter::once(headers.map(str::to_owned)).chain(rows) {
+    for row in std::iter::once(&header).chain(rows) {
         let mut line = String::new();
-        for (cell, width) in row.iter().zip(widths) {
+        for (cell, width) in row.iter().zip(&widths) {
             // The last column is not padded: trailing spaces would be the only
             // thing past the end of it.
             if !line.is_empty() {
@@ -885,6 +903,186 @@ async fn resume(State(applier): State<Arc<Applier>>, UrlPath(id): UrlPath<String
     }
 }
 
+/// Where GitHub takes an operator to install an app on an account.
+///
+/// GitHub's own path, spelled out here because a registered app that nobody has
+/// installed can see nothing at all — so the address is the next thing an
+/// operator needs, and having to go and find it is where the flow stalls.
+const INSTALL_URL: &str = "https://github.com/apps";
+
+/// `POST /connections/github` with a registration as the body: hold this
+/// GitHub App as one of spaceport's own.
+///
+/// The body is JSON rather than a manifest because it is a handful of fields an
+/// operator typed, three of which are secrets — and nothing about them wants to
+/// go through a file on disk.
+async fn connect_github(
+    State(connections): State<Arc<ConnectionRepository>>,
+    body: String,
+) -> Response {
+    let registration: Registration = match serde_json::from_str(&body) {
+        Ok(registration) => registration,
+        Err(error) => {
+            return refuse(
+                StatusCode::BAD_REQUEST,
+                &format!("that is not a github app registration: {error}"),
+            );
+        }
+    };
+
+    match register::connect(&connections, registration).await {
+        Ok(connection) => {
+            let body = format!(
+                "connected `{}` as github app {}, owned by {}\n  install it on an account at {INSTALL_URL}/{}/installations/new\n",
+                connection.slug, connection.app_id, connection.owner, connection.slug,
+            );
+
+            (StatusCode::OK, body).into_response()
+        }
+        // Everything `connect` refuses is something about the registration, and
+        // the message says which part of it.
+        Err(error) => refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    }
+}
+
+/// `GET /connections`: the github apps this spaceport is, one per line.
+///
+/// Never a secret, not even a redacted one: a listing is the response most
+/// likely to be pasted somewhere, and a column of `Secret(…)` would say nothing
+/// an operator did not already know.
+async fn connections(State(connections): State<Arc<ConnectionRepository>>) -> Response {
+    let held = match connections.all().await {
+        Ok(held) => held,
+        Err(error) => {
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not read the connections: {error:#}"),
+            );
+        }
+    };
+
+    if held.is_empty() {
+        return (
+            StatusCode::OK,
+            "no github apps are connected — connect one with `spaceport connect github --manual`\n",
+        )
+            .into_response();
+    }
+
+    let rows: Vec<Vec<String>> = held
+        .iter()
+        .map(|connection| {
+            vec![
+                connection.slug.clone(),
+                connection.app_id.to_string(),
+                connection.owner.clone(),
+                connection.connected_at.clone(),
+            ]
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        columns(&["SLUG", "APP ID", "OWNER", "CONNECTED"], &rows),
+    )
+        .into_response()
+}
+
+/// `GET /connections/{slug}`: everything spaceport knows about one connection.
+///
+/// The secrets are reported as being set and never as their values: that they
+/// are there at all is the question an operator has — the alternative is
+/// reading them back, and a command that prints a private key is one somebody
+/// will eventually run in front of a screen share.
+async fn connection(
+    State(connections): State<Arc<ConnectionRepository>>,
+    UrlPath(slug): UrlPath<String>,
+) -> Response {
+    let held = match connections.by_slug(&slug).await {
+        Ok(Some(held)) => held,
+        Ok(None) => return refuse(StatusCode::NOT_FOUND, &unconnected(&slug)),
+        Err(error) => {
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not read the connection `{slug}`: {error:#}"),
+            );
+        }
+    };
+
+    let mut out = Report::default();
+    out.field("app", held.slug.clone());
+    out.field("name", held.name.clone());
+    out.field("app id", held.app_id.to_string());
+    out.field("owner", held.owner.clone());
+    out.field("client id", held.client_id.clone());
+    out.field("connected", held.connected_at.clone());
+    out.field(
+        "secrets",
+        "client secret, webhook secret, private key (not shown)".to_owned(),
+    );
+
+    // What GitHub last said, which is a cache and is empty until the first
+    // reconciliation has run — so an app nobody has installed says so rather
+    // than saying nothing.
+    match connections.installations(held.app_id).await {
+        Ok(installations) if installations.is_empty() => out.field(
+            "installed",
+            format!(
+                "nowhere yet — install it at {INSTALL_URL}/{}/installations/new",
+                held.slug
+            ),
+        ),
+        Ok(installations) => {
+            for (index, installation) in installations.iter().enumerate() {
+                out.field(
+                    if index == 0 { "installed" } else { "" },
+                    format!(
+                        "{} ({}), {} repositories",
+                        installation.account,
+                        installation.account_type.to_lowercase(),
+                        installation.repositories.len(),
+                    ),
+                );
+            }
+        }
+        Err(error) => out.field("installed", format!("could not be read: {error:#}")),
+    }
+
+    (StatusCode::OK, out.render()).into_response()
+}
+
+/// `DELETE /connections/{slug}`: forget the app, and everything cached under
+/// it.
+async fn forget_connection(
+    State(connections): State<Arc<ConnectionRepository>>,
+    UrlPath(slug): UrlPath<String>,
+) -> Response {
+    match connections.forget(&slug).await {
+        Ok(true) => {
+            let body = format!(
+                "forgot `{slug}`\n  its secrets, its cached installations and its recent deliveries are gone\n  the app itself still exists on github, and can be deleted there\n"
+            );
+
+            (StatusCode::OK, body).into_response()
+        }
+        Ok(false) => refuse(StatusCode::NOT_FOUND, &unconnected(&slug)),
+        Err(error) => {
+            warn!(%error, "forgetting a connection failed");
+
+            refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not forget `{slug}`: {error:#}"),
+            )
+        }
+    }
+}
+
+/// What is said about a slug nothing is connected under, in the one wording
+/// both handlers that can meet one use.
+fn unconnected(slug: &str) -> String {
+    format!("`{slug}` is not connected — `spaceport connect list` says what is")
+}
+
 fn refuse(status: StatusCode, message: &str) -> Response {
     (status, format!("{message}\n")).into_response()
 }
@@ -1014,6 +1212,7 @@ container:
             config: crate::Config::parse(CONFIG).unwrap(),
             operator: "/run/spaceport.sock".parse().unwrap(),
             applier,
+            connections: Arc::new(ConnectionRepository::new(db.clone())),
             db,
             certificates: None,
             reconciled: crate::app::reconcile::Report::default(),
@@ -1742,6 +1941,179 @@ container:
         assert_eq!(status.version, "9.9.9");
         assert_eq!(status.apps.running, 1);
         assert_eq!(status.edge.routed_hosts, 1);
+    }
+
+    /// A registration as the cli sends one, with the fixture key so that it
+    /// gets past validation.
+    fn registration(slug: &str, app_id: i64) -> String {
+        serde_json::json!({
+            "slug": slug,
+            "app_id": app_id,
+            "name": "Spaceport for Acme",
+            "owner": "an-organisation",
+            "client_id": "Iv1.0123456789abcdef",
+            "client_secret": "a-client-secret",
+            "webhook_secret": "a-webhook-secret",
+            "private_key": crate::connections::github::key::testing::PKCS1,
+        })
+        .to_string()
+    }
+
+    async fn post_connection(router: &Router, body: String) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/connections/github")
+            .body(Body::from(body))
+            .unwrap();
+
+        call(router, request).await
+    }
+
+    async fn get_connections(router: &Router, path: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .uri(format!("/connections{path}"))
+            .body(Body::empty())
+            .unwrap();
+
+        call(router, request).await
+    }
+
+    async fn delete_connection(router: &Router, slug: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/connections/{slug}"))
+            .body(Body::empty())
+            .unwrap();
+
+        call(router, request).await
+    }
+
+    #[tokio::test]
+    async fn connects_a_github_app_and_says_where_to_install_it() {
+        let (router, _) = router_and_events();
+
+        let (status, body) = post_connection(&router, registration("spaceport-acme", 42)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("connected `spaceport-acme` as github app 42"),
+            "{body}"
+        );
+        assert!(body.contains("owned by an-organisation"), "{body}");
+        assert!(
+            body.contains("https://github.com/apps/spaceport-acme/installations/new"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_a_registration_that_is_not_json() {
+        let (router, _) = router_and_events();
+
+        let (status, body) = post_connection(&router, "not json at all".to_owned()).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("not a github app registration"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn refuses_a_registration_whose_key_is_not_a_key() {
+        let (router, _) = router_and_events();
+        let body = registration("spaceport-acme", 42).replace(
+            &serde_json::to_string(crate::connections::github::key::testing::PKCS1).unwrap(),
+            "\"hunter2\"",
+        );
+
+        let (status, body) = post_connection(&router, body).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("not pem"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn lists_the_connections_in_columns() {
+        let (router, _) = router_and_events();
+        post_connection(&router, registration("spaceport-acme", 42)).await;
+        post_connection(&router, registration("spaceport-other", 43)).await;
+
+        let (status, body) = get_connections(&router, "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(lines[0].starts_with("SLUG"), "{body}");
+        assert!(lines[0].contains("APP ID"), "{body}");
+        assert!(lines[1].starts_with("spaceport-acme"), "{body}");
+        assert!(lines[2].starts_with("spaceport-other"), "{body}");
+    }
+
+    /// An empty listing has to say what to do next, or it reads as spaceport
+    /// having failed to answer.
+    #[tokio::test]
+    async fn says_when_nothing_is_connected() {
+        let (router, _) = router_and_events();
+
+        let (status, body) = get_connections(&router, "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("no github apps are connected"), "{body}");
+        assert!(body.contains("spaceport connect github --manual"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn shows_one_connection() {
+        let (router, _) = router_and_events();
+        post_connection(&router, registration("spaceport-acme", 42)).await;
+
+        let (status, body) = get_connections(&router, "/spaceport-acme").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("app        spaceport-acme"), "{body}");
+        assert!(body.contains("Iv1.0123456789abcdef"), "{body}");
+        assert!(body.contains("nowhere yet"), "{body}");
+    }
+
+    /// The one thing a connection must never do: an operator asking what is
+    /// connected must not be shown what proves it.
+    #[tokio::test]
+    async fn never_prints_a_secret() {
+        let (router, _) = router_and_events();
+        post_connection(&router, registration("spaceport-acme", 42)).await;
+
+        let (_, shown) = get_connections(&router, "/spaceport-acme").await;
+        let (_, listed) = get_connections(&router, "").await;
+
+        for body in [&shown, &listed] {
+            assert!(!body.contains("a-client-secret"), "{body}");
+            assert!(!body.contains("a-webhook-secret"), "{body}");
+            assert!(!body.contains("PRIVATE KEY"), "{body}");
+        }
+        assert!(shown.contains("(not shown)"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn showing_a_connection_nobody_made_is_a_404() {
+        let (router, _) = router_and_events();
+
+        let (status, body) = get_connections(&router, "/ghost").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("`ghost` is not connected"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn forgets_a_connection() {
+        let (router, _) = router_and_events();
+        post_connection(&router, registration("spaceport-acme", 42)).await;
+
+        let (status, body) = delete_connection(&router, "spaceport-acme").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("forgot `spaceport-acme`"), "{body}");
+        assert!(body.contains("still exists on github"), "{body}");
+        assert_eq!(
+            delete_connection(&router, "spaceport-acme").await.0,
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]

@@ -100,6 +100,13 @@ pub fn status(status: &Status, colour: Colour) -> String {
         line(if at == 0 { "apps" } else { "" }, &line_of);
     }
 
+    // Only when there is one, the way the hostname line is: a spaceport that is
+    // connected to nothing is an ordinary spaceport, and a `0 github apps` line
+    // on every status would read as something missing.
+    if status.connections > 0 {
+        line("connect", &connections(status.connections));
+    }
+
     let reconcile = &status.reconcile;
     line(
         "start",
@@ -181,6 +188,17 @@ fn apps(apps: &Apps, colour: Colour) -> Vec<String> {
     }
 
     lines
+}
+
+/// How many GitHub Apps this spaceport is registered as, said in English.
+///
+/// Nothing is coloured: being connected to none, one or several is a decision
+/// rather than a condition, so there is nothing here to warn about.
+fn connections(held: usize) -> String {
+    match held {
+        1 => "1 github app".to_owned(),
+        held => format!("{held} github apps"),
+    }
 }
 
 /// What spaceport holds, and what it is missing.
@@ -335,6 +353,7 @@ mod tests {
                 failed: 1,
                 swept: 1,
             },
+            connections: 2,
         }
     }
 
@@ -426,6 +445,28 @@ mod tests {
         let block = super::status(&status, Colour::Yes);
         assert!(!block.contains(RED), "{block:?}");
         assert!(!block.contains(YELLOW), "{block:?}");
+    }
+
+    /// A spaceport connected to nothing says nothing, the same way one with no
+    /// hostname of its own does.
+    #[test]
+    fn says_how_many_github_apps_it_is_connected_as_and_only_when_there_are_any() {
+        let block = super::status(&example(), Colour::No);
+        assert!(block.contains("connect   2 github apps"), "{block}");
+
+        let mut none = example();
+        none.connections = 0;
+        assert!(
+            !super::status(&none, Colour::No).contains("github app"),
+            "{block}"
+        );
+
+        let mut one = example();
+        one.connections = 1;
+        assert!(
+            super::status(&one, Colour::No).contains("1 github app\n"),
+            "{block}"
+        );
     }
 
     #[test]
