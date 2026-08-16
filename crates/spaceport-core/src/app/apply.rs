@@ -1440,6 +1440,8 @@ source:
   image: strm/helloworld-http:latest
 routing:
   hosts: [{hosts}]
+auth:
+  gating: open
 container:
   health:
     readiness:
@@ -1566,6 +1568,8 @@ source:
   image: strm/helloworld-http:latest
 routing:
   hosts: [{hosts}]
+auth:
+  gating: open
 container:
   health:
     readiness:
@@ -2580,6 +2584,8 @@ source:
   context: .
 routing:
   hosts: [{hosts}]
+auth:
+  gating: open
 container:
   health:
     readiness:
@@ -2835,6 +2841,8 @@ source:
   image: strm/helloworld-http:latest
 routing:
   hosts: [{hosts}]
+auth:
+  gating: open
 container:
   secrets: [DB_PASSWORD]
   env:

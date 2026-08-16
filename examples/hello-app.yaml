@@ -4,6 +4,8 @@ source:
   image: strm/helloworld-http:latest
 routing:
   hosts: [alpha.test, beta.test]
+auth:
+  gating: open
 container:
   health:
     readiness:

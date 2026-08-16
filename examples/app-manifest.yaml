@@ -9,6 +9,23 @@ source:        # one of build | image
 routing:
   hosts: [my-app.example.com, www.my-app.example.com]        # when hostname already registered, fail
 
+auth:            # required — a manifest has to say who may reach the app
+  gating: edge   # edge | open.
+                 # `edge`: spaceport authenticates every request before the app
+                 # sees it. `open`: anyone who can reach the hosts reaches the
+                 # app, and `roles`/`public_path_prefixes` are invalid.
+  public_path_prefixes:   # optional, default none: paths reachable without a
+                          # session. Matched after canonicalization, at segment
+                          # boundaries (`/public` matches `/public/x`, never
+                          # `/publicfoo`). Must start with `/`; no trailing
+                          # slash, query, fragment, `.`/`..` or empty segments;
+                          # a bare `/` is refused — that is `gating: open`.
+    - /public
+    - /css
+  roles: [ reader, writer ]   # required with `edge`, at least one, no
+                              # duplicates; [a-z][a-z0-9-]*, 63 chars at most.
+                              # Entitlements are granted against these names.
+
 container:
   port: 8080                    # Defaults to a single `EXPOSE` (tcp) in the image config
                                 # (error if not present or more than one `EXPOSE`)

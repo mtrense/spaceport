@@ -781,6 +781,8 @@ source:
   dockerfile: Dockerfile
 routing:
   hosts: [site.example.com]
+auth:
+  gating: open
 ";
 
     const PREBUILT_MANIFEST: &str = "\
@@ -790,6 +792,8 @@ source:
   image: ghcr.io/an-organisation/site:v1
 routing:
   hosts: [site.example.com]
+auth:
+  gating: open
 ";
 
     fn app(id: &str) -> AppId {

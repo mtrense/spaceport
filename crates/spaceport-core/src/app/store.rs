@@ -743,6 +743,8 @@ source:
   image: strm/helloworld-http:latest
 routing:
   hosts: [{hosts}]
+auth:
+  gating: open
 "
         ))
         .unwrap();

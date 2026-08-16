@@ -1238,6 +1238,8 @@ source:
   image: traefik/whoami:latest
 routing:
   hosts: [alpha.test]
+auth:
+  gating: open
 container:
 {container}"
         ))
@@ -1629,6 +1631,8 @@ source:
   image: traefik/whoami:latest
 routing:
   hosts: [alpha.test]
+auth:
+  gating: open
 ",
         )
         .unwrap()
@@ -1867,6 +1871,8 @@ source:
   image: spaceport.invalid/nothing:v1
 routing:
   hosts: [alpha.test]
+auth:
+  gating: open
 container:
   port: 80
 ",
@@ -1943,7 +1949,7 @@ container:
             return;
         };
         let manifest = AppManifest::parse(
-            "schema_version: 1\nsource:\n  type: build\nrouting:\n  hosts: [alpha.test]\n",
+            "schema_version: 1\nsource:\n  type: build\nrouting:\n  hosts: [alpha.test]\nauth:\n  gating: open\n",
         )
         .unwrap();
 

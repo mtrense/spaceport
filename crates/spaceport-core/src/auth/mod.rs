@@ -127,6 +127,72 @@ impl<'de> Deserialize<'de> for UserId {
     }
 }
 
+/// A role, as an app's manifest declares one and an entitlement grants one.
+///
+/// The spec's constraint — a lowercase letter, then lowercase letters, digits
+/// and hyphens — is the [`UserSlug`] alphabet, and deliberately so: a role
+/// travels the same places a slug does (JWT claims, log lines, `grant`
+/// commands), and two alphabets would mean two quoting stories. Bounded by the
+/// same length for the same reason.
+///
+/// `admin` is an ordinary role here. The rule that `admin` is never mappable
+/// belongs to SSO mappings, not to the name itself — a manifest may well
+/// declare an `admin` role for an operator to grant by hand.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Role(String);
+
+impl Role {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for Role {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        if s.is_empty() {
+            bail!("a role must not be empty");
+        }
+        if s.len() > MAX_SLUG_LEN {
+            bail!("role `{s}` is longer than {MAX_SLUG_LEN} characters");
+        }
+        if !s.as_bytes()[0].is_ascii_lowercase() {
+            bail!("role `{s}` must start with a lowercase letter");
+        }
+        if !s
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            bail!("role `{s}` may only contain lowercase letters, digits and hyphens");
+        }
+
+        Ok(Self(s.to_owned()))
+    }
+}
+
+impl fmt::Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for Role {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+/// A role out of a manifest or off the wire is held to the same rules as one
+/// off the command line.
+impl<'de> Deserialize<'de> for Role {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let role = String::deserialize(deserializer)?;
+
+        role.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 /// The name an operator gives a user.
 ///
 /// The spec's role constraint — a lowercase letter, then lowercase letters,
@@ -321,6 +387,30 @@ mod tests {
         ] {
             assert!(id.parse::<UserId>().is_err(), "accepted `{id}`");
         }
+    }
+
+    #[test]
+    fn accepts_a_plain_role() {
+        assert_eq!("reader".parse::<Role>().unwrap().as_str(), "reader");
+        assert_eq!("tier-2".parse::<Role>().unwrap().as_str(), "tier-2");
+        // Not refused here: "never mappable" is a rule about SSO mappings, and
+        // a manifest declaring `admin` for manual grants is legitimate.
+        assert_eq!("admin".parse::<Role>().unwrap().as_str(), "admin");
+    }
+
+    /// The same alphabet as a slug, on purpose — so what a slug refuses, a
+    /// role refuses too.
+    #[test]
+    fn rejects_a_role_that_breaks_the_charset() {
+        for role in ["", "Reader", "2fast", "-lead", "my role", "my_role"] {
+            assert!(role.parse::<Role>().is_err(), "accepted `{role}`");
+        }
+    }
+
+    #[test]
+    fn rejects_an_overlong_role() {
+        let err = "a".repeat(64).parse::<Role>().unwrap_err().to_string();
+        assert!(err.contains("longer than 63"), "{err}");
     }
 
     #[test]

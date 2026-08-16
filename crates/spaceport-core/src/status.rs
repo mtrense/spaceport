@@ -550,6 +550,8 @@ source:
   image: strm/helloworld-http:latest
 routing:
   hosts: [alpha.test]
+auth:
+  gating: open
 container:
   health:
     readiness:

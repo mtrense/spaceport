@@ -4,6 +4,8 @@ source:
   image: hashicorp/http-echo:latest
 routing:
   hosts: [echo.test]
+auth:
+  gating: open
 container:
 #  port: 8080
   health:

@@ -456,7 +456,7 @@ mod tests {
         App {
             id: id.parse().unwrap(),
             manifest: AppManifest::parse(&format!(
-                "schema_version: 1\nsource:\n  type: image\n  image: x\nrouting:\n  hosts: [{host}]\n"
+                "schema_version: 1\nsource:\n  type: image\n  image: x\nrouting:\n  hosts: [{host}]\nauth:\n  gating: open\n"
             ))
             .unwrap(),
             container: crate::runtime::ContainerId::new("test-container"),

@@ -556,6 +556,8 @@ source:
   dockerfile: Dockerfile
 routing:
   hosts: [{HOST}]
+auth:
+  gating: open
 container:
   health:
     readiness:
@@ -576,6 +578,8 @@ source:
   dockerfile: Dockerfile
 routing:
   hosts: [{HOST}]
+auth:
+  gating: open
 container:
   health:
     readiness:
@@ -1035,6 +1039,8 @@ source:
   dockerfile: Dockerfile
 routing:
   hosts: [{HOST}]
+auth:
+  gating: open
 container:
   secrets: [DB_PASSWORD]
   env:

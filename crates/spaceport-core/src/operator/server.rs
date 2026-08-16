@@ -3742,6 +3742,8 @@ source:
   image: strm/helloworld-http:latest
 routing:
   hosts: [alpha.test]
+auth:
+  gating: open
 container:
   health:
     readiness:
@@ -3988,6 +3990,8 @@ source:
   image: strm/helloworld-http:latest
 routing:
   hosts: [alpha.test, beta.test]
+auth:
+  gating: open
 container:
   port: 8080
   health:
@@ -4031,6 +4035,8 @@ source:
   image: strm/helloworld-http:latest
 routing:
   hosts: [alpha.test]
+auth:
+  gating: open
 container:
   health:
     readiness:
@@ -6132,6 +6138,8 @@ source:
   type: build
 routing:
   hosts: [gamma.test]
+auth:
+  gating: open
 container:
   health:
     readiness:
@@ -6609,6 +6617,8 @@ source:
   image: strm/helloworld-http:latest
 routing:
   hosts: [alpha.test]
+auth:
+  gating: open
 container:
   secrets: [DB_PASSWORD]
   env:
@@ -6625,6 +6635,8 @@ source:
   image: strm/helloworld-http:latest
 routing:
   hosts: [alpha.test]
+auth:
+  gating: open
 container:
   secrets: [DB_PASSWORD, API_KEY]
   env:

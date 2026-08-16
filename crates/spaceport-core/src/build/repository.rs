@@ -797,6 +797,8 @@ source:
   dockerfile: Dockerfile
 routing:
   hosts: [site.example.com]
+auth:
+  gating: open
 ";
 
     /// The queue orders by `started_at`, and two requests made in the same

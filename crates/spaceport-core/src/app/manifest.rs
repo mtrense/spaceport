@@ -15,6 +15,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, de};
 
 use super::secrets::StoredSecret;
+use crate::auth::Role;
 use crate::config::SchemaVersion;
 use crate::duration;
 
@@ -39,6 +40,21 @@ pub struct AppManifest {
 
     /// Which traffic reaches the app.
     pub routing: Routing,
+
+    /// Who may reach the app: behind spaceport's edge authentication, or open
+    /// to anyone who can reach its hosts.
+    ///
+    /// Required, with no default on purpose. Either default would be wrong for
+    /// somebody — defaulting to `open` silently publishes an internal tool,
+    /// defaulting to `edge` silently locks a public site's users out — so the
+    /// manifest has to say. This is also a compatibility decision: manifests
+    /// recorded before this field existed no longer parse, and that lands in
+    /// the paths that re-read stored manifests, which already leave such an
+    /// app down with a warning naming the reason (see `reconcile` — "nothing
+    /// here is fatal"). A running container keeps serving until then; the way
+    /// back up is re-applying with an `auth` block, which is exactly the
+    /// question the operator has to answer anyway.
+    pub auth: Auth,
 
     /// How the app runs. Every part of it has a default, so a manifest that
     /// says nothing here is complete.
@@ -155,6 +171,165 @@ fn default_context() -> PathBuf {
 pub struct Routing {
     /// Hosts served by this app. At least one, or nothing could ever reach it.
     pub hosts: Vec<Host>,
+}
+
+/// Who may reach the app.
+///
+/// Internally tagged on `gating`, in the shape of [`Source`]: the two variants
+/// share no fields, and `deny_unknown_fields` is what makes `roles` under
+/// `gating: open` an error rather than a silently ignored key. Silently
+/// ignoring it would hide a misconfiguration — an operator who wrote roles
+/// down believed they were gating something.
+///
+/// Parsed and validated only, for now: nothing enforces gating yet. What is
+/// accepted here is the contract later enforcement holds an app to, which is
+/// exactly why it is strict already — a manifest admitted today must not be
+/// refused by the spaceport that starts enforcing.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "gating", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum Auth {
+    /// Spaceport authenticates every request at its edge before the app sees
+    /// it; only a user entitled to one of the declared roles gets through.
+    Edge {
+        /// Paths that stay reachable without a session — a login page's CSS,
+        /// a public feed. Matched after canonicalization and at segment
+        /// boundaries (`/public` matches `/public/x`, never `/publicfoo`);
+        /// the matching itself is enforcement work and lives with it, later.
+        #[serde(default)]
+        public_path_prefixes: Vec<PathPrefix>,
+
+        /// The roles this app understands. Entitlements are granted against
+        /// these names, and the JWT an app receives carries the intersection.
+        roles: Vec<Role>,
+    },
+
+    /// Anyone who can reach the app's hosts reaches the app. Spaceport mints
+    /// no sessions for it, sets no cookies on its domains, and passes
+    /// `Authorization` through untouched.
+    ///
+    /// A struct variant with no fields rather than a unit variant, because the
+    /// derive skips unknown-field checks for unit variants: `gating: open`
+    /// with a `roles:` key left over from an `edge` block would parse cleanly,
+    /// and that leftover is precisely the misconfiguration worth catching.
+    Open {},
+}
+
+impl Auth {
+    /// What serde cannot express about gating: the rules that span the whole
+    /// list rather than one element.
+    fn validate(&self) -> Result<()> {
+        let Self::Edge {
+            public_path_prefixes,
+            roles,
+        } = self
+        else {
+            return Ok(());
+        };
+
+        // An edge-gated app with no roles is one nobody could ever be entitled
+        // to: not gated, unreachable. `gating: open` is how to say "no roles".
+        if roles.is_empty() {
+            bail!(
+                "auth.roles must declare at least one role: with `gating: edge`, access is granted per role, and an app with none could never be reached by anyone"
+            );
+        }
+
+        let mut seen = HashSet::with_capacity(roles.len());
+        for role in roles {
+            if !seen.insert(role) {
+                bail!("auth.roles names `{role}` twice");
+            }
+        }
+
+        let mut seen = HashSet::with_capacity(public_path_prefixes.len());
+        for prefix in public_path_prefixes {
+            if !seen.insert(prefix) {
+                bail!("auth.public_path_prefixes lists `{prefix}` twice");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Longest a public path prefix may be. Generous — a prefix is a piece of a
+/// URL an operator wrote by hand — but bounded, because everything else a
+/// manifest names is.
+const MAX_PATH_PREFIX_LEN: usize = 1024;
+
+/// A path prefix that stays public on an edge-gated app.
+///
+/// Held to the shape the matcher will rely on: absolute, no trailing slash, no
+/// query or fragment, no empty and no `.`/`..` segments. Requests are
+/// canonicalized before matching, so a prefix that only matches
+/// un-canonicalized spellings — `/a/../b`, `/a//b` — would silently never
+/// match, and one with a trailing slash would make `/public` itself private
+/// while `/public/x` stayed open. Refusing those here means what is stored is
+/// already the normal form, and the later milestone only adds the
+/// segment-boundary matcher.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PathPrefix(String);
+
+impl PathPrefix {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for PathPrefix {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        if !s.starts_with('/') {
+            bail!("public path prefix `{s}` must start with `/`");
+        }
+        // `/` is a prefix of every path, so this would be `gating: edge` with
+        // every request exempted from it — a contradiction better said plainly.
+        if s == "/" {
+            bail!(
+                "a public path prefix of `/` would make the whole app public — say `gating: open` instead"
+            );
+        }
+        if s.len() > MAX_PATH_PREFIX_LEN {
+            bail!("public path prefix `{s}` is longer than {MAX_PATH_PREFIX_LEN} characters");
+        }
+        // A query or fragment is not part of a path, and a prefix carrying one
+        // would never match anything once the path alone is compared.
+        if let Some(stray) = ['?', '#'].iter().find(|c| s.contains(**c)) {
+            bail!("public path prefix `{s}` must not carry a `{stray}` — only a path is matched");
+        }
+        if s.ends_with('/') {
+            bail!(
+                "public path prefix `{s}` must not end with `/` — a prefix already covers everything below it"
+            );
+        }
+        for segment in s[1..].split('/') {
+            if segment.is_empty() {
+                bail!("public path prefix `{s}` has an empty segment");
+            }
+            // Matching happens after canonicalization, which resolves these
+            // away — a prefix spelled with them could never match a request.
+            if segment == "." || segment == ".." {
+                bail!("public path prefix `{s}` must not contain `.` or `..` segments");
+            }
+        }
+
+        Ok(Self(s.to_owned()))
+    }
+}
+
+impl<'de> Deserialize<'de> for PathPrefix {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
+    }
+}
+
+impl fmt::Display for PathPrefix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// How the app's container runs.
@@ -490,10 +665,20 @@ impl Container {
             if !declared.insert(secret) {
                 bail!("container.secrets names `{secret}` twice");
             }
+            if shadows_spaceport(secret) {
+                bail!(
+                    "container.secrets declares `{secret}`, and names starting with `SPACEPORT` are spaceport's own — it injects those variables itself, and an app must not be able to shadow one"
+                );
+            }
         }
 
         let mut used = HashSet::new();
         for (name, value) in &self.env {
+            if shadows_spaceport(name) {
+                bail!(
+                    "container.env sets `{name}`, and names starting with `SPACEPORT` are spaceport's own — it injects those variables itself, and an app must not be able to shadow one"
+                );
+            }
             for reference in placeholders(value)? {
                 let secret: VarName = reference
                     .parse()
@@ -517,6 +702,22 @@ impl Container {
 
         Ok(())
     }
+}
+
+/// Whether a variable name collides with the ones spaceport injects.
+///
+/// Spaceport hands every app `SPACEPORT_*` variables — `SPACEPORT_APP_ID`,
+/// `SPACEPORT_ISSUER`, `SPACEPORT_JWKS_URL`, and whatever a later spaceport
+/// adds — so a manifest must not be able to set one. Checked as a prefix and
+/// case-insensitively: the docker engine's environment is case-sensitive, but
+/// an app reading `getenv` results case-insensitively (or a manifest that
+/// wins by spelling it `spaceport_issuer`) would still be shadowing.
+fn shadows_spaceport(name: &VarName) -> bool {
+    const RESERVED: &str = "SPACEPORT";
+
+    name.as_str()
+        .get(..RESERVED.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED))
 }
 
 /// How spaceport decides an app is working.
@@ -886,6 +1087,8 @@ impl AppManifest {
             }
         }
 
+        self.auth.validate()?;
+
         self.container.validate()?;
 
         self.container.health.readiness.validate("readiness")?;
@@ -912,6 +1115,8 @@ source:
   image: strm/helloworld-http:latest
 routing:
   hosts: [alpha.test, beta.test]
+auth:
+  gating: open
 ";
 
     fn hosts(manifest: &AppManifest) -> Vec<&str> {
@@ -939,7 +1144,7 @@ routing:
     /// give an operator back something they never wrote.
     #[test]
     fn keeps_the_document_it_was_parsed_from() {
-        let raw = "# what this app is for\nschema_version: 1\nsource:\n  type: image\n  image: \"strm/helloworld-http:latest\"\nrouting:\n  hosts: [alpha.test]\n";
+        let raw = "# what this app is for\nschema_version: 1\nsource:\n  type: image\n  image: \"strm/helloworld-http:latest\"\nrouting:\n  hosts: [alpha.test]\nauth:\n  gating: open\n";
 
         let manifest = AppManifest::parse(raw).unwrap();
 
@@ -972,6 +1177,8 @@ source:
   type: build
 routing:
   hosts: [alpha.test]
+auth:
+  gating: open
 ";
         assert_eq!(
             AppManifest::parse(raw).unwrap().source,
@@ -1748,5 +1955,237 @@ success_threshold: 1",
         let err = host.parse::<Host>().unwrap_err().to_string();
 
         assert!(err.contains("longer than 63"), "{err}");
+    }
+
+    /// `MINIMAL` with its `auth` section replaced, indented into place.
+    fn with_auth(fields: &str) -> String {
+        let fields: String = fields.lines().map(|line| format!("  {line}\n")).collect();
+
+        MINIMAL.replace("auth:\n  gating: open\n", &format!("auth:\n{fields}"))
+    }
+
+    /// Either default would be wrong for somebody — `open` publishes an
+    /// internal tool, `edge` locks a public site's users out — so a manifest
+    /// that does not say is refused rather than guessed at.
+    #[test]
+    fn rejects_a_manifest_without_an_auth_block() {
+        let raw = MINIMAL.replace("auth:\n  gating: open\n", "");
+        let err = AppManifest::parse(&raw).unwrap_err().to_string();
+
+        assert!(err.contains("auth"), "{err}");
+    }
+
+    #[test]
+    fn parses_open_gating() {
+        assert_eq!(AppManifest::parse(MINIMAL).unwrap().auth, Auth::Open {});
+    }
+
+    #[test]
+    fn parses_edge_gating_with_roles_and_public_prefixes() {
+        let raw = with_auth(
+            "gating: edge
+public_path_prefixes:
+  - '/public'
+  - '/css/v2'
+roles: [reader, writer]",
+        );
+
+        let auth = AppManifest::parse(&raw).unwrap().auth;
+        let Auth::Edge {
+            public_path_prefixes,
+            roles,
+        } = auth
+        else {
+            panic!("parsed `gating: edge` as {auth:?}");
+        };
+
+        assert_eq!(
+            roles.iter().map(Role::as_str).collect::<Vec<_>>(),
+            ["reader", "writer"]
+        );
+        assert_eq!(
+            public_path_prefixes
+                .iter()
+                .map(PathPrefix::as_str)
+                .collect::<Vec<_>>(),
+            ["/public", "/css/v2"]
+        );
+    }
+
+    /// Nothing public is the ordinary shape of a gated app, so the list must
+    /// be optional — a manifest should not have to write `[]` to say it.
+    #[test]
+    fn an_edge_gated_app_is_wholly_private_by_default() {
+        let auth = AppManifest::parse(&with_auth("gating: edge\nroles: [reader]"))
+            .unwrap()
+            .auth;
+
+        assert!(matches!(
+            auth,
+            Auth::Edge { public_path_prefixes, .. } if public_path_prefixes.is_empty()
+        ));
+    }
+
+    #[test]
+    fn rejects_an_unknown_gating() {
+        let err = AppManifest::parse(&with_auth("gating: perimeter"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("perimeter"), "{err}");
+    }
+
+    /// Roles under `gating: open` are meaningless, and a silently ignored key
+    /// hides a misconfiguration: whoever wrote them down believed they were
+    /// gating something.
+    #[test]
+    fn rejects_roles_under_open_gating() {
+        let err = AppManifest::parse(&with_auth("gating: open\nroles: [reader]"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("roles"), "{err}");
+    }
+
+    /// The same worry for the other `edge` field.
+    #[test]
+    fn rejects_public_prefixes_under_open_gating() {
+        let raw = with_auth("gating: open\npublic_path_prefixes: ['/public']");
+        let err = AppManifest::parse(&raw).unwrap_err().to_string();
+
+        assert!(err.contains("public_path_prefixes"), "{err}");
+    }
+
+    /// With `gating: edge`, access is granted per role, so an app with none
+    /// declared could never be reached by anyone — `roles` is required, not
+    /// defaulted to empty and caught later.
+    #[test]
+    fn rejects_edge_gating_without_roles() {
+        let err = AppManifest::parse(&with_auth("gating: edge"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("roles"), "{err}");
+    }
+
+    /// Spelling the empty list out is the same mistake made explicitly.
+    #[test]
+    fn rejects_edge_gating_with_empty_roles() {
+        let err = AppManifest::parse(&with_auth("gating: edge\nroles: []"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("at least one role"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_repeated_role() {
+        let err = AppManifest::parse(&with_auth("gating: edge\nroles: [reader, reader]"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("twice"), "{err}");
+    }
+
+    /// The charset is [`Role`]'s and tested there; this is the seam — a bad
+    /// role in a manifest has to surface as a manifest error.
+    #[test]
+    fn rejects_a_role_that_breaks_the_charset() {
+        let err = AppManifest::parse(&with_auth("gating: edge\nroles: [Reader]"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("lowercase"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_repeated_public_prefix() {
+        let raw = with_auth("gating: edge\nroles: [reader]\npublic_path_prefixes: ['/a', '/a']");
+        let err = AppManifest::parse(&raw).unwrap_err().to_string();
+
+        assert!(err.contains("twice"), "{err}");
+    }
+
+    #[test]
+    fn accepts_a_normalized_public_prefix() {
+        for prefix in ["/public", "/css/v2", "/a-b_c.d", "/.well-known/feed"] {
+            assert_eq!(
+                prefix.parse::<PathPrefix>().unwrap().as_str(),
+                prefix,
+                "refused `{prefix}`"
+            );
+        }
+    }
+
+    /// `/` is a prefix of every path: `gating: edge` with every request
+    /// exempted from it. The message has to point at the honest spelling.
+    #[test]
+    fn rejects_a_public_prefix_of_the_whole_app() {
+        let err = "/".parse::<PathPrefix>().unwrap_err().to_string();
+
+        assert!(err.contains("gating: open"), "{err}");
+    }
+
+    /// The shapes the matcher could never match — relative, trailing slash,
+    /// empty or dot segments, a query or fragment — refused before they are
+    /// stored, so what is stored is already the normal form.
+    #[test]
+    fn rejects_a_public_prefix_that_is_not_a_normalized_path() {
+        for prefix in [
+            "",
+            "public",
+            "public/",
+            "/public/",
+            "/public//x",
+            "//public",
+            "/public/./x",
+            "/public/..",
+            "/../public",
+            "/public?x=1",
+            "/public#frag",
+        ] {
+            assert!(prefix.parse::<PathPrefix>().is_err(), "accepted `{prefix}`");
+        }
+    }
+
+    #[test]
+    fn rejects_an_overlong_public_prefix() {
+        let prefix = format!("/{}", "a".repeat(MAX_PATH_PREFIX_LEN));
+        let err = prefix.parse::<PathPrefix>().unwrap_err().to_string();
+
+        assert!(err.contains("longer than"), "{err}");
+    }
+
+    /// Spaceport injects `SPACEPORT_*` variables into every app, and a
+    /// manifest that could set one could shadow what the app's middleware
+    /// trusts — `SPACEPORT_JWKS_URL` pointed at an attacker's keys is the
+    /// concrete disaster. Case-insensitive because an app reading its
+    /// environment leniently would still be fooled by `spaceport_jwks_url`.
+    #[test]
+    fn rejects_an_env_variable_that_shadows_spaceport() {
+        for name in ["SPACEPORT_APP_ID", "spaceport_issuer", "SpacePortX"] {
+            let raw = with_container(&format!("env:\n  {name}: x"));
+            let err = AppManifest::parse(&raw).unwrap_err().to_string();
+
+            assert!(err.contains("spaceport's own"), "for `{name}`: {err}");
+        }
+    }
+
+    /// The same reservation from the secrets side: a secret is only ever
+    /// delivered through an env variable of its own name.
+    #[test]
+    fn rejects_a_secret_that_shadows_spaceport() {
+        let raw = with_container("secrets: [SPACEPORT_TOKEN]\nenv:\n  A: \"{{SPACEPORT_TOKEN}}\"");
+        let err = AppManifest::parse(&raw).unwrap_err().to_string();
+
+        assert!(err.contains("spaceport's own"), "{err}");
+    }
+
+    /// The reservation is a prefix rule, not a substring one: a name that
+    /// merely contains or resembles the word is the app's own business.
+    #[test]
+    fn leaves_variables_that_merely_mention_spaceport_alone() {
+        let raw = with_container("env:\n  MY_SPACEPORT_URL: x\n  SPACEPOR: y");
+        assert!(AppManifest::parse(&raw).is_ok());
     }
 }
