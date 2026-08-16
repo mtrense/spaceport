@@ -35,7 +35,7 @@ use tracing::{debug, info, warn};
 use super::{Adopted, Container, ContainerId, ContainerRuntime, Events, Managed, RuntimeEvent};
 use crate::app::data::{DataDir, Owner};
 use crate::app::manifest::Source;
-use crate::app::{AppId, AppManifest};
+use crate::app::{AppId, AppManifest, Auth};
 use crate::build::image::{BuildRequest, BuiltImage, ImageBuilder};
 
 /// Marks a container as spaceport's, and says whose it is.
@@ -57,6 +57,14 @@ pub struct DockerRuntime {
     /// Where the volumes an app asks for are made. Held here because it is
     /// the runtime that has to have them on disk before a container starts.
     data: DataDir,
+
+    /// `https://<edge.hostname>` — what a gated app's container receives as
+    /// `SPACEPORT_ISSUER`, with the JWKS URL derived from it. Held here
+    /// because the runtime is what fixes a container's environment at
+    /// creation, and absent when the config named no hostname — in which case
+    /// a gated app cannot be signed into anyway, and the two URL variables
+    /// are withheld rather than invented.
+    issuer: Option<String>,
 }
 
 impl DockerRuntime {
@@ -66,10 +74,14 @@ impl DockerRuntime {
     /// request — so this succeeding does not mean there is a daemon there.
     /// Use [`DockerRuntime::ping`] to find that out at startup rather than at
     /// the first apply.
-    pub fn connect(data: DataDir) -> Result<Self> {
+    pub fn connect(data: DataDir, issuer: Option<String>) -> Result<Self> {
         let docker = Docker::connect_with_defaults().context("connecting to the docker daemon")?;
 
-        Ok(Self { docker, data })
+        Ok(Self {
+            docker,
+            data,
+            issuer,
+        })
     }
 
     /// Check that the daemon is actually there and talking.
@@ -184,7 +196,7 @@ impl ContainerRuntime for DockerRuntime {
 
         let body = ContainerCreateBody {
             image: Some(image.to_owned()),
-            env: Some(environment(manifest)?),
+            env: Some(environment(app, manifest, self.issuer.as_deref())?),
             labels: Some(HashMap::from([
                 (MANAGED_LABEL.to_owned(), "true".to_owned()),
                 (APP_LABEL.to_owned(), app.to_string()),
@@ -652,7 +664,7 @@ impl DockerRuntime {
     }
 
     fn fingerprint(&self, app: &AppId, image: &str, manifest: &AppManifest) -> String {
-        fingerprint(&self.data, app, image, manifest)
+        fingerprint(&self.data, app, image, manifest, self.issuer.as_deref())
     }
 }
 
@@ -885,8 +897,14 @@ fn tail(log: &VecDeque<String>) -> String {
 /// fingerprints exactly as it did before secrets existed. Anything else would
 /// have replaced every container running on every host, on upgrade, to record
 /// the absence of something none of them had.
-fn fingerprint(data: &DataDir, app: &AppId, image: &str, manifest: &AppManifest) -> String {
-    let spec = specification(data, app, image, manifest);
+fn fingerprint(
+    data: &DataDir,
+    app: &AppId,
+    image: &str,
+    manifest: &AppManifest,
+    issuer: Option<&str>,
+) -> String {
+    let spec = specification(data, app, image, manifest, issuer);
 
     let digest = ring::digest::digest(&ring::digest::SHA256, spec.as_bytes());
     digest.as_ref()[..16]
@@ -900,7 +918,13 @@ fn fingerprint(data: &DataDir, app: &AppId, image: &str, manifest: &AppManifest)
 /// Split out from [`fingerprint`] so that a test can read what is about to be
 /// hashed. Everything else about a hash can be asserted from the outside; that
 /// no secret went into it cannot, because a digest looks the same either way.
-fn specification(data: &DataDir, app: &AppId, image: &str, manifest: &AppManifest) -> String {
+fn specification(
+    data: &DataDir,
+    app: &AppId,
+    image: &str,
+    manifest: &AppManifest,
+    issuer: Option<&str>,
+) -> String {
     let container = &manifest.container;
 
     let mut spec = String::new();
@@ -947,6 +971,18 @@ fn specification(data: &DataDir, app: &AppId, image: &str, manifest: &AppManifes
         field(&mut spec, if volume.read_only { "ro" } else { "rw" });
     }
 
+    // What spaceport itself injects — the milestone-6 `SPACEPORT_*` variables
+    // — is part of a gated container's environment, and an environment fixed
+    // at creation has to be replaced when it changes: a gated container from
+    // before the variables existed, or from before the hostname did, must not
+    // be adopted as current. Fielded via the same function that injects, so
+    // the fingerprint and the environment cannot say different things — and
+    // empty for `gating: open`, so every open app's fingerprint stays exactly
+    // as it always was.
+    for var in spaceport_environment(app, manifest, issuer) {
+        field(&mut spec, &var);
+    }
+
     spec
 }
 
@@ -978,18 +1014,52 @@ fn field(spec: &mut String, value: &str) {
 }
 
 /// The environment to give a container, as the engine wants it: the manifest's
-/// own values with every secret it interpolates put in.
+/// own values with every secret it interpolates put in, and — for a gated app
+/// — the `SPACEPORT_*` variables of the JWT contract after them.
 ///
 /// The grammar of a placeholder lives in the manifest module and is not
 /// repeated here — this only turns the map that comes back into the list of
-/// `NAME=value` strings docker takes.
-fn environment(manifest: &AppManifest) -> Result<Vec<String>> {
-    Ok(manifest
+/// `NAME=value` strings docker takes. The injected names cannot collide with
+/// the manifest's: the `SPACEPORT` prefix is reserved at manifest validation,
+/// which exists precisely so this append never has to ask who wins.
+fn environment(app: &AppId, manifest: &AppManifest, issuer: Option<&str>) -> Result<Vec<String>> {
+    let mut env: Vec<String> = manifest
         .container
         .environment()?
         .into_iter()
         .map(|(name, value)| format!("{name}={value}"))
-        .collect())
+        .collect();
+    env.extend(spaceport_environment(app, manifest, issuer));
+
+    Ok(env)
+}
+
+/// The variables spaceport speaks to an app through: `SPACEPORT_APP_ID` for
+/// the `aud` it must expect, `SPACEPORT_ISSUER` for the `iss`, and
+/// `SPACEPORT_JWKS_URL` for where the verifying keys live.
+///
+/// Only for `gating: edge`, deliberately: the spec ties these variables to the
+/// JWT contract, and spaceport never mints a JWT for an open app — variables
+/// naming an issuer that will never issue would be an invitation to verify
+/// tokens that cannot arrive. And only the two URL variables when a hostname
+/// is configured: without one a gated app cannot be signed into at all (the
+/// gate refuses with the same missing piece), so the app id — which needs no
+/// hostname — is injected alone rather than beside invented URLs.
+fn spaceport_environment(app: &AppId, manifest: &AppManifest, issuer: Option<&str>) -> Vec<String> {
+    if !matches!(manifest.auth, Auth::Edge { .. }) {
+        return Vec::new();
+    }
+
+    let mut vars = vec![format!("SPACEPORT_APP_ID={app}")];
+    if let Some(issuer) = issuer {
+        vars.push(format!("SPACEPORT_ISSUER={issuer}"));
+        vars.push(format!(
+            "SPACEPORT_JWKS_URL={}",
+            crate::auth::jwt::jwks_url(issuer)
+        ));
+    }
+
+    vars
 }
 
 /// The container name spaceport gives an app. Prefixed, so a container that is
@@ -1252,6 +1322,7 @@ container:
             &"my-app".parse().unwrap(),
             "traefik/whoami:latest",
             manifest,
+            None,
         )
     }
 
@@ -1263,6 +1334,7 @@ container:
             &"my-app".parse().unwrap(),
             "traefik/whoami:latest",
             manifest,
+            None,
         )
     }
 
@@ -1270,19 +1342,122 @@ container:
         DataDir::new(std::path::PathBuf::from("/var/lib/spaceport/apps"))
     }
 
+    fn my_app() -> AppId {
+        "my-app".parse().unwrap()
+    }
+
+    /// A gated counterpart of [`manifest`], for what only `gating: edge`
+    /// containers receive. Indented the same way, for the same reason.
+    fn gated_manifest(container: &str) -> AppManifest {
+        let container: String = container
+            .lines()
+            .map(|line| format!("  {line}\n"))
+            .collect();
+
+        AppManifest::parse(&format!(
+            "schema_version: 1
+source:
+  type: image
+  image: traefik/whoami:latest
+routing:
+  hosts: [alpha.test]
+auth:
+  gating: edge
+  roles: [reader]
+container:
+{container}"
+        ))
+        .unwrap()
+    }
+
     #[test]
     fn gives_the_container_its_environment_in_order() {
         let manifest = manifest("env:\n  ZULU: last\n  ALPHA: first");
 
         assert_eq!(
-            environment(&manifest).unwrap(),
+            environment(&my_app(), &manifest, None).unwrap(),
             ["ALPHA=first", "ZULU=last"]
         );
     }
 
     #[test]
     fn gives_a_container_with_no_environment_an_empty_one() {
-        assert!(environment(&manifest("port: 80")).unwrap().is_empty());
+        assert!(
+            environment(&my_app(), &manifest("port: 80"), None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The JWT contract's variables, injected exactly where the contract
+    /// applies: a gated container gets all three, after the manifest's own
+    /// environment — whose names the reserved `SPACEPORT` prefix keeps clear.
+    #[test]
+    fn gives_a_gated_container_the_spaceport_variables() {
+        let manifest = gated_manifest("env:\n  MODE: production");
+
+        assert_eq!(
+            environment(&my_app(), &manifest, Some("https://spaceport.test")).unwrap(),
+            [
+                "MODE=production",
+                "SPACEPORT_APP_ID=my-app",
+                "SPACEPORT_ISSUER=https://spaceport.test",
+                "SPACEPORT_JWKS_URL=https://spaceport.test/.well-known/jwks.json",
+            ]
+        );
+    }
+
+    /// An open app is outside the JWT contract, so it gets none of the
+    /// contract's variables — an issuer that will never issue to it included.
+    #[test]
+    fn gives_an_open_container_no_spaceport_variables() {
+        let manifest = manifest("env:\n  MODE: production");
+
+        assert_eq!(
+            environment(&my_app(), &manifest, Some("https://spaceport.test")).unwrap(),
+            ["MODE=production"]
+        );
+    }
+
+    /// Without a hostname there is no issuer and no JWKS to point at, and a
+    /// gated app cannot be signed into anyway — so only the app id, which
+    /// needs no hostname, is injected rather than URLs invented from nothing.
+    #[test]
+    fn withholds_the_url_variables_when_no_hostname_is_configured() {
+        let manifest = gated_manifest("port: 80");
+
+        assert_eq!(
+            environment(&my_app(), &manifest, None).unwrap(),
+            ["SPACEPORT_APP_ID=my-app"]
+        );
+    }
+
+    /// The injected variables are part of the container's fixed environment,
+    /// so they are part of the fingerprint too: a gated container from before
+    /// the hostname existed must be replaced, not adopted — while an open
+    /// app's fingerprint stays exactly as it always was, hostname or not.
+    #[test]
+    fn fingerprints_the_injected_variables_for_gated_apps_only() {
+        let gated = gated_manifest("port: 80");
+        let open = manifest("port: 80");
+        let with = |manifest: &AppManifest, issuer: Option<&str>| {
+            fingerprint(
+                &data(),
+                &my_app(),
+                "traefik/whoami:latest",
+                manifest,
+                issuer,
+            )
+        };
+
+        assert_ne!(
+            with(&gated, None),
+            with(&gated, Some("https://spaceport.test"))
+        );
+        assert_eq!(
+            with(&open, None),
+            with(&open, Some("https://spaceport.test"))
+        );
     }
 
     /// A manifest of `container` with `secrets` resolved to the given values,
@@ -1316,7 +1491,7 @@ env:
         );
 
         assert_eq!(
-            environment(&manifest).unwrap(),
+            environment(&my_app(), &manifest, None).unwrap(),
             ["DATABASE_URL=postgres://user:hunter2@db:5432/app"]
         );
     }
@@ -1334,7 +1509,7 @@ env:
         );
 
         assert_eq!(
-            environment(&manifest).unwrap(),
+            environment(&my_app(), &manifest, None).unwrap(),
             ["DATABASE_URL=postgres://admin:hunter2@db/app"]
         );
     }
@@ -1352,7 +1527,7 @@ env:
         );
 
         assert_eq!(
-            environment(&manifest).unwrap(),
+            environment(&my_app(), &manifest, None).unwrap(),
             ["A=hunter2", "B=before hunter2 after"]
         );
     }
@@ -1370,7 +1545,9 @@ env:
   DATABASE_URL: \"pw={{DB_PASSWORD}}\"",
         );
 
-        let err = environment(&manifest).unwrap_err().to_string();
+        let err = environment(&my_app(), &manifest, None)
+            .unwrap_err()
+            .to_string();
 
         assert!(err.contains("DB_PASSWORD"), "{err}");
         assert!(err.contains("not resolved"), "{err}");
@@ -1588,7 +1765,7 @@ env:
     /// nothing but daemon, so they should run wherever one exists, but a
     /// checkout with no docker installed is not a broken checkout.
     async fn daemon() -> Option<DockerRuntime> {
-        let runtime = DockerRuntime::connect(DataDir::new(temp_dir())).ok()?;
+        let runtime = DockerRuntime::connect(DataDir::new(temp_dir()), None).ok()?;
         runtime.ping().await.ok()?;
 
         Some(runtime)

@@ -300,22 +300,39 @@ impl SessionRepository {
     /// parent join is needed here — every way a parent dies deletes these rows
     /// in the same commit, so the row's own existence and expiry answer.
     pub async fn app_session_lives(&self, token: &Secret, app: &AppId) -> Result<bool> {
+        Ok(self.app_session_user(token, app).await?.is_some())
+    }
+
+    /// The user a live app session for `app` belongs to, or `None` for a token
+    /// that names no live one — the same question as
+    /// [`SessionRepository::app_session_lives`], answered with the identity
+    /// the JWT's `sub` needs.
+    ///
+    /// This is the read the milestone-6 cache stands in front of: it runs once
+    /// per cache miss rather than once per request, and the four minutes an
+    /// entry then lives are the spec's whole staleness budget on the hot path.
+    /// A stored user id this build cannot parse answers "nobody", the
+    /// failing-closed direction: an unreadable identity must not sign in, and
+    /// must certainly not be vouched for to an app.
+    pub async fn app_session_user(&self, token: &Secret, app: &AppId) -> Result<Option<UserId>> {
         let token_hash = hash(token.expose());
         let app = app.clone();
 
         self.db
             .call(move |connection| {
-                let expires_at: Option<String> = connection
+                let found: Option<(String, String)> = connection
                     .query_row(
-                        "SELECT expires_at FROM app_sessions
+                        "SELECT user_id, expires_at FROM app_sessions
                          WHERE token_hash = ?1 AND spaceport_app = ?2",
                         rusqlite::params![token_hash, app.as_str()],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()
                     .context("looking an app session up")?;
 
-                Ok(expires_at.is_some_and(|at| !is_past(&at)))
+                Ok(found
+                    .filter(|(_, expires_at)| !is_past(expires_at))
+                    .and_then(|(user, _)| user.parse().ok()))
             })
             .await
     }
@@ -691,6 +708,30 @@ mod tests {
         );
         assert_eq!(rows_in(&sessions, "app_sessions").await, 0);
         assert_eq!(rows_in(&sessions, "exchange_nonces").await, 0);
+    }
+
+    /// The identity half of the proxy's question: the user an app session
+    /// answers with is the JWT's `sub`, and only for the app the session was
+    /// minted for.
+    #[tokio::test]
+    async fn an_app_session_answers_with_its_user() {
+        let (users, sessions, _) = repositories();
+        let fresh = signed_in(&users, &sessions).await;
+        let minted = app_session(&sessions, &fresh).await;
+
+        let user = sessions
+            .app_session_user(&minted.token, &blog())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(user, fresh.user);
+        assert!(
+            sessions
+                .app_session_user(&minted.token, &"wiki".parse().unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The inherited expiry is enforced, not only reported: an app session

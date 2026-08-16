@@ -89,14 +89,29 @@ pub(super) fn unknown(user: &UserRef) -> anyhow::Error {
 }
 
 /// The global user pool, over the state database.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UserRepository {
     db: Db,
+    /// The JWT cache the edge mints into. Suspend and drop are two of the
+    /// spec's purge levers, and the purge lives beside `offboard`'s call sites
+    /// because that is the cascade's one home; it runs after the commit, since
+    /// the cache is only ever a copy of what the tables allow and must never
+    /// be emptier than them ahead of a rollback. Shared through
+    /// [`UserRepository::with_jwt_cache`]; `new` makes a private one for the
+    /// tests that never mint a JWT.
+    jwt_cache: std::sync::Arc<super::jwt::JwtCache>,
 }
 
 impl UserRepository {
     pub fn new(db: Db) -> Self {
-        Self { db }
+        Self::with_jwt_cache(db, std::sync::Arc::new(super::jwt::JwtCache::new()))
+    }
+
+    /// The constructor the daemon uses: the one process-wide cache, so a
+    /// suspend or drop committed here empties exactly the entries the edge
+    /// would serve next.
+    pub fn with_jwt_cache(db: Db, jwt_cache: std::sync::Arc<super::jwt::JwtCache>) -> Self {
+        Self { db, jwt_cache }
     }
 
     /// Every live user, in slug order, optionally only those whose slug
@@ -290,7 +305,15 @@ impl UserRepository {
             .await
             .map_err(UserError::Failed)?;
 
-        found.ok_or_else(|| UserError::Unknown(unknown(user)))
+        let record = found.ok_or_else(|| UserError::Unknown(unknown(user)))?;
+        // The cached-JWT half of the offboarding cascade, only when the door
+        // actually closed: a resume purges nothing, because nothing about a
+        // resumed user's access got narrower.
+        if suspended {
+            self.jwt_cache.purge_user(&record.id);
+        }
+
+        Ok(record)
     }
 
     /// Delete a user, keeping only the log's memory of them.
@@ -353,7 +376,12 @@ impl UserRepository {
             .await
             .map_err(UserError::Failed)?;
 
-        found.ok_or_else(|| UserError::Unknown(unknown(user)))
+        let record = found.ok_or_else(|| UserError::Unknown(unknown(user)))?;
+        // The dropped user's cached JWTs die with everything else of theirs —
+        // after the commit, for `mark`'s reason.
+        self.jwt_cache.purge_user(&record.id);
+
+        Ok(record)
     }
 }
 
@@ -376,13 +404,18 @@ fn slug_collision(error: &anyhow::Error) -> bool {
 
 /// Where suspending or dropping a user grows its teeth.
 ///
-/// HOOK POINT — first tenant in place. The spec has both verbs cascade the
-/// same way: sessions (global and per-app, WebSocket connections included),
-/// API keys and cached JWTs all die with the user, in this transaction, so
-/// that a user the pool says is gone can never be one a session table still
-/// lets in. Global sessions and their pending one-time codes now do; API
-/// keys, derived app sessions and cached JWTs join here — and nowhere else —
-/// as their milestones land. Entitlements deliberately do *not*: they cascade
+/// HOOK POINT — the database tenants live here. The spec has both verbs
+/// cascade the same way: sessions (global and per-app, WebSocket connections
+/// included), API keys and cached JWTs all die with the user, so that a user
+/// the pool says is gone can never be one a session table still lets in.
+/// Global sessions, pending one-time codes, app sessions and exchange nonces
+/// now do, in this transaction; API keys join here as their milestone lands.
+/// Cached JWTs are the one tenant that cannot: the cache is in-memory, not a
+/// table, so its purge sits at this function's call sites, after the commit —
+/// a purge inside a transaction that then rolled back would leave the cache
+/// emptier than the rows, which is harmless, but the discipline of "commit,
+/// then purge" keeps the cache a strict copy. Entitlements deliberately do
+/// *not* cascade here: they cascade
 /// on drop only — suspend keeps them so resume restores access — so their
 /// delete lives at [`UserRepository::drop_user`]'s call site rather than in
 /// this shared path.

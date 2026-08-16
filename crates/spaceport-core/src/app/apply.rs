@@ -35,7 +35,7 @@ use super::manifest::{Source, VarName};
 use super::repository::AppRepository;
 use super::secrets::SecretRepository;
 use super::store::{Removed, Suspended};
-use super::{App, AppId, AppManifest, AppStore, health};
+use super::{App, AppId, AppManifest, AppStore, Auth, health};
 use crate::build::repository::BuildRepository;
 use crate::runtime::{Adopted, Container, ContainerRuntime};
 
@@ -297,12 +297,29 @@ pub struct Applier {
     /// an `Arc` to an entry a newcomer has already replaced with a second lock
     /// for the same id — two locks for one app being exactly no lock at all.
     worked_on: Mutex<WorkedOn>,
+    /// The JWT cache the edge mints into, purged per app when a deploy changes
+    /// the roles its manifest declares: every cached token's `roles` was
+    /// intersected against the old manifest, so the whole app's entries are
+    /// stale at once. Here and not in a handler, because this is the one choke
+    /// point every way of deploying goes through — the operator's apply, the
+    /// operator's deploy, and the worker behind an armed app.
+    jwt_cache: Arc<crate::auth::JwtCache>,
 }
 
 /// One lock per app, and beside it the number of holders and waiters that lock
 /// has — which is what says when the app can be forgotten again. Named only so
 /// that the shape is written once.
 type WorkedOn = HashMap<AppId, (Arc<AsyncMutex<()>>, usize)>;
+
+/// The roles `manifest` declares, as the set the JWT intersection reads them:
+/// a gated app's list, and the empty set for `gating: open`, so a deploy that
+/// flips the gating counts as the roles changing — which it is.
+fn declared_roles(manifest: &AppManifest) -> std::collections::BTreeSet<crate::auth::Role> {
+    match &manifest.auth {
+        Auth::Edge { roles, .. } => roles.iter().cloned().collect(),
+        Auth::Open {} => std::collections::BTreeSet::new(),
+    }
+}
 
 impl Applier {
     pub fn new(
@@ -319,7 +336,20 @@ impl Applier {
             builds,
             secrets,
             worked_on: Mutex::default(),
+            jwt_cache: Arc::new(crate::auth::JwtCache::new()),
         }
+    }
+
+    /// Share the process-wide JWT cache, so a deploy that changes an app's
+    /// declared roles purges the entries the edge would serve next. `new`
+    /// leaves a private cache in place for the many tests that never mint a
+    /// JWT — a purge against an empty cache is free — and the daemon calls
+    /// this once, at wiring.
+    #[must_use]
+    pub fn with_jwt_cache(mut self, jwt_cache: Arc<crate::auth::JwtCache>) -> Self {
+        self.jwt_cache = jwt_cache;
+
+        self
     }
 
     /// Take `id` for as long as the returned guard is held, waiting for whoever
@@ -781,6 +811,21 @@ impl Applier {
         // verb ahead of this one in the queue may have changed — a `set` of the
         // last missing secret, or a `suspend` of the app this is about to start.
         //
+        // The roles the app declared before this deploy, read while the old
+        // record still is the record: if they differ from the new manifest's,
+        // every cached JWT for this app carries an intersection against a
+        // slate that no longer exists, and the purge below is the spec's
+        // "roles change on deploy" lever. Read failures collapse to "no
+        // roles", which errs towards purging — a purge too many costs one
+        // re-mint per user, a purge too few costs four minutes of stale roles.
+        let previous_roles = match self.repository.recorded(&id).await {
+            Ok(Some(record)) => AppManifest::parse(&record.manifest)
+                .map(|manifest| declared_roles(&manifest))
+                .unwrap_or_default(),
+            Ok(None) | Err(_) => std::collections::BTreeSet::new(),
+        };
+        let fresh_roles = declared_roles(&manifest);
+
         // The document, taken before anything is resolved: what is recorded is
         // what the operator or the repository wrote, and resolving a build
         // deliberately leaves that text alone.
@@ -819,6 +864,14 @@ impl Applier {
             .await
         {
             warn!(app = %applied.id(), %error, "the app was not recorded, so it will not survive a restart");
+        }
+
+        // The manifest that decides the intersection has changed hands, so the
+        // tokens intersected against the old one go — after the app is what
+        // the new document says, never before, or a request in the window
+        // would re-mint against the manifest this deploy is replacing.
+        if previous_roles != fresh_roles {
+            self.jwt_cache.purge_app(applied.id());
         }
 
         // Everything is in place and the answer is still no. The operator asked
@@ -1449,6 +1502,75 @@ container:
 "
         ))
         .unwrap()
+    }
+
+    /// A gated counterpart of [`manifest`], declaring `roles` — for the test
+    /// about the deploy-time JWT purge, which only gated manifests can move.
+    fn gated_manifest(roles: &str) -> AppManifest {
+        AppManifest::parse(&format!(
+            "schema_version: 1
+source:
+  type: image
+  image: strm/helloworld-http:latest
+routing:
+  hosts: [alpha.test]
+auth:
+  gating: edge
+  roles: {roles}
+container:
+  health:
+    readiness:
+      type: none
+"
+        ))
+        .unwrap()
+    }
+
+    /// The spec's fourth purge lever: a deploy that changes the app's declared
+    /// roles empties the app's cached JWTs — every cached token's `roles` was
+    /// intersected against the manifest the deploy replaced — while a deploy
+    /// that keeps the roles leaves the cache alone, and another app's entries
+    /// survive either way.
+    #[tokio::test]
+    async fn a_deploy_that_changes_declared_roles_purges_the_apps_cached_jwts() {
+        let cache = Arc::new(crate::auth::JwtCache::new());
+        let (applier, _) = applier(Arc::new(FakeRuntime::default()));
+        let applier = applier.with_jwt_cache(cache.clone());
+        let blog: AppId = "blog".parse().unwrap();
+        let user: crate::auth::UserId = "3f29b1d4-8a6e-4c2b-9e77-1d5f6a2b9c40".parse().unwrap();
+        let plant = |app: &AppId| {
+            cache.insert(
+                &Secret::new("a-cookie"),
+                app,
+                &user,
+                Secret::new("a-cached-jwt"),
+            );
+        };
+        let held = |app: &AppId| cache.lookup(&Secret::new("a-cookie"), app).is_some();
+
+        applier
+            .apply(blog.clone(), gated_manifest("[reader]"), false)
+            .await
+            .unwrap();
+        plant(&blog);
+        plant(&"wiki".parse().unwrap());
+
+        // The same roles again: nothing about the intersection moved, so the
+        // cache is left alone.
+        applier
+            .apply(blog.clone(), gated_manifest("[reader]"), false)
+            .await
+            .unwrap();
+        assert!(held(&blog));
+
+        // A different slate: every cached token for this app is stale at once
+        // — and only for this app.
+        applier
+            .apply(blog.clone(), gated_manifest("[reader, writer]"), false)
+            .await
+            .unwrap();
+        assert!(!held(&blog));
+        assert!(held(&"wiki".parse().unwrap()));
     }
 
     /// The app an apply started, for the tests that are not about suspension.

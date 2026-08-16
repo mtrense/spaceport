@@ -20,6 +20,7 @@
 
 pub mod app_session;
 pub mod entitlement;
+pub mod jwt;
 pub mod log;
 pub mod repository;
 pub mod session;
@@ -29,6 +30,7 @@ pub use entitlement::{
     EntitlementError, EntitlementRecord, EntitlementRepository, Granted, RevokeScope, Revoked,
     RoleAtApp,
 };
+pub use jwt::{JwtCache, JwtSigner};
 pub use log::{AuthEvent, AuthLogRepository, OPERATOR_ORIGIN, WEB_ORIGIN};
 pub use repository::UserRepository;
 pub use session::{
@@ -66,32 +68,44 @@ impl UserId {
     /// not produce random bytes is a host that should not be minting
     /// identities.
     pub fn generate() -> Result<Self> {
-        let mut bytes = [0_u8; 16];
-        ring::rand::SystemRandom::new()
-            .fill(&mut bytes)
-            // ring's own error says nothing; what an operator can act on is
-            // that the host's randomness is what failed.
-            .map_err(|_| anyhow::anyhow!("this host would not produce random bytes"))?;
-
-        // What makes sixteen random bytes a v4 UUID: the version nibble says 4,
-        // and the two variant bits say RFC 4122.
-        bytes[6] = (bytes[6] & 0x0f) | 0x40;
-        bytes[8] = (bytes[8] & 0x3f) | 0x80;
-
-        let mut rendered = String::with_capacity(36);
-        for (index, byte) in bytes.iter().enumerate() {
-            if matches!(index, 4 | 6 | 8 | 10) {
-                rendered.push('-');
-            }
-            rendered.push_str(&format!("{byte:02x}"));
-        }
-
-        Ok(Self(rendered))
+        uuid_v4().map(Self)
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// A fresh version-4 UUID off the host's randomness, rendered in the canonical
+/// hyphenated lowercase form.
+///
+/// One function for the two things this module tree mints in UUID shape — a
+/// user's id and a JWT's `jti` — so the pinned bits and the rendering are
+/// written once. Hand-rolled from [`ring::rand::SystemRandom`] rather than a
+/// `uuid` crate, for [`UserId`]'s reason: sixteen random bytes with six bits
+/// pinned would not survive as a dependency justification.
+pub(crate) fn uuid_v4() -> Result<String> {
+    let mut bytes = [0_u8; 16];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        // ring's own error says nothing; what an operator can act on is
+        // that the host's randomness is what failed.
+        .map_err(|_| anyhow::anyhow!("this host would not produce random bytes"))?;
+
+    // What makes sixteen random bytes a v4 UUID: the version nibble says 4,
+    // and the two variant bits say RFC 4122.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    let mut rendered = String::with_capacity(36);
+    for (index, byte) in bytes.iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            rendered.push('-');
+        }
+        rendered.push_str(&format!("{byte:02x}"));
+    }
+
+    Ok(rendered)
 }
 
 impl FromStr for UserId {

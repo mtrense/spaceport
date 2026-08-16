@@ -158,11 +158,12 @@ pub async fn handle(
     // The gate stands between routing and forwarding, which is the only place
     // it can: it needs the app's manifest to know whether there is a door, and
     // it must run before the rewrite below destroys the headers it reads. An
-    // open app costs one enum match here; a gated one costs the database read
-    // the spec accepts until milestone 6's JWT cache.
-    if let Some(refused) = gate::gate(&state, &app, name, &req).await {
-        return Ok(refused);
-    }
+    // open app costs one enum match here; a gated one costs a cache lookup on
+    // the hot path, and the database reads plus one signature on a miss.
+    let bearer = match gate::gate(&state, &app, name, &req).await {
+        gate::Admission::Refused(refused) => return Ok(refused),
+        gate::Admission::Pass { bearer } => bearer,
+    };
 
     let upstream = app.upstream;
     // Kept for the event at the end, which is written after the request has
@@ -180,6 +181,27 @@ pub async fn handle(
         req.headers_mut(),
         matches!(app.manifest.auth, Auth::Edge { .. }),
     );
+    // After the strip, deliberately: every `Authorization` a client sent is
+    // gone by now, so the header the app reads can only ever be spaceport's
+    // own voice — the JWT contract's `Bearer`, minted by the gate above.
+    if let Some(jwt) = bearer {
+        match HeaderValue::from_str(&format!("Bearer {}", jwt.expose())) {
+            Ok(value) => {
+                req.headers_mut().insert(header::AUTHORIZATION, value);
+            }
+            // A token this build minted always fits in a header; one that does
+            // not was never minted here, and forwarding without it fails
+            // closed at the app's own verifier rather than open.
+            Err(error) => {
+                warn!(app = %app.id, %error, "could not render the minted jwt as a header");
+
+                return Ok(refuse(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "spaceport could not attach its credentials\n".into(),
+                ));
+            }
+        }
+    }
 
     match state.upstreams.client.request(req).await {
         Ok(response) => {
@@ -553,7 +575,26 @@ mod tests {
     /// which have to plant users, sessions and entitlements behind the edge's
     /// back and then knock on the front.
     async fn edge_over(apps: Arc<AppStore>, db: crate::state::Db) -> SocketAddr {
-        let sessions = Arc::new(crate::auth::SessionRepository::new(db.clone()));
+        edge_with(apps, db, Arc::new(crate::auth::JwtCache::new())).await
+    }
+
+    /// And the same again, sharing the test's own JWT cache — for the purge
+    /// tests, whose repositories on the operator side must be emptying the
+    /// very cache the edge mints into, exactly as the daemon wires them.
+    async fn edge_with(
+        apps: Arc<AppStore>,
+        db: crate::state::Db,
+        jwt_cache: Arc<crate::auth::JwtCache>,
+    ) -> SocketAddr {
+        let sessions = Arc::new(crate::auth::SessionRepository::with_jwt_cache(
+            db.clone(),
+            jwt_cache.clone(),
+        ));
+        let entitlements = Arc::new(crate::auth::EntitlementRepository::with_jwt_cache(
+            db.clone(),
+            jwt_cache.clone(),
+        ));
+        let signer = Arc::new(crate::auth::JwtSigner::new(db.clone()));
         let hostname = Some("spaceport.test".to_owned());
         let state = Arc::new(EdgeState {
             router: routes::router(routes::SpaceportRoutes {
@@ -579,14 +620,19 @@ mod tests {
                 builds: crate::connections::github::Nudge::new(),
                 hostname: hostname.clone(),
                 sessions: sessions.clone(),
-                entitlements: Arc::new(crate::auth::EntitlementRepository::new(db.clone())),
+                entitlements: entitlements.clone(),
                 auth_log: Arc::new(crate::auth::AuthLogRepository::new(db)),
                 apps: apps.clone(),
+                signer: signer.clone(),
+                jwt_cache: jwt_cache.clone(),
                 https_port: 443,
             })),
             apps,
             upstreams: Upstreams::new(),
             sessions,
+            entitlements,
+            signer,
+            jwt_cache,
             hostname,
             https_port: 443,
         });
@@ -937,8 +983,13 @@ mod tests {
     #[tokio::test]
     async fn the_redirect_chain_ends_with_an_app_cookie_and_the_original_path() {
         let db = crate::state::Db::in_memory().unwrap();
+        // The logout at the end is a purge lever, so the repository the test
+        // drops sessions through must share the cache the edge mints into —
+        // the same wiring the daemon does.
+        let jwt_cache = Arc::new(crate::auth::JwtCache::new());
         let users = crate::auth::UserRepository::new(db.clone());
-        let sessions = crate::auth::SessionRepository::new(db.clone());
+        let sessions =
+            crate::auth::SessionRepository::with_jwt_cache(db.clone(), jwt_cache.clone());
         let entitlements = crate::auth::EntitlementRepository::new(db.clone());
         let alice: crate::auth::UserRef = "alice".parse().unwrap();
         users.create(&"alice".parse().unwrap(), None).await.unwrap();
@@ -957,7 +1008,7 @@ mod tests {
         )));
         apps.insert(gated("blog", "alpha.test", upstream().await, ""))
             .unwrap();
-        let edge = edge_over(apps, db).await;
+        let edge = edge_with(apps, db, jwt_cache).await;
 
         // Hop one: the gate.
         let (status, headers, _) = get_headed(edge, "alpha.test", "/posts?q=1", NAVIGATE).await;
@@ -1292,8 +1343,9 @@ mod tests {
     }
 
     /// What a gated app actually receives: the smuggled `Authorization` and
-    /// `X-Spaceport` headers gone, the spaceport cookie gone, and the app's
-    /// own cookie still riding.
+    /// `X-Spaceport` headers gone, the spaceport cookie gone, the app's own
+    /// cookie still riding — and in `Authorization`'s place, spaceport's own
+    /// `Bearer`, which is the milestone-6 contract and never the client's word.
     #[tokio::test]
     async fn a_gated_app_never_sees_spaceports_credentials() {
         let db = crate::state::Db::in_memory().unwrap();
@@ -1317,10 +1369,10 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            body,
-            "authorization=[] cookie=[theme=dark] x-spaceport-user=[]"
-        );
+        assert!(body.contains("authorization=[Bearer ey"), "{body}");
+        assert!(!body.contains("smuggled"), "{body}");
+        assert!(body.contains("cookie=[theme=dark]"), "{body}");
+        assert!(body.contains("x-spaceport-user=[]"), "{body}");
     }
 
     /// And an open app keeps its `Authorization` — that header is its own
@@ -1350,6 +1402,324 @@ mod tests {
             body,
             "authorization=[Bearer theirs] cookie=[] x-spaceport-user=[]"
         );
+    }
+
+    /// A live app-session cookie for `user` at `app`, planted the way
+    /// [`app_cookie`] plants alice's, with the grants the test names — and the
+    /// user id handed back, because the JWT tests assert on `sub`.
+    async fn planted_cookie(
+        db: &crate::state::Db,
+        user: &str,
+        grants: &[&str],
+        app: &str,
+    ) -> (String, crate::auth::UserId) {
+        let users = crate::auth::UserRepository::new(db.clone());
+        let sessions = crate::auth::SessionRepository::new(db.clone());
+        let entitlements = crate::auth::EntitlementRepository::new(db.clone());
+        let named: crate::auth::UserRef = user.parse().unwrap();
+        let created = users.create(&user.parse().unwrap(), None).await.unwrap();
+        for grant in grants {
+            entitlements
+                .grant(&named, &grant.parse().unwrap())
+                .await
+                .unwrap();
+        }
+        let minted = sessions
+            .mint_code(&named, crate::auth::DEFAULT_SESSION_LIFETIME)
+            .await
+            .unwrap();
+        let fresh = sessions.redeem(&minted.code).await.unwrap();
+        let (session, user) = sessions.session_of(&fresh.token).await.unwrap().unwrap();
+        let nonce = sessions
+            .mint_nonce(&user, &app.parse().unwrap(), &session)
+            .await
+            .unwrap();
+        let fresh = sessions
+            .redeem_nonce(&nonce, &app.parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+
+        (
+            format!("__Host-spaceport-app-session={}", fresh.token.expose()),
+            created.id,
+        )
+    }
+
+    /// A gated app whose manifest declares `roles`, for the intersection tests
+    /// the fixed `[reader]` of [`gated`] cannot express.
+    fn gated_roles(id: &str, host: &str, upstream: SocketAddr, roles: &str) -> App {
+        App {
+            id: id.parse().unwrap(),
+            manifest: AppManifest::parse(&format!(
+                "schema_version: 1\nsource:\n  type: image\n  image: x\nrouting:\n  hosts: [{host}]\nauth:\n  gating: edge\n  roles: {roles}\n"
+            ))
+            .unwrap(),
+            container: crate::runtime::ContainerId::new("test-container"),
+            upstream,
+        }
+    }
+
+    /// The `Bearer` the echoing upstream reported receiving, out of its body.
+    fn echoed_jwt(body: &str) -> String {
+        body.split("authorization=[Bearer ")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no bearer reached the app: {body}"))
+            .split(']')
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn jwt_payload(jwt: &str) -> serde_json::Value {
+        use base64::Engine as _;
+
+        serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(jwt.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// The whole milestone-6 contract, end to end: a gated request arrives at
+    /// the app carrying a `Bearer` JWT whose claims are the spec's — `iss` the
+    /// edge's https origin, `sub` the stable user id, `aud` the app id, five
+    /// minutes of `exp`, and `roles` the intersection of the user's
+    /// entitlements with what the manifest declares — and whose signature
+    /// verifies against the JWKS the same edge serves at the well-known path.
+    #[tokio::test]
+    async fn a_gated_request_reaches_the_app_with_a_jwt_the_jwks_verifies() {
+        use base64::Engine as _;
+
+        let db = crate::state::Db::in_memory().unwrap();
+        // Entitled to `reader` (declared), `admin` at this app (undeclared)
+        // and `reader` at another app entirely: only the first may surface.
+        let (cookie, user) = planted_cookie(
+            &db,
+            "alice",
+            &["reader@blog", "admin@blog", "reader@wiki"],
+            "blog",
+        )
+        .await;
+        let apps = Arc::new(AppStore::answering_to(Some(
+            "spaceport.test".parse().unwrap(),
+        )));
+        apps.insert(gated_roles(
+            "blog",
+            "alpha.test",
+            credential_echo().await,
+            "[reader, writer]",
+        ))
+        .unwrap();
+        let edge = edge_over(apps, db).await;
+
+        let (status, _, body) = get_headed(edge, "alpha.test", "/", &[("cookie", &cookie)]).await;
+        assert_eq!(status, StatusCode::OK);
+        let jwt = echoed_jwt(&body);
+
+        let header: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(jwt.split('.').next().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(header["alg"], "EdDSA");
+        assert_eq!(header["typ"], "JWT");
+
+        let payload = jwt_payload(&jwt);
+        assert_eq!(payload["iss"], "https://spaceport.test");
+        assert_eq!(payload["sub"], user.as_str());
+        assert_eq!(payload["aud"], "blog");
+        assert_eq!(payload["roles"], serde_json::json!(["reader"]));
+        assert_eq!(
+            payload["exp"].as_i64().unwrap() - payload["iat"].as_i64().unwrap(),
+            300
+        );
+
+        // The verification an app's middleware performs, against the JWKS the
+        // edge itself serves on spaceport's own hostname.
+        let (status, _, jwks) =
+            get_headed(edge, "spaceport.test", "/.well-known/jwks.json", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        let jwks: serde_json::Value = serde_json::from_str(&jwks).unwrap();
+        let key = jwks["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|key| key["kid"] == header["kid"])
+            .expect("the jwks names the kid the token claims");
+        let public = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(key["x"].as_str().unwrap())
+            .unwrap();
+        let (message, signature) = jwt.rsplit_once('.').unwrap();
+        ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &public)
+            .verify(
+                message.as_bytes(),
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(signature)
+                    .unwrap(),
+            )
+            .expect("the edge's jwks should verify the edge's token");
+    }
+
+    /// The four-minute cache at work: the second request rides the first's
+    /// token — same `jti`, no re-mint — and a purge makes the third a fresh
+    /// mint with a fresh `jti`.
+    #[tokio::test]
+    async fn the_cache_reuses_a_jwt_and_a_purge_re_mints() {
+        let db = crate::state::Db::in_memory().unwrap();
+        let (cookie, user) = planted_cookie(&db, "alice", &["reader@blog"], "blog").await;
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated("blog", "alpha.test", credential_echo().await, ""))
+            .unwrap();
+        let jwt_cache = Arc::new(crate::auth::JwtCache::new());
+        let edge = edge_with(apps, db, jwt_cache.clone()).await;
+
+        let (_, _, first) = get_headed(edge, "alpha.test", "/", &[("cookie", &cookie)]).await;
+        let (_, _, second) = get_headed(edge, "alpha.test", "/", &[("cookie", &cookie)]).await;
+        assert_eq!(
+            jwt_payload(&echoed_jwt(&first))["jti"],
+            jwt_payload(&echoed_jwt(&second))["jti"],
+        );
+
+        jwt_cache.purge_user(&user);
+
+        let (status, _, third) = get_headed(edge, "alpha.test", "/", &[("cookie", &cookie)]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(
+            jwt_payload(&echoed_jwt(&first))["jti"],
+            jwt_payload(&echoed_jwt(&third))["jti"],
+        );
+    }
+
+    /// `spaceport auth session drop` is a purge lever: the moment the drop
+    /// commits, the cookie stops answering — where a cache nobody purged would
+    /// have gone on serving the dropped session for four minutes.
+    #[tokio::test]
+    async fn a_session_drop_stops_cached_access_immediately() {
+        let db = crate::state::Db::in_memory().unwrap();
+        let (cookie, _) = planted_cookie(&db, "alice", &["reader@blog"], "blog").await;
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated("blog", "alpha.test", upstream().await, ""))
+            .unwrap();
+        let jwt_cache = Arc::new(crate::auth::JwtCache::new());
+        let edge = edge_with(apps, db.clone(), jwt_cache.clone()).await;
+        let extra = [("cookie", cookie.as_str()), ("accept", "text/html")];
+
+        let (status, _, _) = get_headed(edge, "alpha.test", "/", &extra).await;
+        assert_eq!(status, StatusCode::OK);
+
+        crate::auth::SessionRepository::with_jwt_cache(db, jwt_cache)
+            .drop_sessions(&"alice".parse().unwrap(), None)
+            .await
+            .unwrap();
+
+        let (status, _, _) = get_headed(edge, "alpha.test", "/", &extra).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+    }
+
+    /// Suspending the user is the same lever pulled from the pool's side.
+    #[tokio::test]
+    async fn a_suspend_stops_cached_access_immediately() {
+        let db = crate::state::Db::in_memory().unwrap();
+        let (cookie, _) = planted_cookie(&db, "alice", &["reader@blog"], "blog").await;
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated("blog", "alpha.test", upstream().await, ""))
+            .unwrap();
+        let jwt_cache = Arc::new(crate::auth::JwtCache::new());
+        let edge = edge_with(apps, db.clone(), jwt_cache.clone()).await;
+        let extra = [("cookie", cookie.as_str()), ("accept", "text/html")];
+
+        let (status, _, _) = get_headed(edge, "alpha.test", "/", &extra).await;
+        assert_eq!(status, StatusCode::OK);
+
+        crate::auth::UserRepository::with_jwt_cache(db, jwt_cache)
+            .suspend(&"alice".parse().unwrap())
+            .await
+            .unwrap();
+
+        let (status, _, _) = get_headed(edge, "alpha.test", "/", &extra).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+    }
+
+    /// A revoke leaves the session alive and the access gone: the purge makes
+    /// the next request re-intersect, the intersection is empty, and the
+    /// spec's rule is a `403` — never an empty-`roles` JWT.
+    #[tokio::test]
+    async fn a_revoke_turns_the_next_request_into_a_403() {
+        let db = crate::state::Db::in_memory().unwrap();
+        let (cookie, _) = planted_cookie(&db, "alice", &["reader@blog"], "blog").await;
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated("blog", "alpha.test", upstream().await, ""))
+            .unwrap();
+        let jwt_cache = Arc::new(crate::auth::JwtCache::new());
+        let edge = edge_with(apps, db.clone(), jwt_cache.clone()).await;
+        let extra = [("cookie", cookie.as_str()), ("accept", "text/html")];
+
+        let (status, _, _) = get_headed(edge, "alpha.test", "/", &extra).await;
+        assert_eq!(status, StatusCode::OK);
+
+        crate::auth::EntitlementRepository::with_jwt_cache(db, jwt_cache)
+            .revoke(&"alice".parse().unwrap(), None)
+            .await
+            .unwrap();
+
+        let (status, _, body) = get_headed(edge, "alpha.test", "/", &extra).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("no access"), "{body}");
+    }
+
+    /// The cache is keyed so that nothing ever crosses: two users on one app
+    /// are vouched for as themselves, and one user on two apps gets a token
+    /// per audience.
+    #[tokio::test]
+    async fn the_cache_never_serves_across_users_or_apps() {
+        let db = crate::state::Db::in_memory().unwrap();
+        let (alices, alice) =
+            planted_cookie(&db, "alice", &["reader@blog", "reader@wiki"], "blog").await;
+        let (bobs, bob) = planted_cookie(&db, "bob", &["reader@blog"], "blog").await;
+        // Alice's second cookie, on the other app's domain.
+        let sessions = crate::auth::SessionRepository::new(db.clone());
+        let minted = sessions
+            .mint_code(
+                &"alice".parse().unwrap(),
+                crate::auth::DEFAULT_SESSION_LIFETIME,
+            )
+            .await
+            .unwrap();
+        let fresh = sessions.redeem(&minted.code).await.unwrap();
+        let (session, user) = sessions.session_of(&fresh.token).await.unwrap().unwrap();
+        let nonce = sessions
+            .mint_nonce(&user, &"wiki".parse().unwrap(), &session)
+            .await
+            .unwrap();
+        let wiki_cookie = format!(
+            "__Host-spaceport-app-session={}",
+            sessions
+                .redeem_nonce(&nonce, &"wiki".parse().unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .token
+                .expose()
+        );
+
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated("blog", "alpha.test", credential_echo().await, ""))
+            .unwrap();
+        apps.insert(gated("wiki", "beta.test", credential_echo().await, ""))
+            .unwrap();
+        let edge = edge_over(apps, db).await;
+
+        let (_, _, hers) = get_headed(edge, "alpha.test", "/", &[("cookie", &alices)]).await;
+        let (_, _, his) = get_headed(edge, "alpha.test", "/", &[("cookie", &bobs)]).await;
+        assert_eq!(jwt_payload(&echoed_jwt(&hers))["sub"], alice.as_str());
+        assert_eq!(jwt_payload(&echoed_jwt(&his))["sub"], bob.as_str());
+
+        let (_, _, wiki) = get_headed(edge, "beta.test", "/", &[("cookie", &wiki_cookie)]).await;
+        assert_eq!(jwt_payload(&echoed_jwt(&wiki))["aud"], "wiki");
+        assert_eq!(jwt_payload(&echoed_jwt(&hers))["aud"], "blog");
     }
 
     /// `https://host/path?query` in two pieces, for following a redirect by

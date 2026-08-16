@@ -30,6 +30,7 @@
 
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -39,6 +40,7 @@ use ring::rand::SecureRandom;
 use rusqlite::{OptionalExtension, Transaction};
 use tracing::info;
 
+use super::jwt::JwtCache;
 use super::log::{OPERATOR_ORIGIN, WEB_ORIGIN, record_in};
 use super::repository::{find, record, unknown};
 use super::{UserId, UserRecord, UserRef};
@@ -235,18 +237,32 @@ impl std::error::Error for RedeemError {}
 /// reads one and writes the other in a single transaction, and a caller who
 /// could reach the codes without the sessions could mint ways in that nothing
 /// lists.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionRepository {
     /// Visible to [`super::app_session`], which is the same repository's other
     /// half in another file: app sessions and exchange nonces are session
     /// tables, and a second repository over them could drop rows this one's
     /// cascades believe it owns.
     pub(super) db: Db,
+    /// The JWT cache the edge mints into, purged here because this repository
+    /// is where sessions die: `drop_sessions` and `logout` are the spec's
+    /// purge levers, and a purge that lived in a handler instead would miss
+    /// whichever caller the next milestone adds. Shared with the edge and the
+    /// other auth repositories through [`SessionRepository::with_jwt_cache`];
+    /// `new` makes a private one so the many tests that never mint a JWT need
+    /// not know the cache exists — a purge against an empty cache is free.
+    pub(super) jwt_cache: Arc<JwtCache>,
 }
 
 impl SessionRepository {
     pub fn new(db: Db) -> Self {
-        Self { db }
+        Self::with_jwt_cache(db, Arc::new(JwtCache::new()))
+    }
+
+    /// The constructor the daemon uses: the one process-wide cache, so a drop
+    /// committed here empties exactly the entries the edge would serve next.
+    pub fn with_jwt_cache(db: Db, jwt_cache: Arc<JwtCache>) -> Self {
+        Self { db, jwt_cache }
     }
 
     /// Mint a one-time code for the user `user` names, redeeming into a
@@ -562,6 +578,13 @@ impl SessionRepository {
             .await?;
 
         if let Some((session, user)) = &dropped {
+            // The cached JWTs the dropped app sessions were feeding go with
+            // them — after the commit, so a rollback never leaves the cache
+            // emptier than the tables, and by user because the app-session
+            // tokens themselves were only ever stored hashed.
+            if let Ok(user) = user.parse::<UserId>() {
+                self.jwt_cache.purge_user(&user);
+            }
             info!(%user, %session, "logout");
         }
 
@@ -674,6 +697,15 @@ impl SessionRepository {
                 user.slug,
             ))),
             Some(Ok((user, dropped))) => {
+                // `session drop` is a purge lever by spec: the cached JWTs the
+                // dropped sessions' derivatives minted must not outlive them.
+                // By user rather than per session, because the cache is keyed
+                // by app-session tokens this side never saw in the clear — a
+                // drop of one session also purging the other's entries costs a
+                // re-mint, not access.
+                if !dropped.is_empty() {
+                    self.jwt_cache.purge_user(&user.id);
+                }
                 for session in &dropped {
                     info!(user = %user.id, session = %session.id, "session dropped");
                 }

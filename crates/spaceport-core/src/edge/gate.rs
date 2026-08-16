@@ -52,61 +52,96 @@ use crate::secret::Secret;
 /// cookie refuses to do so over plaintext.
 pub(crate) const APP_SESSION_COOKIE: &str = "__Host-spaceport-app-session";
 
+/// What the gate said about one request: pass — with the JWT spaceport vouches
+/// for a gated request with, or without one for an open app or a public path —
+/// or the response refusing it instead.
+pub(super) enum Admission {
+    /// Forward it. For a gated request the bearer is the JWT to inject as
+    /// `Authorization` after the strip; an open app's and a public path's
+    /// requests carry none, because the spec mints no JWTs there.
+    Pass { bearer: Option<Secret> },
+    /// Answer with this and let no app hear of it.
+    Refused(Response<Body>),
+}
+
 /// Ask whether `req`, addressed to `host` and routed to the gated-or-open
-/// `app`, may pass to it. `None` is yes; a response is the refusal to send
-/// instead.
+/// `app`, may pass to it — and with which JWT, when it may.
 ///
-/// Every "no" here costs a database read and no more, and every gated "yes"
-/// costs exactly one — the app-session lookup. That per-request read is the
-/// spec's arrangement until milestone 6's JWT cache takes over the hot path.
+/// The hot path is the four-minute cache: a request whose cookie has a live
+/// entry costs no database read at all, which is milestone 6's whole point,
+/// and the four minutes are exactly the staleness window the spec accepts
+/// between purges. A miss costs the app-session lookup, the entitlement read
+/// and one Ed25519 signature, and refills the cache for everyone after.
 pub(super) async fn gate<B>(
     state: &EdgeState,
     app: &App,
     host: &str,
     req: &Request<B>,
-) -> Option<Response<Body>> {
+) -> Admission {
     let Auth::Edge {
         public_path_prefixes,
-        ..
+        roles,
     } = &app.manifest.auth
     else {
         // `gating: open`: spaceport holds no door here at all.
-        return None;
+        return Admission::Pass { bearer: None };
     };
 
     // Public prefixes are matched against the canonical spelling, so neither
     // `/css/../secret` nor `//public/x` can dodge or fake a match — see
-    // `canonical_path` for the full argument.
+    // `canonical_path` for the full argument. No JWT either: a public path is
+    // reachable signed out, and a token that sometimes rode along would be a
+    // contract the app cannot rely on.
     let canonical = canonical_path(req.uri().path());
     if public_path_prefixes
         .iter()
         .any(|prefix| prefix.matches(&canonical))
     {
-        return None;
+        return Admission::Pass { bearer: None };
     }
 
     if let Some(token) = cookie_value(req.headers(), APP_SESSION_COOKIE) {
-        match state
-            .sessions
-            .app_session_lives(&Secret::new(token), &app.id)
-            .await
-        {
+        let token = Secret::new(token);
+
+        // The cache first: a hit *is* the authentication — an entry only
+        // exists because this very cookie passed the database no more than
+        // four minutes ago, and every lever that could have revoked it since
+        // purges this cache in the same breath.
+        if let Some(jwt) = state.jwt_cache.lookup(&token, &app.id) {
             // Authenticated by the cookie — which is exactly the credential a
             // cross-site form rides, so unsafe methods pass through the CSRF
             // check before the request may pass to the app. Requests a future
             // API key authenticates are exempt by spec (a key never travels in
             // a cookie); that branch will return before this check when the
             // milestone lands.
-            Ok(true) => {
-                return csrf_refusal(req.method(), req.headers(), Some(host), state.https_port);
+            if let Some(refusal) =
+                csrf_refusal(req.method(), req.headers(), Some(host), state.https_port)
+            {
+                return Admission::Refused(refusal);
             }
-            Ok(false) => {}
+
+            return Admission::Pass { bearer: Some(jwt) };
+        }
+
+        match state.sessions.app_session_user(&token, &app.id).await {
+            Ok(Some(user)) => {
+                // The CSRF check, before anything is minted — same rule and
+                // same placement as on the cache hit above.
+                if let Some(refusal) =
+                    csrf_refusal(req.method(), req.headers(), Some(host), state.https_port)
+                {
+                    return Admission::Refused(refusal);
+                }
+
+                return vouch(state, app, roles, &token, &user).await;
+            }
+            Ok(None) => {}
             // Failing open would make a database hiccup an authentication
             // bypass; failing closed makes it an error page.
             Err(error) => {
                 warn!(error = %format!("{error:#}"), "could not check an app session");
 
-                return Some(plain(
+                return Admission::Refused(plain(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "spaceport could not check the session\n",
                 ));
@@ -120,7 +155,7 @@ pub(super) async fn gate<B>(
         .map(|hostname| exchange_url(hostname, state.https_port, app.id.as_str(), host, req.uri()));
 
     if is_navigation(req.method(), req.headers()) {
-        return Some(match login {
+        return Admission::Refused(match login {
             Some(login) => see_other(&login),
             // A gated app on a spaceport with no hostname has no exchange to
             // send anyone through. 503 rather than 401: the request is fine,
@@ -146,7 +181,110 @@ pub(super) async fn gate<B>(
         response.headers_mut().insert(X_SPACEPORT_LOGIN, value);
     }
 
-    Some(response)
+    Admission::Refused(response)
+}
+
+/// Mint the JWT that vouches for `user` to `app`, cache it, and pass — or
+/// refuse, when the roles have moved since the session was minted.
+///
+/// `roles` in the token is the intersection of the user's entitlements with
+/// what the deployed manifest declares, computed here per mint rather than
+/// per session: the exchange checked the same question before the cookie ever
+/// existed, but a revoke or a redeployed manifest since then can empty it —
+/// and the spec's rule is that an empty intersection is a `403`, never an
+/// empty-`roles` JWT. The check below is that rule at the mint site, so the
+/// exchange's gate and this one cannot drift apart; [`crate::auth::jwt::mint`]
+/// refuses an empty slate once more as the last line.
+async fn vouch(
+    state: &EdgeState,
+    app: &App,
+    roles: &[crate::auth::Role],
+    token: &Secret,
+    user: &crate::auth::UserId,
+) -> Admission {
+    // The iss the token claims must be an origin the app can fetch the JWKS
+    // from, and without a hostname spaceport has neither — the same missing
+    // piece the sign-in redirect refuses over, worded the same way.
+    let Some(hostname) = state.hostname.as_deref() else {
+        return Admission::Refused(plain(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this app is gated and spaceport has no `edge.hostname` to vouch for you as\n",
+        ));
+    };
+
+    let held = match state
+        .entitlements
+        .audit(&crate::auth::UserRef::Id(user.clone()))
+        .await
+    {
+        Ok((_, held)) => held,
+        // A user the pool no longer knows cannot be vouched for; their
+        // sessions died in the same transaction, so this is a race's width
+        // wide and "no access" is the honest answer on the losing side.
+        Err(crate::auth::EntitlementError::UnknownUser(_)) => Vec::new(),
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "could not read entitlements to mint a jwt");
+
+            return Admission::Refused(plain(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "spaceport could not check your access\n",
+            ));
+        }
+    };
+
+    // Sorted and deduplicated by the set, so two mints for one user render
+    // the claim identically whatever order the grants arrived in.
+    let intersection: std::collections::BTreeSet<crate::auth::Role> = held
+        .into_iter()
+        .filter(|entitlement| entitlement.app == app.id && roles.contains(&entitlement.role))
+        .map(|entitlement| entitlement.role)
+        .collect();
+    if intersection.is_empty() {
+        return Admission::Refused(plain(
+            StatusCode::FORBIDDEN,
+            "you are signed in, and your account has no access to this app\n",
+        ));
+    }
+    let intersection: Vec<crate::auth::Role> = intersection.into_iter().collect();
+
+    let key = match state.signer.signing_key().await {
+        Ok(key) => key,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "could not load the jwt signing key");
+
+            return Admission::Refused(plain(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "spaceport could not sign for you\n",
+            ));
+        }
+    };
+
+    // exp is iat plus five minutes and the cache holds it for four, so a
+    // cached token always reaches the app with at least a minute left — the
+    // spec's arithmetic, with the app-side verifier's sixty seconds of clock
+    // leeway on top of that.
+    let jwt = match crate::auth::jwt::mint(
+        &key,
+        &crate::auth::jwt::issuer(hostname, state.https_port),
+        user,
+        &app.id,
+        &intersection,
+        time::OffsetDateTime::now_utc(),
+    ) {
+        Ok(jwt) => jwt,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "could not mint a jwt");
+
+            return Admission::Refused(plain(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "spaceport could not sign for you\n",
+            ));
+        }
+    };
+
+    state.jwt_cache.insert(token, &app.id, user, jwt.clone());
+
+    Admission::Pass { bearer: Some(jwt) }
 }
 
 /// The header a `401` carries the exchange URL in, so a SPA that caught the

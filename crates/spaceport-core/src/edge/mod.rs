@@ -51,6 +51,18 @@ pub struct EdgeState {
     /// apps — the same repository the login page and the callback write, or a
     /// cookie one listener minted would be one another refuses.
     pub sessions: Arc<crate::auth::SessionRepository>,
+    /// What each user may reach, for the intersection a minted JWT's `roles`
+    /// carries. The same repository the exchange checks entitlements through,
+    /// because both are reading the same access question at different moments.
+    pub entitlements: Arc<crate::auth::EntitlementRepository>,
+    /// The key the gate signs JWTs with — the same signer whose JWKS the home
+    /// router serves, or a token minted here would fail against the document
+    /// apps verify with.
+    pub signer: Arc<crate::auth::JwtSigner>,
+    /// The four-minute JWT cache: the gate's hot path, and the very instance
+    /// the auth repositories purge on the operator side. Shared through
+    /// [`Home`], exactly as `sessions` is.
+    pub jwt_cache: Arc<crate::auth::JwtCache>,
     /// Spaceport's own hostname, for building the exchange URL a gated app
     /// bounces strangers to. Absent when the config named none, in which case
     /// gated apps can only refuse.
@@ -85,6 +97,9 @@ pub async fn serve(
     // the same repositories on purpose — the callback redeems what the login
     // page minted — and this is where that sameness is wired.
     let sessions = home.sessions.clone();
+    let entitlements = home.entitlements.clone();
+    let signer = home.signer.clone();
+    let jwt_cache = home.jwt_cache.clone();
     let hostname = home.hostname.clone();
 
     let state = Arc::new(EdgeState {
@@ -99,6 +114,9 @@ pub async fn serve(
         apps,
         upstreams: proxy::Upstreams::new(),
         sessions,
+        entitlements,
+        signer,
+        jwt_cache,
         hostname,
         https_port: listen.https.port(),
     });

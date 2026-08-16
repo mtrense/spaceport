@@ -96,6 +96,17 @@ pub struct Home {
     /// manifest from: nothing about where a user is sent is taken from the
     /// request that sent them here.
     pub apps: Arc<AppStore>,
+    /// The key that signs the JWTs gated apps receive, held here because the
+    /// JWKS that verifies them is served on this host — the spec pins it to
+    /// `https://<edge.hostname>/.well-known/jwks.json` — and the gate signs
+    /// with the same key through [`super::EdgeState`], or a token minted at
+    /// one listener would fail at the document the other serves.
+    pub signer: Arc<crate::auth::JwtSigner>,
+    /// The JWT cache the gate mints into. On the `Home` for the wiring's sake:
+    /// `edge::serve` copies it out for [`super::EdgeState`] exactly as it does
+    /// `sessions`, and the operator side purges the same instance through the
+    /// auth repositories.
+    pub jwt_cache: Arc<crate::auth::JwtCache>,
     /// Named in the callback URLs the exchange builds when it is not 443,
     /// exactly as the plaintext redirect names it.
     pub https_port: u16,
@@ -117,6 +128,7 @@ pub fn router(home: Arc<Home>) -> Router {
         .route("/login", get(login_page).post(login))
         .route("/logout", get(logout_page).post(logout))
         .route("/auth/exchange", get(exchange))
+        .route("/.well-known/jwks.json", get(jwks))
         .route(&format!("{}/{{state}}", manifest::SETUP_PATH), get(setup))
         .route(
             &format!("{}/{{state}}/callback", manifest::SETUP_PATH),
@@ -462,6 +474,45 @@ async fn exchange(
         query_encode(nonce.expose()),
         query_encode(&next),
     ))
+}
+
+/// `GET /.well-known/jwks.json`: the public keys that verify spaceport's JWTs.
+///
+/// Served on spaceport's own hostname only — the path the spec pins, on the
+/// origin `SPACEPORT_ISSUER` names, which is what lets an app's middleware
+/// derive this URL from the issuer alone. The document holds every key a
+/// token in flight might carry, `kid`-disambiguated, so key rotation is
+/// invisible to a verifier that re-fetches on an unknown `kid`.
+///
+/// `max-age=60`: JWKS reads are one per app process plus re-fetches, so the
+/// cache buys almost nothing in load — what it costs is rotation latency,
+/// since a verifier holding a stale document misses a brand-new key for up to
+/// the max-age. A minute keeps that window smaller than any human rotation
+/// runbook notices, where the five minutes a JWT lives would have made
+/// rotation's first minutes a stream of refusals.
+async fn jwks(State(home): State<Arc<Home>>) -> Response {
+    match home.signer.jwks().await {
+        Ok(document) => (
+            StatusCode::OK,
+            [
+                (http::header::CONTENT_TYPE, "application/jwk-set+json"),
+                (http::header::CACHE_CONTROL, "public, max-age=60"),
+            ],
+            document,
+        )
+            .into_response(),
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "the jwks could not be served");
+
+            // Plain text rather than a page: what is reading this is an app's
+            // JWT middleware, not a person with a browser.
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "spaceport could not read its signing keys\n",
+            )
+                .into_response()
+        }
+    }
 }
 
 /// A 303 to `location`: fetched with GET whatever this was.
@@ -912,8 +963,10 @@ mod tests {
             hostname: Some(HOSTNAME.to_owned()),
             sessions: Arc::new(SessionRepository::new(db.clone())),
             entitlements: Arc::new(EntitlementRepository::new(db.clone())),
-            auth_log: Arc::new(AuthLogRepository::new(db)),
+            auth_log: Arc::new(AuthLogRepository::new(db.clone())),
             apps: Arc::new(AppStore::new()),
+            signer: Arc::new(crate::auth::JwtSigner::new(db)),
+            jwt_cache: Arc::new(crate::auth::JwtCache::new()),
             https_port: 443,
         });
 
@@ -955,6 +1008,38 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert!(body.starts_with("spaceport "), "{body}");
+    }
+
+    /// The JWKS is served where the spec pins it — the well-known path on
+    /// spaceport's own host — in the JWK Set media type, cacheable for the
+    /// minute the handler's rotation-latency comment argues, and holding the
+    /// OKP key an app verifies with.
+    #[tokio::test]
+    async fn serves_the_jwks_on_the_well_known_path() {
+        let response = router(plain_home())
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/jwks.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/jwk-set+json"
+        );
+        assert_eq!(response.headers()["cache-control"], "public, max-age=60");
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let jwks: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let key = &jwks["keys"][0];
+        assert_eq!(key["kty"], "OKP");
+        assert_eq!(key["crv"], "Ed25519");
+        assert!(key["kid"].as_str().unwrap().contains('-'), "{jwks}");
+        assert!(!key["x"].as_str().unwrap().is_empty(), "{jwks}");
     }
 
     /// The host is spaceport's, but only the paths it serves are: a path
@@ -1621,6 +1706,8 @@ mod tests {
             entitlements: entitlements.clone(),
             auth_log: Arc::new(AuthLogRepository::new(db.clone())),
             apps,
+            signer: Arc::new(crate::auth::JwtSigner::new(db.clone())),
+            jwt_cache: Arc::new(crate::auth::JwtCache::new()),
             https_port: 443,
         });
 

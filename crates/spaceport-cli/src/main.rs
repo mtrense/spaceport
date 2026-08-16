@@ -15,8 +15,8 @@ use spaceport_core::app::{
     reconcile, supervise,
 };
 use spaceport_core::auth::{
-    AuthLogRepository, EntitlementRepository, RevokeScope, RoleAtApp, SessionId, SessionRepository,
-    UserId, UserRef, UserRepository, UserSlug,
+    AuthLogRepository, EntitlementRepository, JwtCache, JwtSigner, RevokeScope, RoleAtApp,
+    SessionId, SessionRepository, UserId, UserRef, UserRepository, UserSlug, jwt,
 };
 use spaceport_core::build;
 use spaceport_core::build::dir::BuildDir;
@@ -923,7 +923,16 @@ async fn run(args: RunArgs) -> Result<()> {
     builds.create()?;
     info!(path = %builds.root().display(), "opened the build directory");
 
-    let runtime = Arc::new(DockerRuntime::connect(data)?);
+    // The issuer gated containers are told to expect JWTs from — one spelling
+    // for the `iss` claim, the `SPACEPORT_ISSUER` variable and the JWKS URL,
+    // absent exactly when the hostname is.
+    let issuer = config
+        .edge
+        .hostname
+        .as_ref()
+        .map(|hostname| jwt::issuer(&hostname.to_string(), config.edge.listen.https.port()));
+
+    let runtime = Arc::new(DockerRuntime::connect(data, issuer)?);
     runtime.ping().await?;
 
     // Spaceport's own host is claimed before the first app is restored, so
@@ -933,16 +942,25 @@ async fn run(args: RunArgs) -> Result<()> {
         info!(%hostname, "answering to this host as spaceport itself");
     }
 
+    // One JWT cache for the whole process, made before anything that mints
+    // into it or purges it: the edge's gate fills it, and the auth
+    // repositories and the applier empty it on every revocation lever — two
+    // caches would be a purge that leaves the other one serving.
+    let jwt_cache = Arc::new(JwtCache::new());
+
     // Cloned rather than moved: the same engine runs the containers and builds
     // the images, which is what [`spaceport_core::build::image::ImageBuilder`]
     // is implemented on `DockerRuntime` for.
-    let applier = Arc::new(Applier::new(
-        apps.clone(),
-        runtime.clone(),
-        AppRepository::new(db.clone()),
-        BuildRepository::new(db.clone()),
-        SecretRepository::new(db.clone()),
-    ));
+    let applier = Arc::new(
+        Applier::new(
+            apps.clone(),
+            runtime.clone(),
+            AppRepository::new(db.clone()),
+            BuildRepository::new(db.clone()),
+            SecretRepository::new(db.clone()),
+        )
+        .with_jwt_cache(jwt_cache.clone()),
+    );
 
     // Ahead of the listeners, so a restart does not answer 404 for apps it is
     // in the middle of bringing back.
@@ -1101,12 +1119,21 @@ async fn run(args: RunArgs) -> Result<()> {
     // on the edge writes the rows this socket lists and drops, and two
     // repositories would only be two handles to the same table pretending
     // otherwise.
-    let sessions = Arc::new(SessionRepository::new(db.clone()));
+    let sessions = Arc::new(SessionRepository::with_jwt_cache(
+        db.clone(),
+        jwt_cache.clone(),
+    ));
     // Shared with the operator interface for the reason sessions are: the
     // exchange on the edge must be answering over the same rows a grant or a
     // denial audit reads on the socket.
-    let entitlements = Arc::new(EntitlementRepository::new(db.clone()));
+    let entitlements = Arc::new(EntitlementRepository::with_jwt_cache(
+        db.clone(),
+        jwt_cache.clone(),
+    ));
     let auth_log = Arc::new(AuthLogRepository::new(db.clone()));
+    // The key the edge signs app JWTs with, and whose JWKS it serves —
+    // generated on first need, persisted in the state store.
+    let signer = Arc::new(JwtSigner::new(db.clone()));
 
     let home = Arc::new(edge::Home {
         attempts: attempts.clone(),
@@ -1120,6 +1147,8 @@ async fn run(args: RunArgs) -> Result<()> {
         entitlements: entitlements.clone(),
         auth_log: auth_log.clone(),
         apps: apps.clone(),
+        signer,
+        jwt_cache: jwt_cache.clone(),
         https_port: config.edge.listen.https.port(),
     });
 
@@ -1147,7 +1176,7 @@ async fn run(args: RunArgs) -> Result<()> {
             // arming one, can make an image that already exists deployable
             // without anything being built to wake the loop on its own.
             deploying,
-            users: Arc::new(UserRepository::new(db.clone())),
+            users: Arc::new(UserRepository::with_jwt_cache(db.clone(), jwt_cache)),
             auth_log,
             entitlements,
             sessions,

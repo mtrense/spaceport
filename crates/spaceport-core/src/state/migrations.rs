@@ -543,6 +543,32 @@ const MIGRATIONS: &[&str] = &[
         expires_at     TEXT NOT NULL
     ) STRICT;
     CREATE INDEX exchange_nonces_by_user ON exchange_nonces (user_id);",
+    // 14 — the Ed25519 keys that sign the JWTs handed down to gated apps.
+    //
+    // In the database and not in a file of its own, because that is where every
+    // other key spaceport holds already lives: `acme_accounts.credentials` and
+    // `github_apps.private_key` are the precedent, the protection is the same
+    // `0700` directory and `0600` file, and a second storage location would be
+    // a second backup story for one host's secrets. `pkcs8` is the private key
+    // as ring generated it, base64; `public_key` is the raw 32-byte Ed25519
+    // public key, base64url — stored beside the private half so the JWKS can be
+    // served without parsing a private key on a read path.
+    //
+    // A table and not a single row, on purpose: rotation (a later milestone)
+    // retires a key rather than replacing it, because JWTs signed with the old
+    // key are still in flight for up to their five-minute lifetime and the JWKS
+    // must go on naming the key that verifies them. `current` flags the one key
+    // that signs — rotation flips it and stamps `retired_at` on the old row,
+    // and adds no schema. The `kid` is the spec's `YYYYMMDD-NNN` spelling and
+    // is what disambiguates keys for a verifier holding several.
+    "CREATE TABLE jwt_signing_keys (
+        kid        TEXT NOT NULL PRIMARY KEY,
+        pkcs8      TEXT NOT NULL,
+        public_key TEXT NOT NULL,
+        current    INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        retired_at TEXT
+    ) STRICT;",
 ];
 
 /// The schema version this build writes.
@@ -1036,6 +1062,46 @@ mod tests {
                 "created_at",
                 "expires_at"
             ]
+        );
+    }
+
+    /// A fresh signing key is not yet anything: `current` defaults to 0, so the
+    /// writer that flips exactly one row to 1 is the only thing that ever says
+    /// which key signs — and `retired_at` starts NULL, which is what "still in
+    /// the JWKS" reads as.
+    #[test]
+    fn the_fourteenth_migration_creates_the_signing_key_table() {
+        let connection = empty();
+        migrate(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO jwt_signing_keys (kid, pkcs8, public_key, created_at)
+                 VALUES ('20260816-001', 'a-pkcs8-document', 'a-public-key',
+                         '2026-08-16T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            columns(&connection, "jwt_signing_keys"),
+            [
+                "kid",
+                "pkcs8",
+                "public_key",
+                "current",
+                "created_at",
+                "retired_at"
+            ]
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT current, retired_at FROM jwt_signing_keys WHERE kid = '20260816-001'",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+                )
+                .unwrap(),
+            (0, None)
         );
     }
 

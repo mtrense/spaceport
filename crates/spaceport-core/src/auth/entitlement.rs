@@ -199,14 +199,29 @@ impl std::error::Error for EntitlementError {}
 /// everything else: the user pool's vocabulary is create/suspend/drop and the
 /// entitlements' is grant/revoke/audit, and a handler that grants roles has no
 /// business seeing the verbs that delete users.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EntitlementRepository {
     db: Db,
+    /// The JWT cache the edge mints into: `revoke` is one of the spec's purge
+    /// levers, since a cached JWT carries the roles as they were intersected
+    /// up to four minutes ago and a revoke must not wait that out. Grant is
+    /// deliberately not a purge — a wider slate arriving a re-mint late costs
+    /// a page load, not access. Shared through
+    /// [`EntitlementRepository::with_jwt_cache`]; `new` makes a private one
+    /// for the tests that never mint a JWT.
+    jwt_cache: std::sync::Arc<super::jwt::JwtCache>,
 }
 
 impl EntitlementRepository {
     pub fn new(db: Db) -> Self {
-        Self { db }
+        Self::with_jwt_cache(db, std::sync::Arc::new(super::jwt::JwtCache::new()))
+    }
+
+    /// The constructor the daemon uses: the one process-wide cache, so a
+    /// revoke committed here empties exactly the entries the edge would serve
+    /// next.
+    pub fn with_jwt_cache(db: Db, jwt_cache: std::sync::Arc<super::jwt::JwtCache>) -> Self {
+        Self { db, jwt_cache }
     }
 
     /// Grant `entitlement` to the user `user` names.
@@ -414,6 +429,13 @@ impl EntitlementRepository {
                  mapping rule is what removes it",
             )));
         }
+
+        // Something was actually taken away, so the cached JWTs still carrying
+        // it go too — after the commit, so the cache is never emptier than the
+        // table ahead of a rollback. By user across every app rather than only
+        // the revoked one: an over-wide purge costs one re-mint per app, and a
+        // narrower purge would be more code deciding the same thing.
+        self.jwt_cache.purge_user(&revoked.user.id);
 
         for entitlement in &revoked.removed {
             info!(user = %revoked.user.id, %entitlement, "entitlement revoked");
