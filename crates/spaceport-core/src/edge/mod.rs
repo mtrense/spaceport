@@ -11,6 +11,7 @@ pub(crate) mod proxy;
 pub(crate) mod routes;
 mod service;
 pub mod tls;
+mod websocket;
 
 pub use home::Home;
 pub use service::{ConnInfo, Scheme};

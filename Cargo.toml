@@ -120,6 +120,11 @@ tokio = { version = "1", features = [
   "signal",
   "sync",
   "time",
+  # Only for `copy_bidirectional`, which is what a WebSocket tunnel is once
+  # both handshakes are done: bytes shovelled both ways until either side
+  # hangs up. Named explicitly rather than ridden in on another crate's
+  # feature unification, which is one `cargo update` away from vanishing.
+  "io-util",
 ] }
 tokio-rustls = { version = "0.26", default-features = false, features = [
   "ring",

@@ -12,11 +12,13 @@
 //!
 //! The signing key is generated on first need and kept in the state database,
 //! where every other key spaceport holds already lives — see migration 14 for
-//! the argument. There is one current key; rotation is a later milestone, and
-//! it only has to flip `current`, stamp `retired_at` and keep the retired row
-//! in the JWKS until every JWT it signed has expired, which the schema and
-//! [`JwtSigner::jwks`] are already shaped for. `kid` is what tells a verifier
-//! holding both keys which one made a given token.
+//! the argument. There is one current key, and rotation retires it rather than
+//! replacing it: [`JwtSigner::rotate`] flips `current`, stamps `retired_at`,
+//! and the JWKS keeps the retired row until every JWT it signed has expired.
+//! `kid` is what tells a verifier holding both keys which one made a given
+//! token. Rotation happens on the spec's ninety-day clock — checked lazily,
+//! whenever the key is next needed — and on demand over the operator socket,
+//! which is the compromise-response lever.
 //!
 //! The cache is the spec's staleness budget, whole: a JWT lives five minutes
 //! and is cached for four, so a cached token always has at least a minute
@@ -36,7 +38,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use rusqlite::OptionalExtension;
+use tokio_util::sync::CancellationToken;
 
+use super::log::record_in;
 use super::session::hash;
 use super::{Role, UserId, uuid_v4};
 use crate::app::AppId;
@@ -57,10 +61,17 @@ pub const CACHE_TTL: Duration = Duration::from_secs(4 * 60);
 
 /// How long a retired key stays in the JWKS after rotation flips away from it:
 /// every JWT it signed, plus the verifier's 60 seconds of clock-skew leeway.
-/// Nothing retires a key yet — rotation is a later milestone — but the read
-/// side honouring `retired_at` now is what makes that milestone a command
-/// rather than a schema change.
+/// Past this horizon no honestly-issued token could still verify against it,
+/// so the row is pruned by the next rotation rather than served forever.
 const RETIRED_KEY_GRACE: Duration = Duration::from_secs(JWT_LIFETIME.as_secs() + 60);
+
+/// How old the current key may grow before signing with it triggers a
+/// rotation — the spec's ninety days. Checked lazily, on [`JwtSigner`] use,
+/// rather than by a background task: a key that nothing asks to sign is a key
+/// nobody presents tokens from, so "the next time it is needed" is exactly the
+/// last moment rotation still matters — and a lazy check is one a test can
+/// drive by backdating a row instead of waiting out a season.
+pub const ROTATION_PERIOD: Duration = Duration::from_secs(90 * 24 * 3600);
 
 /// The `iss` a spaceport at `hostname` puts in every JWT, which is also what
 /// gated containers receive as `SPACEPORT_ISSUER`. One spelling for the three
@@ -107,6 +118,10 @@ pub struct JwtSigner {
 pub struct SigningKey {
     kid: String,
     pair: Ed25519KeyPair,
+    /// When the row was made, RFC 3339 — carried in memory so the ninety-day
+    /// check costs a parse and a comparison, never a database read on the
+    /// mint path.
+    created_at: String,
 }
 
 impl SigningKey {
@@ -120,6 +135,25 @@ impl SigningKey {
     }
 }
 
+/// One `jwt_signing_keys` row as `auth key list` reports it: everything but
+/// the key material, which no listing has any business showing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SigningKeyRecord {
+    pub kid: String,
+    pub current: bool,
+    pub created_at: String,
+    pub retired_at: Option<String>,
+}
+
+/// What a rotation did: the kid now signing, and the one it retired — absent
+/// when there was nothing to retire, which only a manual rotate on a spaceport
+/// that never signed can produce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rotation {
+    pub kid: String,
+    pub retired: Option<String>,
+}
+
 impl JwtSigner {
     pub fn new(db: Db) -> Self {
         Self {
@@ -129,7 +163,9 @@ impl JwtSigner {
     }
 
     /// The current signing key, generating and persisting one if this
-    /// spaceport has never signed before.
+    /// spaceport has never signed before — and rotating it first when it has
+    /// grown past [`ROTATION_PERIOD`], so every token minted through this
+    /// method is signed by a key inside its ninety days.
     ///
     /// The keypair is generated *outside* the transaction — randomness has no
     /// business inside a database lock, as every mint in this module tree
@@ -137,10 +173,93 @@ impl JwtSigner {
     /// inserting, so two first-mints racing each other agree on one key and
     /// the loser's sixty-four random bytes are simply dropped.
     pub async fn signing_key(&self) -> Result<std::sync::Arc<SigningKey>> {
-        if let Some(key) = self.loaded() {
+        let key = match self.loaded() {
+            Some(key) => key,
+            None => self.load_or_generate().await?,
+        };
+        if !rotation_due(&key.created_at) {
             return Ok(key);
         }
 
+        // The clock, not an operator, ordered this one — the transaction
+        // re-checks the age, so two overdue mints racing each other rotate
+        // once between them and the loser signs with the winner's key.
+        let (key, rotation) = self.rotate_inner(super::SYSTEM_ORIGIN, false).await?;
+        if let Some(rotation) = &rotation {
+            tracing::info!(
+                kid = rotation.kid,
+                retired = rotation.retired.as_deref().unwrap_or_default(),
+                "rotated the jwt signing key on the ninety-day clock"
+            );
+        }
+
+        Ok(key)
+    }
+
+    /// Retire the current signing key and mint a fresh one, unconditionally —
+    /// the operator's lever, for the day a key is suspected compromised and
+    /// ninety days is eighty-nine too many. `origin` lands in the auth event
+    /// log's ORIGIN column: [`super::OPERATOR_ORIGIN`] from the socket, where
+    /// the automatic path writes [`super::SYSTEM_ORIGIN`].
+    ///
+    /// Nothing is purged: JWTs signed by the retired key stay valid until
+    /// their own `exp`, which is the whole point of keeping the key in the
+    /// JWKS through [`RETIRED_KEY_GRACE`] — and the [`JwtCache`] keeps serving
+    /// them for the same reason, since a cached token's old `kid` still names
+    /// a key the JWKS serves. A compromise response that must also kill
+    /// in-flight tokens is `session drop` / `suspend`, aimed at the users, not
+    /// at the key.
+    pub async fn rotate(&self, origin: &'static str) -> Result<Rotation> {
+        let (_, rotation) = self.rotate_inner(origin, true).await?;
+
+        // Forced, so the transaction always rotates and always reports.
+        rotation.context("a forced rotation reported nothing rotated")
+    }
+
+    /// Every signing key the store holds, newest first — pruned rows excepted,
+    /// which is what pruning means. The read behind `auth key list`.
+    pub async fn keys(&self) -> Result<Vec<SigningKeyRecord>> {
+        self.db
+            .call(|connection| {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT kid, current, created_at, retired_at FROM jwt_signing_keys
+                         ORDER BY kid DESC",
+                    )
+                    .context("preparing the signing key listing")?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok(SigningKeyRecord {
+                            kid: row.get(0)?,
+                            current: row.get::<_, i64>(1)? != 0,
+                            created_at: row.get(2)?,
+                            retired_at: row.get(3)?,
+                        })
+                    })
+                    .context("listing the signing keys")?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .context("listing the signing keys")?;
+
+                Ok(rows)
+            })
+            .await
+    }
+
+    /// The shared rotation transaction: retire whatever is current, mint a
+    /// fresh key, prune what nothing can verify against anymore, and log it —
+    /// one commit for all four, so no failure can leave the store between
+    /// keys.
+    ///
+    /// `force` is the difference between the two triggers. The operator's
+    /// rotate always rotates; the ninety-day path re-checks the current row's
+    /// age *inside* the transaction, because the age it saw in memory may be a
+    /// race behind another task's rotation — the loser then keeps the winner's
+    /// fresh key and reports no rotation of its own.
+    async fn rotate_inner(
+        &self,
+        origin: &'static str,
+        force: bool,
+    ) -> Result<(std::sync::Arc<SigningKey>, Option<Rotation>)> {
         let rng = ring::rand::SystemRandom::new();
         let fresh = Ed25519KeyPair::generate_pkcs8(&rng)
             .map_err(|_| anyhow!("this host would not generate a signing key"))?;
@@ -150,7 +269,99 @@ impl JwtSigner {
             .context("reading the signing key just generated")?;
         let fresh_public = URL_SAFE_NO_PAD.encode(fresh_public.public_key().as_ref());
 
-        let (kid, pkcs8) = self
+        let (kid, pkcs8, created_at, rotation) = self
+            .db
+            .call(move |connection| {
+                let transaction = connection
+                    .transaction()
+                    .context("beginning to rotate the signing key")?;
+
+                let current: Option<(String, String, String)> = transaction
+                    .query_row(
+                        "SELECT kid, pkcs8, created_at FROM jwt_signing_keys WHERE current = 1",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()
+                    .context("looking the current signing key up")?;
+
+                // The race the ninety-day path can lose: another task rotated
+                // between the in-memory age check and this lock. Its key is
+                // young; keep it and rotate nothing.
+                if !force
+                    && let Some((kid, pkcs8, created_at)) = &current
+                    && !rotation_due(created_at)
+                {
+                    return Ok((kid.clone(), Secret::new(pkcs8.clone()), created_at.clone(), None));
+                }
+
+                let at = now();
+                let retired = current.as_ref().map(|(kid, ..)| kid.clone());
+                transaction
+                    .execute(
+                        "UPDATE jwt_signing_keys SET current = 0, retired_at = ?1
+                         WHERE current = 1",
+                        rusqlite::params![at],
+                    )
+                    .context("retiring the signing key")?;
+                prune_retired_in(&transaction)?;
+
+                let kid = fresh_kid(&transaction, &at)?;
+                transaction
+                    .execute(
+                        "INSERT INTO jwt_signing_keys
+                             (kid, pkcs8, public_key, current, created_at)
+                         VALUES (?1, ?2, ?3, 1, ?4)",
+                        rusqlite::params![kid, fresh_pkcs8.expose(), fresh_public, at],
+                    )
+                    .context("persisting a fresh signing key")?;
+
+                // About no user, deliberately: the key vouches for everybody,
+                // and the origin is what tells an auditor whether an operator
+                // ordered this or the calendar did.
+                let detail = match &retired {
+                    Some(retired) => format!(
+                        "signing key {kid} minted; {retired} retired — the jwks serves it until every jwt it signed has expired"
+                    ),
+                    None => format!("signing key {kid} minted; nothing to retire"),
+                };
+                record_in(&transaction, &at, "key.rotated", None, origin, Some(&detail))?;
+
+                transaction.commit().context("committing a key rotation")?;
+                tracing::info!(kid, origin, "rotated the jwt signing key");
+
+                Ok((
+                    kid.clone(),
+                    fresh_pkcs8,
+                    at,
+                    Some(Rotation { kid, retired }),
+                ))
+            })
+            .await?;
+
+        let key = std::sync::Arc::new(parse_key(kid, pkcs8, created_at)?);
+        // Whichever task wrote last, both hold a key the store calls current
+        // or called current a moment ago — and a moment-ago key still verifies
+        // through the JWKS, so last-write-wins costs a re-sign at worst.
+        *self.slot() = Some(key.clone());
+
+        Ok((key, rotation))
+    }
+
+    /// The current key off the database, minting a first one when the table
+    /// has none — the cold half of [`JwtSigner::signing_key`], split out so
+    /// the hot path is one mutex peek.
+    async fn load_or_generate(&self) -> Result<std::sync::Arc<SigningKey>> {
+        let rng = ring::rand::SystemRandom::new();
+        let fresh = Ed25519KeyPair::generate_pkcs8(&rng)
+            .map_err(|_| anyhow!("this host would not generate a signing key"))?;
+        let fresh_pkcs8 = Secret::new(STANDARD.encode(fresh.as_ref()));
+        let fresh_public = Ed25519KeyPair::from_pkcs8(fresh.as_ref())
+            .map_err(|error| anyhow!("{error}"))
+            .context("reading the signing key just generated")?;
+        let fresh_public = URL_SAFE_NO_PAD.encode(fresh_public.public_key().as_ref());
+
+        let (kid, pkcs8, created_at) = self
             .db
             .call(move |connection| {
                 let transaction = connection
@@ -160,16 +371,16 @@ impl JwtSigner {
                 // Somebody else's first mint may have won the race between the
                 // in-memory check above and this transaction; theirs is the
                 // key, or every restart would fork the JWKS.
-                let existing: Option<(String, String)> = transaction
+                let existing: Option<(String, String, String)> = transaction
                     .query_row(
-                        "SELECT kid, pkcs8 FROM jwt_signing_keys WHERE current = 1",
+                        "SELECT kid, pkcs8, created_at FROM jwt_signing_keys WHERE current = 1",
                         [],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
                     .optional()
                     .context("looking the current signing key up")?;
-                if let Some((kid, pkcs8)) = existing {
-                    return Ok((kid, Secret::new(pkcs8)));
+                if let Some((kid, pkcs8, created_at)) = existing {
+                    return Ok((kid, Secret::new(pkcs8), created_at));
                 }
 
                 let at = now();
@@ -186,18 +397,11 @@ impl JwtSigner {
                 transaction.commit().context("committing a signing key")?;
                 tracing::info!(kid, "generated the jwt signing key");
 
-                Ok((kid, fresh_pkcs8))
+                Ok((kid, fresh_pkcs8, at))
             })
             .await?;
 
-        let pair = Ed25519KeyPair::from_pkcs8(
-            &STANDARD
-                .decode(pkcs8.expose())
-                .context("decoding the stored signing key")?,
-        )
-        .map_err(|error| anyhow!("{error}"))
-        .context("reading the stored signing key")?;
-        let key = std::sync::Arc::new(SigningKey { kid, pair });
+        let key = std::sync::Arc::new(parse_key(kid, pkcs8, created_at)?);
 
         let mut slot = self.slot();
         // A racing task may have loaded it first; either way both hold the
@@ -286,8 +490,12 @@ impl JwtSigner {
 }
 
 /// The next free `kid` for a key made at `at`: the spec's `YYYYMMDD-NNN`, with
-/// `NNN` counting keys made on the same day — which only rotation can cause,
-/// and which the counter is already shaped for.
+/// `NNN` counting keys made on the same day — which only rotation can cause.
+///
+/// One past the day's *highest* suffix rather than a row count, because
+/// pruning deletes rows: a count would re-issue a pruned key's kid the same
+/// day, and a kid must never name two keys — it is the one thing a verifier
+/// holding several is allowed to trust.
 fn fresh_kid(transaction: &rusqlite::Transaction<'_>, at: &str) -> Result<String> {
     // `now()` writes RFC 3339, so the date is the first ten characters with
     // the hyphens dropped.
@@ -296,15 +504,86 @@ fn fresh_kid(transaction: &rusqlite::Transaction<'_>, at: &str) -> Result<String
         anyhow::bail!("`{at}` does not carry a date to name a signing key after");
     }
 
-    let taken: i64 = transaction
+    let highest: Option<String> = transaction
         .query_row(
-            "SELECT count(*) FROM jwt_signing_keys WHERE kid LIKE ?1",
+            "SELECT kid FROM jwt_signing_keys WHERE kid LIKE ?1 ORDER BY kid DESC LIMIT 1",
             rusqlite::params![format!("{date}-%")],
             |row| row.get(0),
         )
-        .context("counting the day's signing keys")?;
+        .optional()
+        .context("finding the day's highest signing key")?;
+    let taken = highest
+        .as_deref()
+        .and_then(|kid| kid.rsplit('-').next())
+        .and_then(|suffix| suffix.parse::<i64>().ok())
+        .unwrap_or(0);
 
     Ok(format!("{date}-{:03}", taken + 1))
+}
+
+/// The loaded half of one row, out of what the transaction handed back.
+fn parse_key(kid: String, pkcs8: Secret, created_at: String) -> Result<SigningKey> {
+    let pair = Ed25519KeyPair::from_pkcs8(
+        &STANDARD
+            .decode(pkcs8.expose())
+            .context("decoding the stored signing key")?,
+    )
+    .map_err(|error| anyhow!("{error}"))
+    .context("reading the stored signing key")?;
+
+    Ok(SigningKey {
+        kid,
+        pair,
+        created_at,
+    })
+}
+
+/// Whether a key made at `at` has outlived [`ROTATION_PERIOD`]. An unreadable
+/// stamp answers "not due", the opposite direction from every expiry check in
+/// this module tree, and on purpose: a due-answer here *mints keys*, and a
+/// stamp this build cannot read would mint one per signature, forever — where
+/// a key that merely stays in service is exactly what `auth key rotate` exists
+/// to fix by hand.
+fn rotation_due(at: &str) -> bool {
+    time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
+        .map(|at| {
+            time::OffsetDateTime::now_utc() - at
+                >= time::Duration::seconds(ROTATION_PERIOD.as_secs() as i64)
+        })
+        .unwrap_or(false)
+}
+
+/// Delete the retired rows nothing can verify against anymore, inside the
+/// rotation's transaction. Run at rotation rather than on JWKS reads because
+/// rotation is the only write this table sees — the session tables' argument
+/// that growth and cleanup should be the same traffic — and the JWKS read
+/// already filters what it serves, so a row awaiting the next rotation costs
+/// bytes, not correctness.
+fn prune_retired_in(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    let mut statement = transaction
+        .prepare("SELECT kid, retired_at FROM jwt_signing_keys WHERE retired_at IS NOT NULL")
+        .context("preparing the retired key sweep")?;
+    let retired = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .context("reading the retired keys")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("reading the retired keys")?;
+    drop(statement);
+
+    for (kid, at) in retired {
+        if retired_beyond_grace(&at) {
+            transaction
+                .execute(
+                    "DELETE FROM jwt_signing_keys WHERE kid = ?1",
+                    rusqlite::params![kid],
+                )
+                .context("pruning a retired signing key")?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Whether a key retired at `at` is past the point where any JWT it signed
@@ -390,8 +669,35 @@ struct CachedJwt {
     minted_at: Instant,
 }
 
+/// One live WebSocket tunnel, as the fan-out below tracks it: whose credential
+/// holds it open, and the switch that tears it down.
+///
+/// The user and not the credential's hash, although the connection was opened
+/// by one specific app session or API key: every lever that could revoke the
+/// credential — session drop, key revoke, suspend, drop, logout — already
+/// purges this cache *by user*, because credentials are stored hashed and the
+/// repositories never hold one to aim at. Tracking at the same granularity
+/// means a kill can never miss a connection a purge meant to reach; the cost
+/// is that dropping one of a user's sessions also cuts the WebSockets their
+/// *other* sessions hold — which reconnect and re-authenticate against rows
+/// that still answer, a blip where the alternative's failure mode is a revoked
+/// credential's socket living on.
+struct TrackedSocket {
+    user: UserId,
+    kill: CancellationToken,
+}
+
 /// The in-memory JWT cache: the gate's hot path, and every revocation lever's
-/// purge target.
+/// purge target — which is why the live-WebSocket registry lives inside it
+/// too, making this struct the process's whole revocation fan-out.
+///
+/// The registry could have been a struct beside the cache, but the spec's
+/// WebSocket levers (session drop, revoke, expiry, suspend, drop) are exactly
+/// the purge levers, letter for letter: a separate registry would be a second
+/// handle threaded through every auth repository's constructor and the
+/// daemon's wiring, only to be pulled in the very statements that already pull
+/// this one. Folding them means no seam can purge the cache and forget the
+/// sockets.
 ///
 /// Keyed by `(app-session token, app)` rather than the spec's first sketch of
 /// `(user, app)`, because the key has to be something the request itself
@@ -409,6 +715,12 @@ struct CachedJwt {
 /// worth sharding, and an async lock would only add a wake-up.
 pub struct JwtCache {
     entries: Mutex<HashMap<(String, AppId), CachedJwt>>,
+    /// The live WebSocket tunnels through gated apps, killable per user. A
+    /// `Vec` and not a map: it holds one entry per open socket, is walked only
+    /// on purge and on registration, and swept of finished connections on the
+    /// way past — the entries' own cancellation doubles as the liveness bit,
+    /// since a tunnel that ended dropped its guard and cancelled itself.
+    sockets: Mutex<Vec<TrackedSocket>>,
     /// [`CACHE_TTL`] everywhere but in the tests that would otherwise wait
     /// four minutes to watch an entry die.
     ttl: Duration,
@@ -418,6 +730,7 @@ impl JwtCache {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
+            sockets: Mutex::new(Vec::new()),
             ttl: CACHE_TTL,
         }
     }
@@ -426,8 +739,38 @@ impl JwtCache {
     fn with_ttl(ttl: Duration) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
+            sockets: Mutex::new(Vec::new()),
             ttl,
         }
+    }
+
+    /// Register a WebSocket tunnel `user`'s credential just opened, answering
+    /// the token that kills it.
+    ///
+    /// The tunnel selects on the token and tears both directions down when it
+    /// fires; it must also hold the token's `drop_guard`, so a connection that
+    /// ends on its own cancels its own entry and the next registration or
+    /// purge sweeps it out — the cache's own no-background-loop discipline.
+    pub fn track_socket(&self, user: &UserId) -> CancellationToken {
+        let kill = CancellationToken::new();
+        let mut sockets = self.sockets_lock();
+        sockets.retain(|socket| !socket.kill.is_cancelled());
+        sockets.push(TrackedSocket {
+            user: user.clone(),
+            kill: kill.clone(),
+        });
+
+        kill
+    }
+
+    /// How many tunnels are currently tracked — for the tests that assert an
+    /// open app's sockets never enter the registry at all.
+    #[cfg(test)]
+    pub(crate) fn tracked_sockets(&self) -> usize {
+        let mut sockets = self.sockets_lock();
+        sockets.retain(|socket| !socket.kill.is_cancelled());
+
+        sockets.len()
     }
 
     /// The cached JWT for `token` at `app`, if one is still inside its four
@@ -465,18 +808,35 @@ impl JwtCache {
         );
     }
 
-    /// Drop every cached JWT vouching for `user`, on any app. The lever behind
-    /// `session drop`, `revoke`, suspend and drop: the database write those
-    /// commit is the revocation, and this is what keeps the hot path from
-    /// outliving it by more than the four minutes the spec accepts.
+    /// Drop every cached JWT vouching for `user`, on any app — and cut every
+    /// live WebSocket their credentials hold open. The lever behind `session
+    /// drop`, `revoke`, suspend and drop: the database write those commit is
+    /// the revocation, this is what keeps the hot path from outliving it by
+    /// more than the four minutes the spec accepts, and the socket kill is the
+    /// spec's "handshake auth never outlives revocation" — a tunnel admitted
+    /// under a now-dead credential is cut in the same breath as the cache.
     pub fn purge_user(&self, user: &UserId) {
         self.lock().retain(|_, entry| &entry.user != user);
+        self.sockets_lock().retain(|socket| {
+            if &socket.user == user {
+                socket.kill.cancel();
+                return false;
+            }
+
+            !socket.kill.is_cancelled()
+        });
     }
 
     /// Drop every cached JWT for `app`, whoever holds one. The lever behind a
     /// deploy that changes the app's declared roles: every cached token's
     /// `roles` was intersected against the old manifest, so all of them are
     /// stale at once.
+    ///
+    /// WebSockets are deliberately *not* cut here. The spec's termination
+    /// levers are the session's — drop, revoke, expiry — and a redeploy
+    /// revokes nobody: the sessions behind the sockets still answer, and a
+    /// connection's JWT was delivered once at handshake either way, so cutting
+    /// every socket per deploy would buy no freshness an app could observe.
     pub fn purge_app(&self, app: &AppId) {
         self.lock().retain(|(_, cached), _| cached != app);
     }
@@ -486,6 +846,13 @@ impl JwtCache {
     /// still serve what a purge tried to drop is the wrong side to fail on.
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, AppId), CachedJwt>> {
         self.entries.lock().expect("jwt cache poisoned")
+    }
+
+    /// The same argument as [`JwtCache::lock`], for the sockets: limping on
+    /// with a registry that may still hold what a kill tried to cut is the
+    /// wrong side to fail on.
+    fn sockets_lock(&self) -> std::sync::MutexGuard<'_, Vec<TrackedSocket>> {
+        self.sockets.lock().expect("ws registry poisoned")
     }
 }
 
@@ -758,6 +1125,212 @@ mod tests {
         Secret::new(value)
     }
 
+    /// An RFC 3339 stamp `days` days ago — for backdating rows, which is how
+    /// these tests move the clock without holding it.
+    fn days_ago(days: i64) -> String {
+        (time::OffsetDateTime::now_utc() - time::Duration::days(days))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    }
+
+    async fn backdate(db: &Db, column: &'static str, to: String) {
+        db.call(move |connection| {
+            connection
+                .execute(
+                    &format!(
+                        "UPDATE jwt_signing_keys SET {column} = ?1 WHERE {column} IS NOT NULL"
+                    ),
+                    rusqlite::params![to],
+                )
+                .context("backdating a signing key")?;
+
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The whole retire-and-mint move: rotation flips `current` to a fresh
+    /// kid, stamps the old row retired, and — same day — the `-NNN` counter is
+    /// what tells the two keys apart.
+    #[tokio::test]
+    async fn a_rotation_retires_the_old_key_and_counts_the_kid_up() {
+        let signer = JwtSigner::new(db());
+        let old = key(&signer).await.kid().to_owned();
+
+        let rotation = signer.rotate(crate::auth::OPERATOR_ORIGIN).await.unwrap();
+
+        assert_eq!(rotation.retired.as_deref(), Some(old.as_str()));
+        assert_ne!(rotation.kid, old);
+        // Two keys on one day: same date, counter up by one.
+        assert_eq!(&rotation.kid[..8], &old[..8]);
+        assert!(
+            old.ends_with("-001") && rotation.kid.ends_with("-002"),
+            "{old} {rotation:?}"
+        );
+
+        let keys = signer.keys().await.unwrap();
+        let retired = keys.iter().find(|record| record.kid == old).unwrap();
+        assert!(
+            !retired.current && retired.retired_at.is_some(),
+            "{retired:?}"
+        );
+        let current = keys
+            .iter()
+            .find(|record| record.kid == rotation.kid)
+            .unwrap();
+        assert!(
+            current.current && current.retired_at.is_none(),
+            "{current:?}"
+        );
+        // And new tokens sign with the new kid immediately.
+        assert_eq!(signer.signing_key().await.unwrap().kid(), rotation.kid);
+    }
+
+    /// The retention rule, end to end: a pre-rotation JWT verifies against the
+    /// JWKS *after* rotation, because the retired key is still served — and a
+    /// post-rotation JWT verifies against the new one, `kid` telling them
+    /// apart exactly as the spec promises.
+    #[tokio::test]
+    async fn tokens_from_both_sides_of_a_rotation_verify_via_the_jwks() {
+        let signer = JwtSigner::new(db());
+        let before = mint(
+            key(&signer).await.as_ref(),
+            "https://s.test",
+            &user("aaaaaaaa"),
+            &app("blog"),
+            &roles(&["reader"]),
+            moment(),
+        )
+        .unwrap();
+
+        signer.rotate(crate::auth::OPERATOR_ORIGIN).await.unwrap();
+        let after = mint(
+            key(&signer).await.as_ref(),
+            "https://s.test",
+            &user("aaaaaaaa"),
+            &app("blog"),
+            &roles(&["reader"]),
+            moment(),
+        )
+        .unwrap();
+
+        let jwks: serde_json::Value = serde_json::from_str(&signer.jwks().await.unwrap()).unwrap();
+        let keys = jwks["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 2, "{jwks}");
+        for jwt in [&before, &after] {
+            let header = decode(jwt.expose().split('.').next().unwrap());
+            let public = keys
+                .iter()
+                .find(|key| key["kid"] == header["kid"])
+                .unwrap_or_else(|| panic!("no jwks key for {header}"))["x"]
+                .as_str()
+                .unwrap();
+            let (message, signature) = jwt.expose().rsplit_once('.').unwrap();
+            ring::signature::UnparsedPublicKey::new(
+                &ring::signature::ED25519,
+                URL_SAFE_NO_PAD.decode(public).unwrap(),
+            )
+            .verify(
+                message.as_bytes(),
+                &URL_SAFE_NO_PAD.decode(signature).unwrap(),
+            )
+            .expect("both sides of the rotation must verify");
+        }
+    }
+
+    /// Past the grace horizon nothing honest can present the retired key's
+    /// tokens anymore: the JWKS sheds it at read time, and the next rotation
+    /// prunes the row itself.
+    #[tokio::test]
+    async fn the_jwks_sheds_a_retired_key_past_its_grace_and_rotation_prunes_it() {
+        let database = db();
+        let signer = JwtSigner::new(database.clone());
+        key(&signer).await;
+        signer.rotate(crate::auth::OPERATOR_ORIGIN).await.unwrap();
+
+        let jwks: serde_json::Value = serde_json::from_str(&signer.jwks().await.unwrap()).unwrap();
+        assert_eq!(jwks["keys"].as_array().unwrap().len(), 2);
+
+        backdate(&database, "retired_at", days_ago(1)).await;
+
+        let jwks: serde_json::Value = serde_json::from_str(&signer.jwks().await.unwrap()).unwrap();
+        assert_eq!(jwks["keys"].as_array().unwrap().len(), 1, "{jwks}");
+        // The row is still there — pruning is the next rotation's business.
+        assert_eq!(signer.keys().await.unwrap().len(), 2);
+
+        signer.rotate(crate::auth::OPERATOR_ORIGIN).await.unwrap();
+        let kept = signer.keys().await.unwrap();
+        // The over-grace row went; the just-retired one stays for its tokens.
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert!(kept.iter().all(|record| !record.kid.ends_with("-001")));
+    }
+
+    /// The ninety-day clock, driven by backdating the row: the next signer to
+    /// need the key rotates first, and the log says the system did it — not an
+    /// operator, which is the distinction an auditor reads the column for.
+    #[tokio::test]
+    async fn rotation_fires_on_its_own_past_ninety_days() {
+        let database = db();
+        let old = key(&JwtSigner::new(database.clone()))
+            .await
+            .kid()
+            .to_owned();
+        backdate(&database, "created_at", days_ago(91)).await;
+
+        // A fresh signer, as after a restart: the age check runs on load too.
+        let current = key(&JwtSigner::new(database.clone())).await;
+
+        assert_ne!(current.kid(), old);
+        let entries = crate::auth::AuthLogRepository::new(database)
+            .entries(None)
+            .await
+            .unwrap();
+        let rotated = entries
+            .iter()
+            .find(|entry| entry.kind == "key.rotated")
+            .unwrap();
+        assert_eq!(rotated.origin, crate::auth::SYSTEM_ORIGIN);
+        assert_eq!(rotated.user, None);
+    }
+
+    /// A key inside its ninety days is left alone — the check must not rotate
+    /// on every use, or the JWKS would grow a key per mint.
+    #[tokio::test]
+    async fn a_young_key_is_not_rotated_on_use() {
+        let signer = JwtSigner::new(db());
+        let first = key(&signer).await.kid().to_owned();
+
+        assert_eq!(key(&signer).await.kid(), first);
+        assert_eq!(signer.keys().await.unwrap().len(), 1);
+    }
+
+    /// The manual lever writes the operator's name on the log entry, with both
+    /// kids in the detail — the compromise-response audit trail.
+    #[tokio::test]
+    async fn a_manual_rotation_logs_as_the_operators_doing() {
+        let database = db();
+        let signer = JwtSigner::new(database.clone());
+        let old = key(&signer).await.kid().to_owned();
+
+        let rotation = signer.rotate(crate::auth::OPERATOR_ORIGIN).await.unwrap();
+
+        let entries = crate::auth::AuthLogRepository::new(database)
+            .entries(None)
+            .await
+            .unwrap();
+        let rotated = entries
+            .iter()
+            .find(|entry| entry.kind == "key.rotated")
+            .unwrap();
+        assert_eq!(rotated.origin, crate::auth::OPERATOR_ORIGIN);
+        let detail = rotated.detail.as_deref().unwrap();
+        assert!(
+            detail.contains(&old) && detail.contains(&rotation.kid),
+            "{detail}"
+        );
+    }
+
     #[test]
     fn the_cache_serves_what_was_inserted_and_only_that() {
         let cache = JwtCache::new();
@@ -827,6 +1400,36 @@ mod tests {
             None
         );
         assert!(cache.lookup(&token("bobs-cookie"), &app("blog")).is_some());
+    }
+
+    /// The socket half of the fan-out: a purge aimed at a user fires exactly
+    /// their kill switches, spares everybody else's, and the fired entries
+    /// leave the registry.
+    #[test]
+    fn purging_a_user_kills_their_sockets_and_spares_the_others() {
+        let cache = JwtCache::new();
+        let alices = cache.track_socket(&user("aaaaaaaa"));
+        let bobs = cache.track_socket(&user("bbbbbbbb"));
+
+        cache.purge_user(&user("aaaaaaaa"));
+
+        assert!(alices.is_cancelled());
+        assert!(!bobs.is_cancelled());
+        assert_eq!(cache.tracked_sockets(), 1);
+    }
+
+    /// A tunnel that ends on its own cancels its own entry through the drop
+    /// guard it holds, and the registry sweeps it on the next pass — no
+    /// background loop, the cache's own discipline.
+    #[test]
+    fn a_finished_socket_sweeps_itself_out_of_the_registry() {
+        let cache = JwtCache::new();
+        let kill = cache.track_socket(&user("aaaaaaaa"));
+
+        // What the tunnel task does at the end of its life.
+        drop(kill.drop_guard());
+
+        assert_eq!(cache.tracked_sockets(), 0);
     }
 
     /// A purge aimed at an app takes every user's entry for it — the deploy

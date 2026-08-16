@@ -111,6 +111,12 @@ pub struct Instance {
     /// becoming one. Beside the other three for the same reason: the socket's
     /// mint and drop must move the same rows the login page reads.
     pub sessions: Arc<SessionRepository>,
+    /// The Ed25519 key that signs app JWTs — the very signer the edge mints
+    /// through and serves the JWKS from, because `auth key rotate` on this
+    /// socket must retire the key the next request would otherwise sign with,
+    /// and a second signer over the same table would go on holding the old
+    /// pair in memory.
+    pub signer: Arc<crate::auth::JwtSigner>,
     /// Absent when tls is self-signed: then nothing ever orders a certificate.
     pub certificates: Option<Arc<Certificates>>,
     /// What the reconciliation at startup did. Kept because it is the only
@@ -586,6 +592,7 @@ container:
             auth_log: Arc::new(AuthLogRepository::new(db.clone())),
             entitlements: Arc::new(EntitlementRepository::new(db.clone())),
             sessions: Arc::new(SessionRepository::new(db.clone())),
+            signer: Arc::new(crate::auth::JwtSigner::new(db.clone())),
             db,
             certificates: None,
             reconciled,

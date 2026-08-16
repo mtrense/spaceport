@@ -491,6 +491,22 @@ pub async fn auth_audit(endpoint: &OperatorEndpoint, user: &UserRef) -> Result<S
     send_to(endpoint, request).await
 }
 
+/// Ask it to rotate the JWT signing key now — the compromise-response lever;
+/// the ninety-day clock rotates on its own.
+pub async fn auth_key_rotate(endpoint: &OperatorEndpoint) -> Result<String> {
+    let request = builder("POST", "/auth/keys/rotate").body(Full::default())?;
+
+    send_to(endpoint, request).await
+}
+
+/// Ask for the signing keys still in the store: the current one, and any
+/// retired key the JWKS is still serving out its grace.
+pub async fn auth_key_list(endpoint: &OperatorEndpoint) -> Result<String> {
+    let request = builder("GET", "/auth/keys").body(Full::default())?;
+
+    send_to(endpoint, request).await
+}
+
 /// Ask for the auth event log, optionally only what happened to one user.
 pub async fn auth_log(endpoint: &OperatorEndpoint, user: Option<&UserId>) -> Result<String> {
     // A user id is hex and hyphens, which a query string carries as they are.

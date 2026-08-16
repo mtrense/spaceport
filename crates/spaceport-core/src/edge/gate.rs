@@ -346,7 +346,7 @@ async fn vouch(
 /// search across duplicates: a request carrying several `Authorization`
 /// headers is already malformed, and hunting through it for one that pleases
 /// us would be doing a confused client's guessing for it.
-fn bearer_api_key(headers: &HeaderMap) -> Option<Secret> {
+pub(super) fn bearer_api_key(headers: &HeaderMap) -> Option<Secret> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = value.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("bearer") {

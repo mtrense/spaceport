@@ -31,6 +31,14 @@ pub const OPERATOR_ORIGIN: &str = "operator";
 /// both would erase exactly that.
 pub const WEB_ORIGIN: &str = "web";
 
+/// What an entry spaceport writes on its own initiative names as its origin: a
+/// signing-key rotation the ninety-day clock ordered, with nobody at either
+/// the socket or a browser. Distinct from [`OPERATOR_ORIGIN`] because the
+/// auditor reading `key.rotated` is asking exactly one question — did an
+/// operator pull this lever (compromise response), or did the schedule — and
+/// one word for both would erase the answer.
+pub const SYSTEM_ORIGIN: &str = "system";
+
 /// One thing that happened, as the log stores it.
 ///
 /// `kind` and `origin` stay text all the way out: a row written by a newer

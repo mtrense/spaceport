@@ -264,6 +264,21 @@ impl SessionRepository {
         key: &Secret,
         app: &AppId,
     ) -> Result<Option<(UserId, Role)>> {
+        Ok(self
+            .api_key_grant(key, app)
+            .await?
+            .map(|(user, role, _)| (user, role)))
+    }
+
+    /// The same lookup with the key's expiry beside the identity — what a
+    /// WebSocket upgrade asks, for [`SessionRepository::app_session_grant`]'s
+    /// reason: the tunnel arms its deadline at handshake, since no per-request
+    /// check ever runs again on a socket that upgraded once.
+    pub async fn api_key_grant(
+        &self,
+        key: &Secret,
+        app: &AppId,
+    ) -> Result<Option<(UserId, Role, String)>> {
         let key_hash = hash(key.expose());
         let app = app.clone();
 
@@ -300,7 +315,11 @@ impl SessionRepository {
 
                 // A row this build cannot parse answers "nobody", the
                 // failing-closed direction everything in this module takes.
-                Ok(user_id.parse().ok().zip(role.parse().ok()))
+                Ok(user_id
+                    .parse()
+                    .ok()
+                    .zip(role.parse().ok())
+                    .map(|(user, role)| (user, role, expires_at)))
             })
             .await
     }

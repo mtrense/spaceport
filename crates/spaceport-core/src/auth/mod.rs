@@ -32,8 +32,8 @@ pub use entitlement::{
     EntitlementError, EntitlementRecord, EntitlementRepository, Granted, RevokeScope, Revoked,
     RoleAtApp,
 };
-pub use jwt::{JwtCache, JwtSigner};
-pub use log::{AuthEvent, AuthLogRepository, OPERATOR_ORIGIN, WEB_ORIGIN};
+pub use jwt::{JwtCache, JwtSigner, Rotation, SigningKeyRecord};
+pub use log::{AuthEvent, AuthLogRepository, OPERATOR_ORIGIN, SYSTEM_ORIGIN, WEB_ORIGIN};
 pub use repository::UserRepository;
 pub use session::{
     DEFAULT_SESSION_LIFETIME, FreshSession, MintedCode, RedeemError, SessionError, SessionId,

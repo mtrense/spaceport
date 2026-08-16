@@ -276,6 +276,13 @@ enum AuthCommand {
     /// Report one user's whole standing: the record, the SSO connection, every
     /// entitlement with its origin, and the apps they actually reach.
     Audit(UserRefArgs),
+    /// Manage the Ed25519 key that signs the JWTs handed down to apps.
+    ///
+    /// The key rotates by itself every ninety days; `rotate` is the manual
+    /// lever for the day it is suspected compromised. Rotation breaks nothing:
+    /// tokens signed before it verify against the retired key, which the JWKS
+    /// keeps serving until every one of them has expired.
+    Key(KeyArgs),
     /// Print the append-only auth event log.
     ///
     /// Every mutating auth command lands in it with a timestamp and where it
@@ -331,6 +338,32 @@ struct UserArgs {
 struct SessionArgs {
     #[command(subcommand)]
     command: SessionCommand,
+}
+
+#[derive(Debug, Args)]
+struct KeyArgs {
+    #[command(subcommand)]
+    command: KeyCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum KeyCommand {
+    /// Retire the current signing key and mint a fresh one, immediately.
+    ///
+    /// For compromise response — the ninety-day rotation needs no command.
+    /// In-flight JWTs stay valid until their own expiry; nothing an app holds
+    /// breaks.
+    Rotate(KeyServerArgs),
+    /// List the signing keys still in the store: the current one, and any
+    /// retired key the JWKS still serves.
+    List(KeyServerArgs),
+}
+
+/// The shape both key commands share: nothing but the socket to ask.
+#[derive(Debug, Args)]
+struct KeyServerArgs {
+    #[command(flatten)]
+    server: ServerArgs,
 }
 
 #[derive(Debug, Subcommand)]
@@ -874,6 +907,10 @@ async fn main() -> Result<()> {
             AuthCommand::Grant(args) => grant(args).await,
             AuthCommand::Revoke(args) => revoke(args).await,
             AuthCommand::Audit(args) => audit(args).await,
+            AuthCommand::Key(args) => match args.command {
+                KeyCommand::Rotate(args) => auth_key_rotate(args).await,
+                KeyCommand::List(args) => auth_key_list(args).await,
+            },
             AuthCommand::Log(args) => auth_log(args).await,
         },
         Command::Connect { command } => match command {
@@ -1178,7 +1215,7 @@ async fn run(args: RunArgs) -> Result<()> {
         entitlements: entitlements.clone(),
         auth_log: auth_log.clone(),
         apps: apps.clone(),
-        signer,
+        signer: signer.clone(),
         jwt_cache: jwt_cache.clone(),
         https_port: config.edge.listen.https.port(),
     });
@@ -1211,6 +1248,9 @@ async fn run(args: RunArgs) -> Result<()> {
             auth_log,
             entitlements,
             sessions,
+            // The very signer the edge signs with, so a rotation over this
+            // socket retires the key the next request would have used.
+            signer,
             db,
             certificates: certificates.clone(),
             reconciled: report,
@@ -1510,6 +1550,18 @@ async fn auth_log(args: AuthLogArgs) -> Result<()> {
         "{}",
         client::auth_log(&args.server.server, args.user.as_ref()).await?
     );
+
+    Ok(())
+}
+
+async fn auth_key_rotate(args: KeyServerArgs) -> Result<()> {
+    print!("{}", client::auth_key_rotate(&args.server.server).await?);
+
+    Ok(())
+}
+
+async fn auth_key_list(args: KeyServerArgs) -> Result<()> {
+    print!("{}", client::auth_key_list(&args.server.server).await?);
 
     Ok(())
 }

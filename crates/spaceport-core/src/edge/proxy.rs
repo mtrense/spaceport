@@ -29,13 +29,18 @@ use tracing::{debug, warn};
 use super::EdgeState;
 use super::gate;
 use super::service::{self, ConnInfo};
+use super::websocket;
 use crate::app::Auth;
 use crate::app::store::Route;
 
 /// Headers that describe one hop and must not be passed on to the next.
 ///
-/// `upgrade` among them: spaceport terminates upgrades rather than forwarding
-/// them, so websockets do not work through an app yet.
+/// `upgrade` among them, because an upgrade is negotiated per hop: WebSocket
+/// requests take [`super::websocket`]'s tunnel, which strips the client's
+/// headers here and then asks the upstream for the upgrade in spaceport's own
+/// voice. Any *other* upgrade is terminated by this strip and crosses as plain
+/// HTTP — `websocket` is the one protocol the spec contracts spaceport to
+/// carry.
 const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
@@ -53,7 +58,7 @@ const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host")
 
 /// How long to wait for an app to accept a connection. Loopback either answers
 /// immediately or is not listening; a longer wait only holds the client open.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The connection pool spaceport forwards through, shared by every request.
 pub struct Upstreams {
@@ -165,6 +170,17 @@ pub async fn handle(
         gate::Admission::Pass { bearer } => bearer,
     };
 
+    // A WebSocket upgrade leaves the request/response world here: the tunnel
+    // does its own rewrite, speaks to the upstream on a dedicated connection,
+    // and — when a credential vouched for it — registers with the revocation
+    // fan-out so the socket dies with the session. After the gate, so an
+    // unauthenticated upgrade got its 401 above like any other fetch.
+    if websocket::is_websocket_upgrade(&req) {
+        return Ok(
+            websocket::tunnel(state.clone(), app, name, &authority, conn, bearer, req).await,
+        );
+    }
+
     let upstream = app.upstream;
     // Kept for the event at the end, which is written after the request has
     // been rewritten into something addressed to the upstream instead.
@@ -258,7 +274,7 @@ fn upstream_uri(uri: &Uri, upstream: SocketAddr) -> Uri {
 /// outermost hop, so anything a client sent under these names is a claim about
 /// itself that nothing has checked — passing it through would let any client
 /// pick its own address.
-fn forwarded_headers(headers: &mut HeaderMap, authority: &str, conn: Option<ConnInfo>) {
+pub(super) fn forwarded_headers(headers: &mut HeaderMap, authority: &str, conn: Option<ConnInfo>) {
     strip_hop_by_hop(headers);
 
     // HTTP/2 requests carry the host in `:authority` and no `Host` header at
@@ -284,7 +300,7 @@ fn forwarded_headers(headers: &mut HeaderMap, authority: &str, conn: Option<Conn
 }
 
 /// Remove the headers that govern this connection rather than the message.
-fn strip_hop_by_hop(headers: &mut HeaderMap) {
+pub(super) fn strip_hop_by_hop(headers: &mut HeaderMap) {
     // `Connection` names further headers that are hop-by-hop by declaration,
     // so they have to go before `Connection` itself does.
     let declared: Vec<HeaderName> = headers
@@ -323,7 +339,7 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
 /// cost it the tokens. `gating: open` keeps `Authorization` untouched, as the
 /// spec promises: spaceport holds no credentials there to confuse anyone's
 /// with.
-fn strip_spaceport_headers(headers: &mut HeaderMap, gated: bool) {
+pub(super) fn strip_spaceport_headers(headers: &mut HeaderMap, gated: bool) {
     let forged: Vec<HeaderName> = headers
         .keys()
         .filter(|name| name.as_str().starts_with("x-spaceport"))
@@ -360,7 +376,7 @@ fn strip_spaceport_headers(headers: &mut HeaderMap, gated: bool) {
 }
 
 /// A plain-text refusal, for the cases where no app ever sees the request.
-fn refuse(status: StatusCode, body: String) -> Response<Body> {
+pub(super) fn refuse(status: StatusCode, body: String) -> Response<Body> {
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
     response.headers_mut().insert(
@@ -650,9 +666,11 @@ mod tests {
                 };
                 let service = TowerToHyperService::new(EdgeService::new(state.clone(), conn));
 
+                // With upgrades, as the daemon serves every connection — the
+                // WebSocket tests upgrade through this very fixture.
                 tokio::spawn(async move {
                     let _ = Builder::new(TokioExecutor::new())
-                        .serve_connection(TokioIo::new(stream), service)
+                        .serve_connection_with_upgrades(TokioIo::new(stream), service)
                         .await;
                 });
             }
@@ -1954,6 +1972,345 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("authorization=[Bearer spk_theirs]"), "{body}");
+    }
+
+    /// A raw WebSocket upstream: answers any handshake with a `101` and then
+    /// echoes bytes. Hand-rolled TCP rather than a WebSocket library, because
+    /// spaceport's tunnel has no opinion about frames — bytes in, bytes out is
+    /// exactly the property under test, and a frame-speaking fixture would
+    /// only obscure it.
+    async fn ws_echo_upstream() -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(accepted) => accepted,
+                    Err(_) => return,
+                };
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    loop {
+                        let n = match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        head.extend_from_slice(&buf[..n]);
+                        if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    if stream
+                        .write_all(
+                            b"HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: upgrade\r\n\r\n",
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    loop {
+                        let n = match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        if stream.write_all(&buf[..n]).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        addr
+    }
+
+    /// Knock on the edge with a WebSocket handshake, answering the response
+    /// head and the raw connection — which, after a `101`, *is* the tunnel.
+    async fn ws_connect(
+        edge: SocketAddr,
+        host: &str,
+        path: &str,
+        extra: &[(&str, &str)],
+    ) -> (String, tokio::net::TcpStream) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(edge).await.unwrap();
+        let mut request = format!(
+            "GET {path} HTTP/1.1\r\nhost: {host}\r\nconnection: upgrade\r\nupgrade: websocket\r\nsec-websocket-key: dGVzdCBrZXkgMTIzNDU=\r\nsec-websocket-version: 13\r\n"
+        );
+        for (name, value) in extra {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut head = Vec::new();
+        let mut buf = [0_u8; 1];
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            let n = stream.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            head.push(buf[0]);
+        }
+
+        (String::from_utf8_lossy(&head).into_owned(), stream)
+    }
+
+    /// One round through the tunnel: bytes out, the same bytes back.
+    async fn echoes(stream: &mut tokio::net::TcpStream, payload: &[u8]) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        stream.write_all(payload).await.unwrap();
+        let mut echoed = vec![0_u8; payload.len()];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut echoed))
+            .await
+            .expect("the echo should arrive")
+            .unwrap();
+        assert_eq!(echoed, payload);
+    }
+
+    /// The tunnel is dead: the next read sees the socket end, promptly.
+    async fn closed(stream: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = [0_u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .expect("the cut should close the socket promptly")
+            .unwrap_or(0);
+        assert_eq!(n, 0, "the socket should be closed");
+    }
+
+    /// The milestone's front door: an authenticated WebSocket upgrade to a
+    /// gated app completes the handshake and bytes flow both ways — through
+    /// spaceport, which until this milestone terminated every upgrade.
+    #[tokio::test]
+    async fn an_authenticated_websocket_upgrade_tunnels_end_to_end() {
+        let db = crate::state::Db::in_memory().unwrap();
+        let (cookie, _) = planted_cookie(&db, "alice", &["reader@blog"], "blog").await;
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated("blog", "alpha.test", ws_echo_upstream().await, ""))
+            .unwrap();
+        let edge = edge_over(apps, db).await;
+
+        let (head, mut stream) =
+            ws_connect(edge, "alpha.test", "/live", &[("cookie", &cookie)]).await;
+
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        echoes(&mut stream, b"first frame-shaped bytes").await;
+        echoes(&mut stream, b"and more").await;
+    }
+
+    /// The gate stands in front of the tunnel exactly as it stands in front of
+    /// every request: no credential, no upgrade — a `401` with directions,
+    /// never a redirect a socket cannot follow.
+    #[tokio::test]
+    async fn a_websocket_without_credentials_is_refused_with_a_401() {
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated("blog", "alpha.test", ws_echo_upstream().await, ""))
+            .unwrap();
+        let edge = edge(apps).await;
+
+        let (head, _stream) = ws_connect(edge, "alpha.test", "/live", &[]).await;
+
+        assert!(head.starts_with("HTTP/1.1 401"), "{head}");
+        assert!(!head.to_lowercase().contains("location:"), "{head}");
+    }
+
+    /// The spec's sentence, live: dropping the session terminates the
+    /// WebSocket it authenticated, promptly — handshake auth must not outlive
+    /// revocation.
+    #[tokio::test]
+    async fn dropping_the_session_cuts_its_live_websocket() {
+        let db = crate::state::Db::in_memory().unwrap();
+        let (cookie, _) = planted_cookie(&db, "alice", &["reader@blog"], "blog").await;
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated("blog", "alpha.test", ws_echo_upstream().await, ""))
+            .unwrap();
+        let jwt_cache = Arc::new(crate::auth::JwtCache::new());
+        let edge = edge_with(apps, db.clone(), jwt_cache.clone()).await;
+
+        let (head, mut stream) =
+            ws_connect(edge, "alpha.test", "/live", &[("cookie", &cookie)]).await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        echoes(&mut stream, b"alive").await;
+
+        crate::auth::SessionRepository::with_jwt_cache(db, jwt_cache)
+            .drop_sessions(&"alice".parse().unwrap(), None)
+            .await
+            .unwrap();
+
+        closed(&mut stream).await;
+    }
+
+    /// The same lever for the machine path: revoking the API key kills the
+    /// WebSocket it opened.
+    #[tokio::test]
+    async fn revoking_the_api_key_cuts_its_websocket() {
+        let db = crate::state::Db::in_memory().unwrap();
+        let (header_value, _, minted) = planted_key(&db, "ci-bot", "reader@blog").await;
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated("blog", "alpha.test", ws_echo_upstream().await, ""))
+            .unwrap();
+        let jwt_cache = Arc::new(crate::auth::JwtCache::new());
+        let edge = edge_with(apps, db.clone(), jwt_cache.clone()).await;
+
+        let (head, mut stream) = ws_connect(
+            edge,
+            "alpha.test",
+            "/live",
+            &[("authorization", &header_value)],
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        echoes(&mut stream, b"alive").await;
+
+        crate::auth::SessionRepository::with_jwt_cache(db, jwt_cache)
+            .drop_sessions(
+                &"ci-bot".parse().unwrap(),
+                Some(&minted.id.as_str().parse().unwrap()),
+            )
+            .await
+            .unwrap();
+
+        closed(&mut stream).await;
+    }
+
+    /// Suspend is the immediate-offboarding lever, and the socket is part of
+    /// what it offboards.
+    #[tokio::test]
+    async fn suspending_the_user_cuts_their_websocket() {
+        let db = crate::state::Db::in_memory().unwrap();
+        let (cookie, _) = planted_cookie(&db, "alice", &["reader@blog"], "blog").await;
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated("blog", "alpha.test", ws_echo_upstream().await, ""))
+            .unwrap();
+        let jwt_cache = Arc::new(crate::auth::JwtCache::new());
+        let edge = edge_with(apps, db.clone(), jwt_cache.clone()).await;
+
+        let (head, mut stream) =
+            ws_connect(edge, "alpha.test", "/live", &[("cookie", &cookie)]).await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        echoes(&mut stream, b"alive").await;
+
+        crate::auth::UserRepository::with_jwt_cache(db, jwt_cache)
+            .suspend(&"alice".parse().unwrap())
+            .await
+            .unwrap();
+
+        closed(&mut stream).await;
+    }
+
+    /// Expiry needs no lever: the deadline armed at handshake — the session's
+    /// own `expires_at` — closes the tunnel when it passes, which is the one
+    /// enforcement an already-upgraded connection can ever get.
+    #[tokio::test]
+    async fn an_expiring_session_closes_its_websocket_at_the_deadline() {
+        let db = crate::state::Db::in_memory().unwrap();
+        let (cookie, _) = planted_cookie(&db, "alice", &["reader@blog"], "blog").await;
+        // Two seconds of session left, planted before the handshake arms the
+        // deadline off this very stamp.
+        let soon = (time::OffsetDateTime::now_utc() + time::Duration::seconds(2))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        db.call(move |connection| {
+            connection
+                .execute(
+                    "UPDATE app_sessions SET expires_at = ?1",
+                    rusqlite::params![soon],
+                )
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+        })
+        .await
+        .unwrap();
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated("blog", "alpha.test", ws_echo_upstream().await, ""))
+            .unwrap();
+        let edge = edge_over(apps, db).await;
+
+        let (head, mut stream) =
+            ws_connect(edge, "alpha.test", "/live", &[("cookie", &cookie)]).await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        echoes(&mut stream, b"alive").await;
+
+        // No lever is pulled: the deadline alone must close it.
+        closed(&mut stream).await;
+    }
+
+    /// `gating: open` stays the spec's untouched path for sockets too: the
+    /// tunnel works, nothing registers it, and no revocation lever reaches it.
+    #[tokio::test]
+    async fn an_open_apps_websocket_is_neither_tracked_nor_cut() {
+        let apps = Arc::new(AppStore::new());
+        apps.insert(app("hello", "alpha.test", ws_echo_upstream().await))
+            .unwrap();
+        let jwt_cache = Arc::new(crate::auth::JwtCache::new());
+        let edge = edge_with(
+            apps,
+            crate::state::Db::in_memory().unwrap(),
+            jwt_cache.clone(),
+        )
+        .await;
+
+        let (head, mut stream) = ws_connect(edge, "alpha.test", "/live", &[]).await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        echoes(&mut stream, b"open bytes").await;
+
+        assert_eq!(jwt_cache.tracked_sockets(), 0);
+        // The heaviest lever there is finds nothing of this connection's.
+        jwt_cache.purge_user(&"3f29b1d4-8a6e-4c2b-9e77-1d5f6a2b9c40".parse().unwrap());
+        echoes(&mut stream, b"still open").await;
+    }
+
+    /// A public prefix holds the door open for sockets exactly as for
+    /// requests: no credential authenticated it, so nothing tracks it.
+    #[tokio::test]
+    async fn a_public_prefix_websocket_tunnels_untracked() {
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated(
+            "blog",
+            "alpha.test",
+            ws_echo_upstream().await,
+            "'/public'",
+        ))
+        .unwrap();
+        let jwt_cache = Arc::new(crate::auth::JwtCache::new());
+        let edge = edge_with(
+            apps,
+            crate::state::Db::in_memory().unwrap(),
+            jwt_cache.clone(),
+        )
+        .await;
+
+        let (head, mut stream) = ws_connect(edge, "alpha.test", "/public/live", &[]).await;
+
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        echoes(&mut stream, b"public bytes").await;
+        assert_eq!(jwt_cache.tracked_sockets(), 0);
+    }
+
+    /// An app is free to decline the upgrade, and its refusal crosses back as
+    /// the ordinary response it is — no tunnel, nothing tracked.
+    #[tokio::test]
+    async fn an_upstream_that_declines_the_upgrade_answers_as_plain_http() {
+        let db = crate::state::Db::in_memory().unwrap();
+        let (cookie, _) = planted_cookie(&db, "alice", &["reader@blog"], "blog").await;
+        let apps = Arc::new(AppStore::new());
+        // The plain fixture: answers 200 to anything, upgrades nothing.
+        apps.insert(gated("blog", "alpha.test", upstream().await, ""))
+            .unwrap();
+        let edge = edge_over(apps, db).await;
+
+        let (head, _stream) = ws_connect(edge, "alpha.test", "/live", &[("cookie", &cookie)]).await;
+
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     }
 
     /// `https://host/path?query` in two pieces, for following a redirect by

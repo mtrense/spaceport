@@ -315,6 +315,22 @@ impl SessionRepository {
     /// failing-closed direction: an unreadable identity must not sign in, and
     /// must certainly not be vouched for to an app.
     pub async fn app_session_user(&self, token: &Secret, app: &AppId) -> Result<Option<UserId>> {
+        Ok(self
+            .app_session_grant(token, app)
+            .await?
+            .map(|(user, _)| user))
+    }
+
+    /// The same lookup with the expiry beside the user — what a WebSocket
+    /// upgrade asks, because a tunnel must arm its deadline at handshake: the
+    /// session's `expires_at` is the latest moment its authentication may
+    /// still hold a connection open, and the per-request checks that enforce
+    /// expiry everywhere else never run again on a socket that upgraded once.
+    pub async fn app_session_grant(
+        &self,
+        token: &Secret,
+        app: &AppId,
+    ) -> Result<Option<(UserId, String)>> {
         let token_hash = hash(token.expose());
         let app = app.clone();
 
@@ -332,7 +348,9 @@ impl SessionRepository {
 
                 Ok(found
                     .filter(|(_, expires_at)| !is_past(expires_at))
-                    .and_then(|(user, _)| user.parse().ok()))
+                    .and_then(|(user, expires_at)| {
+                        user.parse().ok().map(|user| (user, expires_at))
+                    }))
             })
             .await
     }

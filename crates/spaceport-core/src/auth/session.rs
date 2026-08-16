@@ -529,9 +529,9 @@ impl SessionRepository {
     /// either way the right response is a cleared cookie.
     ///
     /// The derived app sessions go in the same transaction — one commit
-    /// however many domains the logout reaches. HOOK POINT: when WebSocket
-    /// tracking lands, the connections held under those app sessions are
-    /// terminated here too.
+    /// however many domains the logout reaches — and the `purge_user` after it
+    /// is also what cuts any live WebSocket those app sessions held open: the
+    /// cache is the revocation fan-out, and the sockets ride the same lever.
     pub async fn logout(&self, token: &Secret) -> Result<bool> {
         let token_hash = hash(token.expose());
 

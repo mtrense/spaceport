@@ -31,9 +31,9 @@ use crate::app::manifest::VarName;
 use crate::app::secrets::Set;
 use crate::app::{App, AppId, AppManifest, AppRecord, AppRepository, DataDir, Pattern, health};
 use crate::auth::{
-    AuthLogRepository, EntitlementError, EntitlementRepository, Granted, RevokeScope, Revoked,
-    Role, RoleAtApp, SessionError, SessionId, SessionRepository, UserError, UserId, UserRecord,
-    UserRef, UserRepository,
+    AuthLogRepository, EntitlementError, EntitlementRepository, Granted, JwtSigner, RevokeScope,
+    Revoked, Role, RoleAtApp, SessionError, SessionId, SessionRepository, UserError, UserId,
+    UserRecord, UserRef, UserRepository,
 };
 use crate::build::repository::{Build, BuildRepository, BuildState};
 use crate::connections::github::{
@@ -165,6 +165,8 @@ fn router(instance: Arc<Instance>, events: Arc<EventBus>, shutdown: Cancellation
             "/auth/users/{user}/entitlements/{scope}",
             put(grant_entitlement).delete(revoke_entitlement),
         )
+        .route("/auth/keys", get(list_signing_keys))
+        .route("/auth/keys/rotate", post(rotate_signing_key))
         .route("/auth/log", get(auth_log))
         .route("/connections", get(connections))
         .route("/connections/github", post(connect_github))
@@ -251,6 +253,13 @@ impl FromRef<Operator> for Arc<EntitlementRepository> {
 impl FromRef<Operator> for Arc<SessionRepository> {
     fn from_ref(operator: &Operator) -> Self {
         operator.instance.sessions.clone()
+    }
+}
+
+/// And for the two that rotate and list the JWT signing keys.
+impl FromRef<Operator> for Arc<JwtSigner> {
+    fn from_ref(operator: &Operator) -> Self {
+        operator.instance.signer.clone()
     }
 }
 
@@ -3945,6 +3954,82 @@ struct AuthLogQuery {
     user: Option<String>,
 }
 
+/// `POST /auth/keys/rotate`: retire the current JWT signing key and mint a
+/// fresh one, now.
+///
+/// The ninety-day clock does this on its own; this route is for the day a key
+/// is suspected compromised and waiting is not an answer. The response says
+/// what the retention rule means in the operator's terms, because "rotate"
+/// invites the question of whether apps break — they do not: old JWTs verify
+/// against the retired key the JWKS keeps serving until every one of them has
+/// expired.
+async fn rotate_signing_key(State(signer): State<Arc<JwtSigner>>) -> Response {
+    let rotation = match signer.rotate(crate::auth::OPERATOR_ORIGIN).await {
+        Ok(rotation) => rotation,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "a key rotation failed");
+
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not rotate the signing key: {error:#}"),
+            );
+        }
+    };
+
+    let body = match &rotation.retired {
+        Some(retired) => format!(
+            "rotated the jwt signing key\n  now signing with  {}\n  retired           {retired} — the jwks serves it until every jwt it signed has expired\n",
+            rotation.kid
+        ),
+        None => format!(
+            "minted the first jwt signing key {} — there was nothing to retire\n",
+            rotation.kid
+        ),
+    };
+
+    (StatusCode::OK, body).into_response()
+}
+
+/// `GET /auth/keys`: every signing key still in the store — the current one,
+/// and any retired key whose tokens have not all expired out of the JWKS yet.
+async fn list_signing_keys(State(signer): State<Arc<JwtSigner>>) -> Response {
+    let keys = match signer.keys().await {
+        Ok(keys) => keys,
+        Err(error) => {
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not list the signing keys: {error:#}"),
+            );
+        }
+    };
+
+    if keys.is_empty() {
+        return (
+            StatusCode::OK,
+            "no signing key yet — the first gated request or jwks read mints one\n",
+        )
+            .into_response();
+    }
+
+    let rows: Vec<Vec<String>> = keys
+        .iter()
+        .map(|key| {
+            vec![
+                key.kid.clone(),
+                if key.current { "current" } else { "retired" }.to_owned(),
+                key.created_at.clone(),
+                key.retired_at.clone().unwrap_or_default(),
+            ]
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        columns(&["KID", "STATE", "CREATED", "RETIRED"], &rows),
+    )
+        .into_response()
+}
+
 /// What the deployed manifest says about an app's roles, for the one question
 /// grant and audit both ask: does this entitlement open a door?
 ///
@@ -4517,6 +4602,7 @@ container:
             auth_log: Arc::new(AuthLogRepository::new(db.clone())),
             entitlements: Arc::new(EntitlementRepository::new(db.clone())),
             sessions: Arc::new(SessionRepository::new(db.clone())),
+            signer: Arc::new(JwtSigner::new(db.clone())),
             db: db.clone(),
             certificates: None,
             reconciled: crate::app::reconcile::Report::default(),
@@ -8072,6 +8158,48 @@ container:
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("not a user id"), "{body}");
+    }
+
+    /// The manual rotation lever, end to end over the socket: the response
+    /// names both kids, the listing shows the retired key beside the current
+    /// one, and the log entry is the operator's — because this route exists
+    /// for compromise response, and its audit trail is the point.
+    #[tokio::test]
+    async fn rotating_the_signing_key_over_the_socket_retires_and_lists_and_logs() {
+        let (_, router) = store_and_router();
+
+        let (status, first) = user_command(&router, "POST", "/auth/keys/rotate").await;
+        assert_eq!(status, StatusCode::OK);
+        // A spaceport that never signed mints its first key here.
+        assert!(first.contains("first jwt signing key"), "{first}");
+
+        let (status, body) = user_command(&router, "POST", "/auth/keys/rotate").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("now signing with"), "{body}");
+        assert!(body.contains("retired"), "{body}");
+        assert!(
+            body.contains("until every jwt it signed has expired"),
+            "{body}"
+        );
+
+        let (status, listed) = user_command(&router, "GET", "/auth/keys").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(listed.contains("current"), "{listed}");
+        assert!(listed.contains("retired"), "{listed}");
+
+        let (_, log) = user_command(&router, "GET", "/auth/log").await;
+        assert!(log.contains("key.rotated"), "{log}");
+        assert!(log.contains("operator"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_spaceport_lists_no_keys_and_says_so() {
+        let (_, router) = store_and_router();
+
+        let (status, body) = user_command(&router, "GET", "/auth/keys").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("no signing key yet"), "{body}");
     }
 
     /// A router and the database behind it, for the session tests: redemption
