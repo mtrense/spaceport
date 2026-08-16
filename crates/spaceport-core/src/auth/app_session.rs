@@ -759,7 +759,7 @@ mod tests {
         let fresh = signed_in(&users, &sessions).await;
         app_session(&sessions, &fresh).await;
 
-        let (_, listed) = sessions.list(&alice()).await.unwrap();
+        let (_, listed, _) = sessions.list(&alice()).await.unwrap();
 
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].derived.len(), 1);

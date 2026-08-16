@@ -569,6 +569,45 @@ const MIGRATIONS: &[&str] = &[
         created_at TEXT NOT NULL,
         retired_at TEXT
     ) STRICT;",
+    // 15 — the API keys an operator mints for machine callers.
+    //
+    // A key grants exactly one role at one app to one user, which is why the
+    // row carries the triple flat rather than referencing an entitlement: a
+    // key is deliberately *not* an entitlement — revoking a user's grants must
+    // not silently widen or narrow what a key in some CI system's secrets
+    // store buys, and a key's whole authority has to be readable off its own
+    // row.
+    //
+    // `key_hash` is SHA-256 of the credential, exactly as step 12 stores
+    // session tokens and for the same reason: a read of this table must never
+    // yield a string somebody could paste into an `Authorization` header. The
+    // plaintext exists twice — on the operator's terminal at mint, and in
+    // memory per request on its way to being hashed — and never in a row.
+    // UNIQUE because the hash is how the edge looks a presented key up, and
+    // two rows answering one credential would be two opinions about who it is.
+    //
+    // `key_id` is the short random handle of its own that step 12 argues for
+    // on `session_id`: it is what `session list` prints and `session drop`
+    // takes, so it must be typable in the clear and derivable from nothing.
+    // `prefix_tail` is the one glimpse of the credential a listing shows —
+    // the `spk_` prefix and the last four characters, fixed at mint — stored
+    // rather than derived because the hash cannot give it back.
+    //
+    // No foreign keys, for the reason step 4 gives everywhere: the offboarding
+    // cascade deletes a suspended or dropped user's keys by hand in the same
+    // transaction, and expired rows are swept by the writes that grow the
+    // table.
+    "CREATE TABLE api_keys (
+        key_id        TEXT NOT NULL PRIMARY KEY,
+        user_id       TEXT NOT NULL,
+        spaceport_app TEXT NOT NULL,
+        role          TEXT NOT NULL,
+        key_hash      TEXT NOT NULL UNIQUE,
+        prefix_tail   TEXT NOT NULL,
+        created_at    TEXT NOT NULL,
+        expires_at    TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX api_keys_by_user ON api_keys (user_id);",
 ];
 
 /// The schema version this build writes.
@@ -1102,6 +1141,67 @@ mod tests {
                 )
                 .unwrap(),
             (0, None)
+        );
+    }
+
+    /// An API key row is the credential's shadow and never the credential:
+    /// the hash is unique — one row per key, however many keys share a
+    /// role@app — and a second key for the same triple is an ordinary insert,
+    /// because duplicate grants are the point of minting one per caller.
+    #[test]
+    fn the_fifteenth_migration_creates_the_api_key_table() {
+        let connection = empty();
+        migrate(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO api_keys
+                     (key_id, user_id, spaceport_app, role, key_hash, prefix_tail,
+                      created_at, expires_at)
+                 VALUES ('0123456789abcdef', '3f29b1d4-8a6e-4c2b-9e77-1d5f6a2b9c40', 'blog',
+                         'reader', 'a-hash', 'spk_…wxyz',
+                         '2026-08-16T00:00:00Z', '2026-11-14T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            columns(&connection, "api_keys"),
+            [
+                "key_id",
+                "user_id",
+                "spaceport_app",
+                "role",
+                "key_hash",
+                "prefix_tail",
+                "created_at",
+                "expires_at"
+            ]
+        );
+        // The same triple again under a fresh key is a second row…
+        connection
+            .execute(
+                "INSERT INTO api_keys
+                     (key_id, user_id, spaceport_app, role, key_hash, prefix_tail,
+                      created_at, expires_at)
+                 VALUES ('fedcba9876543210', '3f29b1d4-8a6e-4c2b-9e77-1d5f6a2b9c40', 'blog',
+                         'reader', 'another-hash', 'spk_…abcd',
+                         '2026-08-16T00:00:00Z', '2026-11-14T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        // …while the same credential twice is the constraint saying no.
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO api_keys
+                         (key_id, user_id, spaceport_app, role, key_hash, prefix_tail,
+                          created_at, expires_at)
+                     VALUES ('00000000000000aa', '3f29b1d4-8a6e-4c2b-9e77-1d5f6a2b9c40', 'blog',
+                             'reader', 'a-hash', 'spk_…wxyz',
+                             '2026-08-16T00:00:00Z', '2026-11-14T00:00:00Z')",
+                    [],
+                )
+                .is_err()
         );
     }
 

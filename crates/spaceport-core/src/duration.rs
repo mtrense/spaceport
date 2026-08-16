@@ -10,7 +10,11 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Deserializer, de};
 
 /// Parse a duration of the form `<whole number><unit>`, where the unit is one
-/// of `ms`, `s`, `m` or `h`.
+/// of `ms`, `s`, `m`, `h` or `d`.
+///
+/// `d` exists because the auth spec spells lifetimes in days — an API key
+/// defaults to `90d` — and asking an operator to write `2160h` would be the
+/// parser optimising for its own alphabet over the person typing.
 pub fn parse(raw: &str) -> Result<Duration> {
     let raw = raw.trim();
     let split = raw.find(|c: char| !c.is_ascii_digit()).unwrap_or(raw.len());
@@ -26,8 +30,9 @@ pub fn parse(raw: &str) -> Result<Duration> {
         "s" => Ok(Duration::from_secs(amount)),
         "m" => Ok(Duration::from_secs(amount * 60)),
         "h" => Ok(Duration::from_secs(amount * 3600)),
-        "" => bail!("duration `{raw}` needs a unit: `ms`, `s`, `m` or `h`"),
-        unit => bail!("`{unit}` in `{raw}` is not a duration unit: use `ms`, `s`, `m` or `h`"),
+        "d" => Ok(Duration::from_secs(amount * 24 * 3600)),
+        "" => bail!("duration `{raw}` needs a unit: `ms`, `s`, `m`, `h` or `d`"),
+        unit => bail!("`{unit}` in `{raw}` is not a duration unit: use `ms`, `s`, `m`, `h` or `d`"),
     }
 }
 
@@ -48,6 +53,7 @@ mod tests {
         assert_eq!(parse("10s").unwrap(), Duration::from_secs(10));
         assert_eq!(parse("2m").unwrap(), Duration::from_secs(120));
         assert_eq!(parse("1h").unwrap(), Duration::from_secs(3600));
+        assert_eq!(parse("90d").unwrap(), Duration::from_secs(90 * 24 * 3600));
     }
 
     #[test]

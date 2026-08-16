@@ -414,13 +414,34 @@ pub async fn auth_revoke(
     send_to(endpoint, builder("DELETE", &uri).body(Full::default())?).await
 }
 
-/// Ask for the sessions of the user `user` names. API keys will join the same
-/// listing when they exist, which is why the answer already carries a KIND
-/// column.
+/// Ask for the sessions and API keys of the user `user` names — one listing,
+/// told apart by its KIND column.
 pub async fn auth_session_list(endpoint: &OperatorEndpoint, user: &UserRef) -> Result<String> {
     let request = builder("GET", &format!("/auth/users/{user}/sessions")).body(Full::default())?;
 
     send_to(endpoint, request).await
+}
+
+/// Ask it to mint an API key for the user `user` names, granting exactly
+/// `grants` until `expires` (a duration like `90d`, the far end's default
+/// when absent) from now.
+///
+/// The duration travels as the operator spelled it for [`auth_session_mint`]'s
+/// reason: the server's parser stays the authority. Everything else is safe in
+/// a path as a grant's arguments are — one shared alphabet, and an `@` is an
+/// ordinary path character.
+pub async fn auth_api_key_mint(
+    endpoint: &OperatorEndpoint,
+    user: &UserRef,
+    grants: &RoleAtApp,
+    expires: Option<&str>,
+) -> Result<String> {
+    let uri = match expires {
+        Some(expires) => format!("/auth/users/{user}/api-keys/{grants}?expires={expires}"),
+        None => format!("/auth/users/{user}/api-keys/{grants}"),
+    };
+
+    send_to(endpoint, builder("POST", &uri).body(Full::default())?).await
 }
 
 /// Ask it to mint a one-time code for the user `user` names, redeeming into a

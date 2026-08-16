@@ -100,6 +100,56 @@ pub(super) async fn gate<B>(
         return Admission::Pass { bearer: None };
     }
 
+    // An API key authenticates without any cookie or session — the machine
+    // path, checked before the cookie so a caller sending both is judged by
+    // the credential it deliberately attached. This read happens here, before
+    // the proxy's rewrite strips every `Authorization` header, which is the
+    // ordering the spec fixes: read and validate, then strip. Only the
+    // `Bearer` scheme is accepted, and only a token wearing the `spk_`
+    // prefix engages this branch at all — any other bearer token is not
+    // spaceport's to judge and simply falls through to the cookie path (and
+    // the strip). CSRF does not apply on this branch: the check exists for
+    // credentials a browser attaches on its own, and a header a caller sets
+    // by hand is the opposite of that. A bad key never redirects either —
+    // it is a machine calling, so the answer is the machine-readable `401`,
+    // navigation or not.
+    if let Some(key) = bearer_api_key(req.headers()) {
+        // The cache first, exactly as for cookies: a hit *is* the
+        // authentication, keyed under the key's own hash, and every lever
+        // that revokes a key purges these entries in the same breath.
+        if let Some(jwt) = state.jwt_cache.lookup(&key, &app.id) {
+            return Admission::Pass { bearer: Some(jwt) };
+        }
+
+        return match state.sessions.api_key_identity(&key, &app.id).await {
+            Ok(Some((user, role))) => vouch_key(state, app, &key, &user, role).await,
+            Ok(None) => {
+                // A warning and nothing in the auth event log: a wrong key
+                // costs its sender nothing to repeat, and a log an outsider
+                // can flood is a log nobody reads.
+                warn!(app = %app.id, "refused an api key");
+
+                let mut response =
+                    plain(StatusCode::UNAUTHORIZED, "the api key was not accepted\n");
+                response
+                    .headers_mut()
+                    .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+
+                Admission::Refused(response)
+            }
+            // Failing open would make a database hiccup an authentication
+            // bypass; failing closed makes it an error page.
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "could not check an api key");
+
+                Admission::Refused(plain(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "spaceport could not check the api key\n",
+                ))
+            }
+        };
+    }
+
     if let Some(token) = cookie_value(req.headers(), APP_SESSION_COOKIE) {
         let token = Secret::new(token);
 
@@ -110,10 +160,9 @@ pub(super) async fn gate<B>(
         if let Some(jwt) = state.jwt_cache.lookup(&token, &app.id) {
             // Authenticated by the cookie — which is exactly the credential a
             // cross-site form rides, so unsafe methods pass through the CSRF
-            // check before the request may pass to the app. Requests a future
-            // API key authenticates are exempt by spec (a key never travels in
-            // a cookie); that branch will return before this check when the
-            // milestone lands.
+            // check before the request may pass to the app. Requests an API
+            // key authenticates are exempt by spec (a key never travels in a
+            // cookie); that branch returned above, before this check.
             if let Some(refusal) =
                 csrf_refusal(req.method(), req.headers(), Some(host), state.https_port)
             {
@@ -283,6 +332,94 @@ async fn vouch(
     };
 
     state.jwt_cache.insert(token, &app.id, user, jwt.clone());
+
+    Admission::Pass { bearer: Some(jwt) }
+}
+
+/// The API key a request presents, if it presents one: the first
+/// `Authorization` header, when its scheme is `Bearer` (case-insensitively,
+/// as RFC 9110 reads schemes) and its token wears the `spk_` prefix.
+///
+/// Anything else — another scheme, a bearer token that is not spaceport's,
+/// a value that is not text — answers `None` and takes the cookie path,
+/// where the strip disposes of it. Deliberately the *first* header and not a
+/// search across duplicates: a request carrying several `Authorization`
+/// headers is already malformed, and hunting through it for one that pleases
+/// us would be doing a confused client's guessing for it.
+fn bearer_api_key(headers: &HeaderMap) -> Option<Secret> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+
+    let token = token.trim();
+    token
+        .starts_with(crate::auth::api_key::KEY_PREFIX)
+        .then(|| Secret::new(token))
+}
+
+/// Mint the JWT a validated API key buys, cache it under the key's own hash,
+/// and pass.
+///
+/// The claim shape is the cookie path's exactly — same `iss`, `aud`, `exp`
+/// arithmetic — with `sub` the owning user and `roles` the key's single
+/// role, no more and no less. Deliberately *not* intersected with the
+/// deployed manifest's declared roles: a key grants exactly its role, the
+/// spec's sentence, and the mint over the operator socket already warned when
+/// that role opens no door — an app handed a role it never declared simply
+/// authorises nothing by it, which is the app's own contract to enforce.
+async fn vouch_key(
+    state: &EdgeState,
+    app: &App,
+    key: &Secret,
+    user: &crate::auth::UserId,
+    role: crate::auth::Role,
+) -> Admission {
+    // The same missing piece the cookie path refuses over, worded the same
+    // way: without a hostname there is no `iss` an app could fetch a JWKS from.
+    let Some(hostname) = state.hostname.as_deref() else {
+        return Admission::Refused(plain(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this app is gated and spaceport has no `edge.hostname` to vouch for you as\n",
+        ));
+    };
+
+    let signing_key = match state.signer.signing_key().await {
+        Ok(key) => key,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "could not load the jwt signing key");
+
+            return Admission::Refused(plain(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "spaceport could not sign for you\n",
+            ));
+        }
+    };
+
+    let jwt = match crate::auth::jwt::mint(
+        &signing_key,
+        &crate::auth::jwt::issuer(hostname, state.https_port),
+        user,
+        &app.id,
+        &[role],
+        time::OffsetDateTime::now_utc(),
+    ) {
+        Ok(jwt) => jwt,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "could not mint a jwt");
+
+            return Admission::Refused(plain(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "spaceport could not sign for you\n",
+            ));
+        }
+    };
+
+    // Cached under the key itself — hashed by the cache, like every
+    // credential it holds — with the user beside it so `purge_user`, the
+    // lever behind every key revocation, reaches these entries too.
+    state.jwt_cache.insert(key, &app.id, user, jwt.clone());
 
     Admission::Pass { bearer: Some(jwt) }
 }
@@ -676,6 +813,28 @@ mod tests {
             &Method::GET,
             &headers(&[("accept", "text/html"), ("upgrade", "websocket")])
         ));
+    }
+
+    /// The one shape that engages key auth: the `Bearer` scheme, in any
+    /// case, carrying an `spk_` token. Everything else is not spaceport's to
+    /// judge — it falls through to the cookie path and the strip.
+    #[test]
+    fn only_a_bearer_spk_token_reads_as_an_api_key() {
+        let key = |pairs: &[(&str, &str)]| bearer_api_key(&headers(pairs));
+
+        assert_eq!(
+            key(&[("authorization", "Bearer spk_abc")]).map(|k| k.expose().to_owned()),
+            Some("spk_abc".to_owned())
+        );
+        // The scheme is case-insensitive, as RFC 9110 reads schemes.
+        assert!(key(&[("authorization", "bearer spk_abc")]).is_some());
+
+        // Another scheme, another issuer's bearer token, or no header at all:
+        // not a key, and not this branch's business.
+        assert!(key(&[("authorization", "Basic spk_abc")]).is_none());
+        assert!(key(&[("authorization", "Bearer eyJhbGciOi")]).is_none());
+        assert!(key(&[("authorization", "spk_abc")]).is_none());
+        assert!(key(&[]).is_none());
     }
 
     /// Safe methods pass the CSRF gate unexamined: a GET, HEAD or OPTIONS

@@ -88,24 +88,33 @@ pub struct SessionId(String);
 impl SessionId {
     /// Mint a fresh id from the host's randomness.
     fn generate() -> Result<Self> {
-        let mut bytes = [0_u8; 8];
-        ring::rand::SystemRandom::new()
-            .fill(&mut bytes)
-            // ring's own error says nothing; what an operator can act on is
-            // that the host's randomness is what failed.
-            .map_err(|_| anyhow!("this host would not produce random bytes"))?;
-
-        let mut rendered = String::with_capacity(16);
-        for byte in bytes {
-            rendered.push_str(&format!("{byte:02x}"));
-        }
-
-        Ok(Self(rendered))
+        short_handle().map(Self)
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Sixteen hex characters off the host's randomness: the shape of every short
+/// operator handle in this module tree. One function for the two things
+/// minted in it — a session's id and an API key's — so the two id spaces
+/// cannot drift into different lengths or alphabets, which matters because
+/// `session drop` takes either and tells them apart by lookup, not by shape.
+pub(super) fn short_handle() -> Result<String> {
+    let mut bytes = [0_u8; 8];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        // ring's own error says nothing; what an operator can act on is
+        // that the host's randomness is what failed.
+        .map_err(|_| anyhow!("this host would not produce random bytes"))?;
+
+    let mut rendered = String::with_capacity(16);
+    for byte in bytes {
+        rendered.push_str(&format!("{byte:02x}"));
+    }
+
+    Ok(rendered)
 }
 
 impl FromStr for SessionId {
@@ -591,16 +600,24 @@ impl SessionRepository {
         Ok(dropped.is_some())
     }
 
-    /// Every live session of the user `user` names, oldest first.
+    /// Every live session and API key of the user `user` names, oldest first
+    /// — the spec's `session list`, which reports both under one KIND column.
     ///
     /// Live only: an expired row is swept by the next mint or redeem, and
-    /// listing it in the meantime would be reporting access nobody has. The
-    /// answer will grow API keys in a later milestone, which is why the
-    /// operator interface renders these rows under a KIND column already.
+    /// listing it in the meantime would be reporting access nobody has. One
+    /// read for both tables, in one transaction, so the two halves are about
+    /// the same moment.
     pub async fn list(
         &self,
         user: &UserRef,
-    ) -> Result<(UserRecord, Vec<SessionRecord>), SessionError> {
+    ) -> Result<
+        (
+            UserRecord,
+            Vec<SessionRecord>,
+            Vec<super::api_key::ApiKeyRecord>,
+        ),
+        SessionError,
+    > {
         let asked = user.clone();
 
         let found = self
@@ -615,8 +632,9 @@ impl SessionRepository {
                 };
                 let user = record(row)?;
                 let sessions = live_sessions_in(&transaction, &user.id)?;
+                let keys = super::api_key::live_keys_in(&transaction, &user.id)?;
 
-                Ok(Some((user, sessions)))
+                Ok(Some((user, sessions, keys)))
             })
             .await
             .map_err(SessionError::Failed)?;
@@ -624,18 +642,30 @@ impl SessionRepository {
         found.ok_or_else(|| SessionError::UnknownUser(unknown(user)))
     }
 
-    /// Drop one session of the user's, or every one they have.
+    /// Drop one session or API key of the user's by id, or every session
+    /// *and* key they have.
     ///
-    /// A named session that is not there is a refusal rather than a quiet
-    /// no-op — the operator typed an id, and "done" about an id that named
-    /// nothing would be the answer disagreeing with the table. Dropping all of
-    /// none succeeds and says zero, because "make it so there are no sessions"
-    /// was already true.
+    /// One verb for both tables because that is the spec's command: `session
+    /// drop <user>` with no id is "sign this identity's credentials out,
+    /// all of them", and an id names whichever of the two it matches — the
+    /// handles share one shape on purpose, and the lookup, not the spelling,
+    /// says which table answers. A named id that is in neither is a refusal
+    /// rather than a quiet no-op — the operator typed it, and "done" about an
+    /// id that named nothing would be the answer disagreeing with the tables.
+    /// Dropping all of none succeeds and says zero, because "make it so there
+    /// is nothing" was already true.
     pub async fn drop_sessions(
         &self,
         user: &UserRef,
         session: Option<&SessionId>,
-    ) -> Result<(UserRecord, Vec<SessionRecord>), SessionError> {
+    ) -> Result<
+        (
+            UserRecord,
+            Vec<SessionRecord>,
+            Vec<super::api_key::ApiKeyRecord>,
+        ),
+        SessionError,
+    > {
         let asked = user.clone();
         let session = session.cloned();
 
@@ -656,7 +686,15 @@ impl SessionRepository {
                     Some(id) => held.into_iter().filter(|held| &held.id == id).collect(),
                     None => held,
                 };
-                if session.is_some() && dropping.is_empty() {
+                let held_keys = super::api_key::live_keys_in(&transaction, &user.id)?;
+                let revoking: Vec<super::api_key::ApiKeyRecord> = match &session {
+                    Some(id) => held_keys
+                        .into_iter()
+                        .filter(|held| held.id.as_str() == id.as_str())
+                        .collect(),
+                    None => held_keys,
+                };
+                if session.is_some() && dropping.is_empty() && revoking.is_empty() {
                     return Ok(Some(Err(user)));
                 }
 
@@ -681,10 +719,21 @@ impl SessionRepository {
                         Some(&format!("session {}", session.id)),
                     )?;
                 }
+                for key in &revoking {
+                    super::api_key::remove_key_in(&transaction, &key.id)?;
+                    record_in(
+                        &transaction,
+                        &at,
+                        "key.revoked",
+                        Some(&user.id),
+                        OPERATOR_ORIGIN,
+                        Some(&format!("api key {} ({})", key.id, key.prefix_tail)),
+                    )?;
+                }
 
                 transaction.commit().context("committing a session drop")?;
 
-                Ok(Some(Ok((user, dropping))))
+                Ok(Some(Ok((user, dropping, revoking))))
             })
             .await
             .map_err(SessionError::Failed)?;
@@ -692,25 +741,29 @@ impl SessionRepository {
         match found {
             None => Err(SessionError::UnknownUser(unknown(user))),
             Some(Err(user)) => Err(SessionError::Nothing(anyhow!(
-                "`{}` has no such session — `spaceport auth session list {}` says what is live",
+                "`{}` has no such session or api key — `spaceport auth session list {}` says \
+                 what is live",
                 user.slug,
                 user.slug,
             ))),
-            Some(Ok((user, dropped))) => {
+            Some(Ok((user, dropped, revoked))) => {
                 // `session drop` is a purge lever by spec: the cached JWTs the
-                // dropped sessions' derivatives minted must not outlive them.
-                // By user rather than per session, because the cache is keyed
-                // by app-session tokens this side never saw in the clear — a
-                // drop of one session also purging the other's entries costs a
-                // re-mint, not access.
-                if !dropped.is_empty() {
+                // dropped sessions' derivatives — and the revoked keys —
+                // minted must not outlive them. By user rather than per
+                // credential, because the cache is keyed by tokens this side
+                // never saw in the clear — a drop of one session also purging
+                // the other's entries costs a re-mint, not access.
+                if !dropped.is_empty() || !revoked.is_empty() {
                     self.jwt_cache.purge_user(&user.id);
                 }
                 for session in &dropped {
                     info!(user = %user.id, session = %session.id, "session dropped");
                 }
+                for key in &revoked {
+                    info!(user = %user.id, key = %key.id, "api key revoked");
+                }
 
-                Ok((user, dropped))
+                Ok((user, dropped, revoked))
             }
         }
     }
@@ -791,6 +844,9 @@ pub(super) fn remove_all_in(transaction: &Transaction<'_>, user: &UserId) -> Res
     // deleted: an app session whose parent row was somehow already gone must
     // still not survive its user's offboarding.
     super::app_session::remove_users_in(transaction, user)?;
+    // And the API keys, which the spec has suspend and drop kill alike —
+    // resume restores access, never credentials.
+    super::api_key::remove_users_in(transaction, user)?;
 
     Ok(())
 }
@@ -830,6 +886,12 @@ pub(super) fn sweep_expired_in(transaction: &Transaction<'_>) -> Result<()> {
             rusqlite::params![at],
         )
         .context("sweeping expired exchange nonces")?;
+    transaction
+        .execute(
+            "DELETE FROM api_keys WHERE expires_at < ?1",
+            rusqlite::params![at],
+        )
+        .context("sweeping expired api keys")?;
 
     Ok(())
 }
@@ -1035,7 +1097,7 @@ mod tests {
         let fresh = sessions.redeem(&minted.code).await.unwrap();
 
         assert_eq!(fresh.expires_at, minted.session_expires_at);
-        let (user, listed) = sessions.list(&by_slug("alice")).await.unwrap();
+        let (user, listed, _) = sessions.list(&by_slug("alice")).await.unwrap();
         assert_eq!(user.slug, slug("alice"));
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, fresh.id);
@@ -1202,14 +1264,14 @@ mod tests {
         let second = mint(&sessions, "alice").await;
         let second = sessions.redeem(&second.code).await.unwrap();
 
-        let (_, dropped) = sessions
+        let (_, dropped, _) = sessions
             .drop_sessions(&by_slug("alice"), Some(&first.id))
             .await
             .unwrap();
 
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0].id, first.id);
-        let (_, listed) = sessions.list(&by_slug("alice")).await.unwrap();
+        let (_, listed, _) = sessions.list(&by_slug("alice")).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, second.id);
     }
@@ -1223,7 +1285,7 @@ mod tests {
             sessions.redeem(&minted.code).await.unwrap();
         }
 
-        let (_, dropped) = sessions
+        let (_, dropped, _) = sessions
             .drop_sessions(&by_slug("alice"), None)
             .await
             .unwrap();

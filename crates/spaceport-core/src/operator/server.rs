@@ -156,6 +156,7 @@ fn router(instance: Arc<Instance>, events: Arc<EventBus>, shutdown: Cancellation
             "/auth/users/{user}/sessions/{session}",
             delete(drop_session),
         )
+        .route("/auth/users/{user}/api-keys/{grants}", post(mint_api_key))
         .route(
             "/auth/users/{user}/entitlements",
             delete(revoke_all_entitlements),
@@ -3600,11 +3601,14 @@ fn refuse_user(error: UserError) -> Response {
     refuse(status, &error.to_string())
 }
 
-/// `GET /auth/users/{ref}/sessions`: what is signed in as this user.
+/// `GET /auth/users/{ref}/sessions`: what is signed in — or can sign a
+/// request — as this user: sessions, their derived app sessions, and API
+/// keys, told apart by the KIND column the listing has carried since before
+/// keys existed.
 ///
-/// A KIND column with one value today, on purpose: API keys are a later
-/// milestone and land in this same listing, so the shape that scripts and eyes
-/// learn now is the shape that survives them arriving.
+/// A key's row shows the prefix-and-tail glimpse fixed at mint and what the
+/// key grants; the KEY and GRANTS columns sit empty on session rows, which is
+/// cheaper to read than a second table would be to remember to ask for.
 async fn list_sessions(
     State(sessions): State<Arc<SessionRepository>>,
     UrlPath(user): UrlPath<String>,
@@ -3614,16 +3618,16 @@ async fn list_sessions(
         Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
     };
 
-    let (user, listed) = match sessions.list(&user).await {
+    let (user, listed, keys) = match sessions.list(&user).await {
         Ok(listed) => listed,
         Err(error) => return refuse_session(error),
     };
 
-    if listed.is_empty() {
+    if listed.is_empty() && keys.is_empty() {
         return (
             StatusCode::OK,
             format!(
-                "`{}` has no sessions — `spaceport auth session mint {}` starts one\n",
+                "`{}` has no sessions or api keys — `spaceport auth session mint {}` starts a session\n",
                 user.slug, user.slug
             ),
         )
@@ -3639,6 +3643,8 @@ async fn list_sessions(
         rows.push(vec![
             "session".to_owned(),
             session.id.to_string(),
+            String::new(),
+            String::new(),
             session.created_at.clone(),
             session.expires_at.clone(),
         ]);
@@ -3646,15 +3652,30 @@ async fn list_sessions(
             rows.push(vec![
                 "app".to_owned(),
                 format!("↳ {}", derived.app),
+                String::new(),
+                String::new(),
                 derived.created_at.clone(),
                 derived.expires_at.clone(),
             ]);
         }
     }
+    for key in &keys {
+        rows.push(vec![
+            "key".to_owned(),
+            key.id.to_string(),
+            key.prefix_tail.clone(),
+            format!("{}@{}", key.role, key.app),
+            key.created_at.clone(),
+            key.expires_at.clone(),
+        ]);
+    }
 
     (
         StatusCode::OK,
-        columns(&["KIND", "ID", "CREATED", "EXPIRES"], &rows),
+        columns(
+            &["KIND", "ID", "KEY", "GRANTS", "CREATED", "EXPIRES"],
+            &rows,
+        ),
     )
         .into_response()
 }
@@ -3704,7 +3725,9 @@ struct MintQuery {
     expires: Option<String>,
 }
 
-/// `DELETE /auth/users/{ref}/sessions`: sign this user out everywhere.
+/// `DELETE /auth/users/{ref}/sessions`: sign this user out everywhere — every
+/// session, and every API key with them, which is the spec's "all sessions
+/// and keys".
 async fn drop_all_sessions(
     State(sessions): State<Arc<SessionRepository>>,
     UrlPath(user): UrlPath<String>,
@@ -3712,7 +3735,9 @@ async fn drop_all_sessions(
     drop_scoped(&sessions, &user, None).await
 }
 
-/// `DELETE /auth/users/{ref}/sessions/{id}`: sign one session out.
+/// `DELETE /auth/users/{ref}/sessions/{id}`: sign one session out, or revoke
+/// one API key — the id decides which, by lookup rather than by shape, since
+/// the two handles are deliberately spelled alike.
 async fn drop_session(
     State(sessions): State<Arc<SessionRepository>>,
     UrlPath((user, session)): UrlPath<(String, String)>,
@@ -3725,7 +3750,9 @@ async fn drop_session(
     drop_scoped(&sessions, &user, Some(&session)).await
 }
 
-/// The shared tail of the two drop routes: resolve, drop, count.
+/// The shared tail of the two drop routes: resolve, drop, count what went —
+/// sessions and keys each in their own sentence, because "dropped" and
+/// "revoked" are different verbs to the person reading.
 async fn drop_scoped(
     sessions: &SessionRepository,
     user: &str,
@@ -3736,13 +3763,13 @@ async fn drop_scoped(
         Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
     };
 
-    let (user, dropped) = match sessions.drop_sessions(&user, session).await {
+    let (user, dropped, revoked) = match sessions.drop_sessions(&user, session).await {
         Ok(dropped) => dropped,
         Err(error) => return refuse_session(error),
     };
 
-    let body = match dropped.as_slice() {
-        [] => format!("`{}` had no sessions — nothing to drop\n", user.slug),
+    let mut body = match dropped.as_slice() {
+        [] => String::new(),
         [one] => format!("dropped session {} of `{}`\n", one.id, user.slug),
         many => {
             let mut lines = format!("dropped {} sessions of `{}`\n", many.len(), user.slug);
@@ -3753,6 +3780,88 @@ async fn drop_scoped(
             lines
         }
     };
+    match revoked.as_slice() {
+        [] => {}
+        [one] => body.push_str(&format!(
+            "revoked api key {} ({}) of `{}`\n",
+            one.id, one.prefix_tail, user.slug
+        )),
+        many => {
+            body.push_str(&format!(
+                "revoked {} api keys of `{}`\n",
+                many.len(),
+                user.slug
+            ));
+            for key in many {
+                body.push_str(&format!("  {} ({})\n", key.id, key.prefix_tail));
+            }
+        }
+    }
+    if body.is_empty() {
+        body = format!(
+            "`{}` had no sessions or api keys — nothing to drop\n",
+            user.slug
+        );
+    }
+
+    (StatusCode::OK, body).into_response()
+}
+
+/// `POST /auth/users/{ref}/api-keys/{role}@{app}?expires=…`: mint an API key.
+///
+/// A POST and not a PUT, unlike a grant, because nothing about a key is
+/// idempotent: every mint is a fresh credential, and two keys for the same
+/// role at the same app coexist so each caller can be revoked alone. The
+/// response is the one place the key is ever shown — stored as a hash, like
+/// every credential in the state database — and it carries the same
+/// undeclared-role warning a grant does, from the same check: a key is not an
+/// entitlement, but "does this open a door today?" is the same question.
+async fn mint_api_key(
+    State(sessions): State<Arc<SessionRepository>>,
+    State(instance): State<Arc<Instance>>,
+    UrlPath((user, grants)): UrlPath<(String, String)>,
+    Query(query): Query<MintQuery>,
+) -> Response {
+    let user: UserRef = match user.parse() {
+        Ok(user) => user,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+    let grants: RoleAtApp = match grants.parse() {
+        Ok(grants) => grants,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+    let lifetime = match &query.expires {
+        Some(expires) => match crate::duration::parse(expires) {
+            Ok(lifetime) => lifetime,
+            Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+        },
+        None => crate::auth::DEFAULT_API_KEY_LIFETIME,
+    };
+
+    let minted = match sessions.mint_api_key(&user, &grants, lifetime).await {
+        Ok(minted) => minted,
+        Err(error) => return refuse_session(error),
+    };
+
+    let mut body = format!(
+        "api key for `{}`: {}\n  shown once — it is stored only as a hash\n  id       {}\n  grants   role `{}` at app `{}`\n  expires  {}\n",
+        minted.user.slug,
+        // The deliberate exposure: this response is the terminal the spec
+        // says the key is printed to, exactly once.
+        minted.key.expose(),
+        minted.id,
+        minted.grants.role,
+        minted.grants.app,
+        minted.expires_at,
+    );
+
+    if let Some(warning) = DeclaredRoles::of(instance.applier.repository(), &grants.app)
+        .await
+        .warning(&grants)
+    {
+        warn!(entitlement = %grants, "{warning}");
+        body.push_str(&format!("  warning: {warning}\n"));
+    }
 
     (StatusCode::OK, body).into_response()
 }
@@ -8182,6 +8291,149 @@ container:
         })
         .await
         .unwrap();
+    }
+
+    /// The key out of a mint response — the one place it is ever printed.
+    fn key_in(body: &str) -> String {
+        body.lines()
+            .next()
+            .and_then(|line| line.rsplit_once(": "))
+            .expect("the response prints the key")
+            .1
+            .trim()
+            .to_owned()
+    }
+
+    /// The key id out of a mint response's `id` line.
+    fn key_id_in(body: &str) -> String {
+        body.lines()
+            .find_map(|line| line.trim().strip_prefix("id "))
+            .expect("the response prints the key id")
+            .trim()
+            .to_owned()
+    }
+
+    /// The mint prints the key exactly once — `spk_`-prefixed, beside its id
+    /// and what it grants — and the listing that follows shows the tail
+    /// glimpse and never the credential.
+    #[tokio::test]
+    async fn mints_an_api_key_shown_once_and_listed_as_its_tail() {
+        let (router, _) = router_with_alice_and_blog().await;
+
+        let (status, minted) = user_command(
+            &router,
+            "POST",
+            "/auth/users/alice/api-keys/reader@blog?expires=30d",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{minted}");
+        assert!(minted.contains("api key for `alice`: spk_"), "{minted}");
+        assert!(minted.contains("shown once"), "{minted}");
+        assert!(minted.contains("role `reader` at app `blog`"), "{minted}");
+        assert!(!minted.contains("warning"), "{minted}");
+        let key = key_in(&minted);
+        let id = key_id_in(&minted);
+
+        let (status, listed) = user_command(&router, "GET", "/auth/users/alice/sessions").await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert!(listed.contains("key"), "{listed}");
+        assert!(listed.contains(&id), "{listed}");
+        assert!(listed.contains("spk_…"), "{listed}");
+        assert!(listed.contains("reader@blog"), "{listed}");
+        assert!(!listed.contains(&key), "{listed}");
+    }
+
+    /// The `grant` semantics, mirrored: a role the deployed manifest does not
+    /// declare still mints — granting ahead of the deploy is the ordinary
+    /// order — with the warning beside the key rather than instead of it.
+    #[tokio::test]
+    async fn an_api_key_mint_for_an_undeclared_role_warns_but_mints() {
+        let (router, _) = router_with_alice_and_blog().await;
+
+        let (status, body) =
+            user_command(&router, "POST", "/auth/users/alice/api-keys/ghost@blog").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("api key for `alice`: spk_"), "{body}");
+        assert!(body.contains("warning"), "{body}");
+        assert!(body.contains("does not declare role `ghost`"), "{body}");
+    }
+
+    /// The refusals, each with the status whose problem it is: a mistyped
+    /// user a 404, a suspended one a 409, a bad duration or grants a 400.
+    #[tokio::test]
+    async fn refuses_an_api_key_mint_nobody_can_answer() {
+        let (router, _) = router_with_alice_and_blog().await;
+
+        let (status, body) =
+            user_command(&router, "POST", "/auth/users/ghost/api-keys/reader@blog").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        let (status, body) = user_command(
+            &router,
+            "POST",
+            "/auth/users/alice/api-keys/reader@blog?expires=soon",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        let (status, body) =
+            user_command(&router, "POST", "/auth/users/alice/api-keys/reader").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("not an entitlement"), "{body}");
+
+        user_command(&router, "POST", "/auth/users/alice/suspend").await;
+        let (status, body) =
+            user_command(&router, "POST", "/auth/users/alice/api-keys/reader@blog").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("suspended"), "{body}");
+    }
+
+    /// `session drop <user> <key-id>` revokes exactly that key, and the log
+    /// carries the mint and the revoke — never the credential.
+    #[tokio::test]
+    async fn a_key_drop_revokes_it_and_the_log_says_so() {
+        let (router, _) = router_with_alice_and_blog().await;
+        let (_, minted) =
+            user_command(&router, "POST", "/auth/users/alice/api-keys/reader@blog").await;
+        let key = key_in(&minted);
+        let id = key_id_in(&minted);
+
+        let (status, body) = user_command(
+            &router,
+            "DELETE",
+            &format!("/auth/users/alice/sessions/{id}"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains(&format!("revoked api key {id}")), "{body}");
+        let (_, listed) = user_command(&router, "GET", "/auth/users/alice/sessions").await;
+        assert!(!listed.contains(&id), "{listed}");
+
+        let (_, log) = user_command(&router, "GET", "/auth/log").await;
+        assert!(log.contains("key.minted"), "{log}");
+        assert!(log.contains("key.revoked"), "{log}");
+        assert!(!log.contains(&key), "{log}");
+    }
+
+    /// The bare drop is the spec's "all sessions and keys": one command, both
+    /// credentials gone, each named by its own verb.
+    #[tokio::test]
+    async fn a_bare_session_drop_takes_keys_too() {
+        let ((_, router, ..), db, _) = parts_with_state(OneContainer::default(), CONFIG);
+        create_user_named(&router, "alice", "").await;
+        let (_, minted) = user_command(&router, "POST", "/auth/users/alice/sessions").await;
+        redeem(&db, &minted).await;
+        user_command(&router, "POST", "/auth/users/alice/api-keys/reader@blog").await;
+
+        let (status, body) = user_command(&router, "DELETE", "/auth/users/alice/sessions").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("dropped session"), "{body}");
+        assert!(body.contains("revoked api key"), "{body}");
+        let (_, listed) = user_command(&router, "GET", "/auth/users/alice/sessions").await;
+        assert!(listed.contains("has no sessions or api keys"), "{listed}");
     }
 
     /// The happy path the spec is for: a declared role, granted, audited,

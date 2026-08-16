@@ -408,8 +408,8 @@ fn slug_collision(error: &anyhow::Error) -> bool {
 /// cascade the same way: sessions (global and per-app, WebSocket connections
 /// included), API keys and cached JWTs all die with the user, so that a user
 /// the pool says is gone can never be one a session table still lets in.
-/// Global sessions, pending one-time codes, app sessions and exchange nonces
-/// now do, in this transaction; API keys join here as their milestone lands.
+/// Global sessions, pending one-time codes, app sessions, exchange nonces and
+/// API keys all do, in this transaction.
 /// Cached JWTs are the one tenant that cannot: the cache is in-memory, not a
 /// table, so its purge sits at this function's call sites, after the commit —
 /// a purge inside a transaction that then rolled back would leave the cache

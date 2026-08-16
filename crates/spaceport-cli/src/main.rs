@@ -264,12 +264,14 @@ enum AuthCommand {
     /// from SSO is refused with the rule that produced it — the next IdP login
     /// would put it straight back, and dropping the mapping is what removes it.
     Revoke(RevokeArgs),
-    /// Manage the sessions that sign a user in on the web.
+    /// Manage the sessions that sign a user in on the web, and the API keys
+    /// that sign a machine's requests.
     ///
     /// A session starts from a one-time code minted here and typed into the
     /// login page on the edge hostname; it ends when it expires, when the user
-    /// signs out, or when an operator drops it. API keys are a later milestone
-    /// and will live under this same command.
+    /// signs out, or when an operator drops it. An API key is minted here too,
+    /// grants exactly one role at one app, and ends when it expires or is
+    /// revoked — `list` shows both, `drop` takes either.
     Session(SessionArgs),
     /// Report one user's whole standing: the record, the SSO connection, every
     /// entitlement with its origin, and the apps they actually reach.
@@ -333,7 +335,7 @@ struct SessionArgs {
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
-    /// List a user's live sessions.
+    /// List a user's live sessions and API keys.
     List(UserRefArgs),
     /// Mint a one-time code that signs the user in on the login page.
     ///
@@ -341,7 +343,16 @@ enum SessionCommand {
     /// read it back, and losing it means minting another. It is good for ten
     /// minutes, a single use, and five failed attempts.
     Mint(SessionMintArgs),
-    /// Drop one session by id, or every session the user holds.
+    /// Mint an API key granting one role at one app.
+    ///
+    /// The key is printed once and stored only as a hash: there is no way to
+    /// read it back, and losing it means minting another. A machine presents
+    /// it as `Authorization: Bearer spk_…` and needs no cookie, session or
+    /// CSRF ceremony; the app sees the same JWT a signed-in user's request
+    /// carries, with the key's single role.
+    ApiKey(SessionApiKeyArgs),
+    /// Drop one session or revoke one API key by id, or drop every session
+    /// and key the user holds.
     Drop(SessionDropArgs),
 }
 
@@ -361,12 +372,31 @@ struct SessionMintArgs {
 }
 
 #[derive(Debug, Args)]
+struct SessionApiKeyArgs {
+    /// The user the key belongs to, as a slug or a user id.
+    user: UserRef,
+
+    /// What the key grants, as `<role>@<app-id>` — exactly that role, at
+    /// exactly that app, whatever entitlements the user otherwise holds.
+    grants: RoleAtApp,
+
+    /// How long the key lives, as a duration like `90d`. Ninety days when
+    /// left out.
+    #[arg(long, value_name = "DURATION")]
+    expires: Option<String>,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
 struct SessionDropArgs {
     /// The user, as a slug or a user id.
     user: UserRef,
 
-    /// The session to drop, as `spaceport auth session list` prints it.
-    /// Leaving it out drops every session the user holds.
+    /// The session to drop or the API key to revoke, as `spaceport auth
+    /// session list` prints them. Leaving it out drops every session and
+    /// key the user holds.
     session: Option<SessionId>,
 
     #[command(flatten)]
@@ -838,6 +868,7 @@ async fn main() -> Result<()> {
             AuthCommand::Session(args) => match args.command {
                 SessionCommand::List(args) => session_list(args).await,
                 SessionCommand::Mint(args) => session_mint(args).await,
+                SessionCommand::ApiKey(args) => session_api_key(args).await,
                 SessionCommand::Drop(args) => session_drop(args).await,
             },
             AuthCommand::Grant(args) => grant(args).await,
@@ -1409,6 +1440,28 @@ async fn session_mint(args: SessionMintArgs) -> Result<()> {
     print!(
         "{}",
         client::auth_session_mint(&args.server.server, &args.user, args.expires.as_deref()).await?
+    );
+
+    Ok(())
+}
+
+/// The duration is validated here as well as at the far end, for
+/// [`session_mint`]'s reason: a typo is a refusal before anything crosses the
+/// socket, and the server's parser stays the authority.
+async fn session_api_key(args: SessionApiKeyArgs) -> Result<()> {
+    if let Some(expires) = args.expires.as_deref() {
+        spaceport_core::duration::parse(expires)?;
+    }
+
+    print!(
+        "{}",
+        client::auth_api_key_mint(
+            &args.server.server,
+            &args.user,
+            &args.grants,
+            args.expires.as_deref()
+        )
+        .await?
     );
 
     Ok(())

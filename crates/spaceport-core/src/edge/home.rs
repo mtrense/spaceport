@@ -1865,7 +1865,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains(r#"method="post""#), "{body}");
         // And the session is still there.
-        let (_, listed) = home
+        let (_, listed, _) = home
             .sessions
             .list(&crate::auth::UserRef::Slug("alice".parse().unwrap()))
             .await
@@ -1904,7 +1904,7 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(cleared.contains("Max-Age=0"), "{cleared}");
-        let (_, listed) = home
+        let (_, listed, _) = home
             .sessions
             .list(&crate::auth::UserRef::Slug("alice".parse().unwrap()))
             .await

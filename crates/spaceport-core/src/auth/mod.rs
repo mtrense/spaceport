@@ -18,6 +18,7 @@
 //! a user is the immediate-offboarding lever, and the repository's `offboard`
 //! cascade is where sessions and pending codes already die with the user.
 
+pub mod api_key;
 pub mod app_session;
 pub mod entitlement;
 pub mod jwt;
@@ -25,6 +26,7 @@ pub mod log;
 pub mod repository;
 pub mod session;
 
+pub use api_key::{ApiKeyId, ApiKeyRecord, DEFAULT_API_KEY_LIFETIME, MintedApiKey};
 pub use app_session::{AppSessionRecord, FreshAppSession};
 pub use entitlement::{
     EntitlementError, EntitlementRecord, EntitlementRepository, Granted, RevokeScope, Revoked,

@@ -312,9 +312,9 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
 /// lowercased however the wire spelled them.
 ///
 /// For `gating: edge`, the credentials go too. Every `Authorization` header is
-/// stripped — the JWT milestone makes that header spaceport's channel for its
-/// own `Bearer`, and the API-key milestone will read and validate keys *before*
-/// this line removes them, exactly as the spec orders those steps. And the
+/// stripped — that header is spaceport's channel for its own `Bearer` JWT, and
+/// the gate has already read and validated any API key out of it *before*
+/// this line removes it, exactly as the spec orders those steps. And the
 /// spaceport cookies come out of the `Cookie` header while the app's own ride
 /// on: the session tokens are credentials *to spaceport*, and an app that saw
 /// one could replay its users to every other app on the same edge. A cookie
@@ -1720,6 +1720,240 @@ mod tests {
         let (_, _, wiki) = get_headed(edge, "beta.test", "/", &[("cookie", &wiki_cookie)]).await;
         assert_eq!(jwt_payload(&echoed_jwt(&wiki))["aud"], "wiki");
         assert_eq!(jwt_payload(&echoed_jwt(&hers))["aud"], "blog");
+    }
+
+    /// A minted API key for `user` granting `grants`, beside the header value
+    /// a machine caller sends it as — planted straight through the
+    /// repositories, the way [`planted_cookie`] plants a cookie.
+    async fn planted_key(
+        db: &crate::state::Db,
+        user: &str,
+        grants: &str,
+    ) -> (String, crate::auth::UserId, crate::auth::MintedApiKey) {
+        let users = crate::auth::UserRepository::new(db.clone());
+        let sessions = crate::auth::SessionRepository::new(db.clone());
+        let created = users.create(&user.parse().unwrap(), None).await.unwrap();
+        let minted = sessions
+            .mint_api_key(
+                &user.parse().unwrap(),
+                &grants.parse().unwrap(),
+                crate::auth::DEFAULT_API_KEY_LIFETIME,
+            )
+            .await
+            .unwrap();
+
+        (
+            format!("Bearer {}", minted.key.expose()),
+            created.id,
+            minted,
+        )
+    }
+
+    /// The whole machine path, end to end: a bare `Authorization: Bearer
+    /// spk_…` — no cookie, no session, no exchange — reaches the app as the
+    /// same JWT shape a signed-in user's request carries, with `sub` the
+    /// owning user and `roles` exactly the key's single role, and the
+    /// original header never crosses the hop.
+    #[tokio::test]
+    async fn an_api_key_authenticates_a_gated_request_end_to_end() {
+        let db = crate::state::Db::in_memory().unwrap();
+        let (header_value, user, minted) = planted_key(&db, "ci-bot", "reader@blog").await;
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated_roles(
+            "blog",
+            "alpha.test",
+            credential_echo().await,
+            "[reader, writer]",
+        ))
+        .unwrap();
+        let edge = edge_over(apps, db).await;
+
+        let (status, _, body) =
+            get_headed(edge, "alpha.test", "/", &[("authorization", &header_value)]).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let payload = jwt_payload(&echoed_jwt(&body));
+        assert_eq!(payload["sub"], user.as_str());
+        assert_eq!(payload["aud"], "blog");
+        assert_eq!(payload["roles"], serde_json::json!(["reader"]));
+        // The key itself was read, spent on the check, and stripped: the app
+        // sees spaceport's voice and never the credential.
+        assert!(!body.contains(minted.key.expose()), "{body}");
+    }
+
+    /// A key is pinned to its app: presented anywhere else it is a machine
+    /// caller's `401` with directions in the one header machines read — and
+    /// never a redirect, whatever the request's shape.
+    #[tokio::test]
+    async fn a_key_for_another_app_is_refused_with_a_401() {
+        let db = crate::state::Db::in_memory().unwrap();
+        let (header_value, ..) = planted_key(&db, "ci-bot", "reader@wiki").await;
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated("blog", "alpha.test", upstream().await, ""))
+            .unwrap();
+        let edge = edge_over(apps, db).await;
+
+        let (status, headers, _) =
+            get_headed(edge, "alpha.test", "/", &[("authorization", &header_value)]).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(header(&headers, "www-authenticate"), "Bearer");
+    }
+
+    #[tokio::test]
+    async fn an_expired_key_is_refused_with_a_401() {
+        let db = crate::state::Db::in_memory().unwrap();
+        let (header_value, ..) = planted_key(&db, "ci-bot", "reader@blog").await;
+        db.call(|connection| {
+            connection
+                .execute(
+                    "UPDATE api_keys SET expires_at = '2000-01-01T00:00:00Z'",
+                    [],
+                )
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+        })
+        .await
+        .unwrap();
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated("blog", "alpha.test", upstream().await, ""))
+            .unwrap();
+        let edge = edge_over(apps, db).await;
+
+        let (status, _, _) =
+            get_headed(edge, "alpha.test", "/", &[("authorization", &header_value)]).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Revoking a key over the socket is a purge lever like dropping a
+    /// session: the moment the revoke commits, the key stops answering —
+    /// where a cache nobody purged would have served it four more minutes.
+    #[tokio::test]
+    async fn a_key_revoke_stops_cached_access_immediately() {
+        let db = crate::state::Db::in_memory().unwrap();
+        let (header_value, _, minted) = planted_key(&db, "ci-bot", "reader@blog").await;
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated("blog", "alpha.test", upstream().await, ""))
+            .unwrap();
+        let jwt_cache = Arc::new(crate::auth::JwtCache::new());
+        let edge = edge_with(apps, db.clone(), jwt_cache.clone()).await;
+        let extra = [("authorization", header_value.as_str())];
+
+        let (status, _, _) = get_headed(edge, "alpha.test", "/", &extra).await;
+        assert_eq!(status, StatusCode::OK);
+
+        crate::auth::SessionRepository::with_jwt_cache(db, jwt_cache)
+            .drop_sessions(
+                &"ci-bot".parse().unwrap(),
+                Some(&minted.id.as_str().parse().unwrap()),
+            )
+            .await
+            .unwrap();
+
+        let (status, _, _) = get_headed(edge, "alpha.test", "/", &extra).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Suspending the owner is the same lever pulled from the pool's side:
+    /// the offboard cascade takes the key rows and the purge takes the cache.
+    #[tokio::test]
+    async fn suspending_the_owner_stops_key_access_immediately() {
+        let db = crate::state::Db::in_memory().unwrap();
+        let (header_value, ..) = planted_key(&db, "ci-bot", "reader@blog").await;
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated("blog", "alpha.test", upstream().await, ""))
+            .unwrap();
+        let jwt_cache = Arc::new(crate::auth::JwtCache::new());
+        let edge = edge_with(apps, db.clone(), jwt_cache.clone()).await;
+        let extra = [("authorization", header_value.as_str())];
+
+        let (status, _, _) = get_headed(edge, "alpha.test", "/", &extra).await;
+        assert_eq!(status, StatusCode::OK);
+
+        crate::auth::UserRepository::with_jwt_cache(db, jwt_cache)
+            .suspend(&"ci-bot".parse().unwrap())
+            .await
+            .unwrap();
+
+        let (status, _, _) = get_headed(edge, "alpha.test", "/", &extra).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// CSRF is a property of cookie authentication, and a key is the
+    /// opposite: a POST wearing nothing but the key — no fetch metadata, no
+    /// Origin — crosses, because a header a caller sets by hand cannot be
+    /// forged by a cross-site form.
+    #[tokio::test]
+    async fn a_post_with_key_auth_passes_with_no_csrf_headers() {
+        let db = crate::state::Db::in_memory().unwrap();
+        let (header_value, ..) = planted_key(&db, "ci-bot", "reader@blog").await;
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated("blog", "alpha.test", upstream().await, ""))
+            .unwrap();
+        let edge = edge_over(apps, db).await;
+
+        let (status, _, body) = send(
+            edge,
+            "POST",
+            "alpha.test",
+            "/submit",
+            &[("authorization", &header_value)],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("path=/submit"), "{body}");
+    }
+
+    /// A bad key on a top-level navigation is still a machine calling: the
+    /// answer is the `401`, never the redirect exchange — a script that
+    /// followed one into a login page would be worse off than one that read
+    /// the status.
+    #[tokio::test]
+    async fn a_navigation_with_a_bad_key_gets_a_401_not_a_redirect() {
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated("blog", "alpha.test", upstream().await, ""))
+            .unwrap();
+        let edge = edge(apps).await;
+
+        let (status, headers, _) = get_headed(
+            edge,
+            "alpha.test",
+            "/",
+            &[
+                ("accept", "text/html"),
+                ("sec-fetch-mode", "navigate"),
+                ("authorization", "Bearer spk_not-a-key"),
+            ],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(header(&headers, "www-authenticate"), "Bearer");
+        assert!(!headers.contains_key("location"), "{headers:?}");
+    }
+
+    /// `gating: open` is the spec's promise, keys included: an `spk_` token
+    /// sent to an open app is that app's business, and spaceport neither
+    /// validates nor strips it.
+    #[tokio::test]
+    async fn an_open_app_receives_an_spk_bearer_untouched() {
+        let apps = Arc::new(AppStore::new());
+        apps.insert(app("hello", "alpha.test", credential_echo().await))
+            .unwrap();
+        let edge = edge(apps).await;
+
+        let (status, _, body) = get_headed(
+            edge,
+            "alpha.test",
+            "/",
+            &[("authorization", "Bearer spk_theirs")],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("authorization=[Bearer spk_theirs]"), "{body}");
     }
 
     /// `https://host/path?query` in two pieces, for following a redirect by
