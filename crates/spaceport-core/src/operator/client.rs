@@ -21,6 +21,7 @@ use tokio::net::{TcpStream, UnixStream};
 use super::{OperatorEndpoint, SecretSet};
 use crate::app::manifest::VarName;
 use crate::app::{AppId, Pattern};
+use crate::auth::{UserId, UserRef, UserSlug};
 use crate::events::{Category, Event, Level};
 use crate::secret::Secret;
 use crate::status::Status;
@@ -315,6 +316,74 @@ pub async fn forget_connection(endpoint: &OperatorEndpoint, slug: &str) -> Resul
     let request = builder("DELETE", &format!("/connections/{slug}")).body(Full::default())?;
 
     send_to(endpoint, request).await
+}
+
+/// Ask for the users it knows, optionally only those whose slug matches
+/// `pattern`.
+pub async fn auth_user_list(
+    endpoint: &OperatorEndpoint,
+    pattern: Option<&Pattern>,
+) -> Result<String> {
+    // A pattern over slugs is lowercase letters, digits, hyphens and `*`,
+    // which a query string carries as they are — the argument [`list`] makes.
+    let uri = match pattern {
+        Some(pattern) => format!("/auth/users?pattern={pattern}"),
+        None => "/auth/users".to_owned(),
+    };
+
+    send_to(endpoint, builder("GET", &uri).body(Full::default())?).await
+}
+
+/// Ask it to create a user under `slug`, minting the id it keeps for life.
+///
+/// The email goes in the body rather than the uri, because an address may
+/// carry a `+` that a query string would silently read as a space — and an
+/// absent address is an empty body. The slug is safe in the path: its alphabet
+/// is the app id's.
+pub async fn auth_user_create(
+    endpoint: &OperatorEndpoint,
+    slug: &UserSlug,
+    email: Option<&str>,
+) -> Result<String> {
+    let request = builder("PUT", &format!("/auth/users/{slug}"))
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Full::new(Bytes::from(email.unwrap_or("").to_owned())))?;
+
+    send_to(endpoint, request).await
+}
+
+/// Ask it to suspend the user `user` names — a slug or a user id, and the far
+/// end resolves which. Resolution lives there rather than here because the far
+/// end holds the pool the answer is about.
+pub async fn auth_user_suspend(endpoint: &OperatorEndpoint, user: &UserRef) -> Result<String> {
+    let request = builder("POST", &format!("/auth/users/{user}/suspend")).body(Full::default())?;
+
+    send_to(endpoint, request).await
+}
+
+/// Ask it to let the user `user` names back in.
+pub async fn auth_user_resume(endpoint: &OperatorEndpoint, user: &UserRef) -> Result<String> {
+    let request = builder("POST", &format!("/auth/users/{user}/resume")).body(Full::default())?;
+
+    send_to(endpoint, request).await
+}
+
+/// Ask it to drop the user `user` names, keeping only the auth log's memory.
+pub async fn auth_user_drop(endpoint: &OperatorEndpoint, user: &UserRef) -> Result<String> {
+    let request = builder("DELETE", &format!("/auth/users/{user}")).body(Full::default())?;
+
+    send_to(endpoint, request).await
+}
+
+/// Ask for the auth event log, optionally only what happened to one user.
+pub async fn auth_log(endpoint: &OperatorEndpoint, user: Option<&UserId>) -> Result<String> {
+    // A user id is hex and hyphens, which a query string carries as they are.
+    let uri = match user {
+        Some(user) => format!("/auth/log?user={user}"),
+        None => "/auth/log".to_owned(),
+    };
+
+    send_to(endpoint, builder("GET", &uri).body(Full::default())?).await
 }
 
 /// A GitHub App registration on its way to a spaceport.

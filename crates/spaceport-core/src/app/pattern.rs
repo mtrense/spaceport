@@ -37,6 +37,15 @@ impl Pattern {
         self.matches_str(name.as_str())
     }
 
+    /// Whether the user called `slug` matches.
+    ///
+    /// A third alphabet, spelled as a third method for the reason
+    /// [`Pattern::matches_name`] is a second one: a caller should have to say
+    /// what it is filtering.
+    pub fn matches_slug(&self, slug: &crate::auth::UserSlug) -> bool {
+        self.matches_str(slug.as_str())
+    }
+
     /// The glob itself, over whatever the callers above have unwrapped.
     fn matches_str(&self, candidate: &str) -> bool {
         let mut parts = self.parts.iter();

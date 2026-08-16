@@ -23,6 +23,7 @@ use time::OffsetDateTime;
 use crate::acme::{CertificateRepository, Certificates};
 use crate::app::reconcile::Report;
 use crate::app::{AppId, Applier, health};
+use crate::auth::{AuthLogRepository, UserRepository};
 use crate::build::repository::BuildRepository;
 use crate::config::{Config, TlsProvider};
 use crate::connections::github::{self, ConnectionRepository, TrackingRepository};
@@ -94,6 +95,14 @@ pub struct Instance {
     /// operator watching a commit they can see was built go nowhere. The shove
     /// is what makes it seconds, and it decides only *when* the loop looks.
     pub deploying: github::Nudge,
+    /// The global user pool. Held here for the reason `connections` is: every
+    /// handler that touches a user must be looking at the same rows, over the
+    /// same database, as every other.
+    pub users: Arc<UserRepository>,
+    /// The append-only auth event log, read-side. Beside `users` because it is
+    /// the other half of the same story — the pool says who exists, the log
+    /// says what happened to them — and the two answer over the same database.
+    pub auth_log: Arc<AuthLogRepository>,
     /// Absent when tls is self-signed: then nothing ever orders a certificate.
     pub certificates: Option<Arc<Certificates>>,
     /// What the reconciliation at startup did. Kept because it is the only
@@ -563,6 +572,8 @@ container:
             nudge: github::Nudge::new(),
             building: github::Nudge::new(),
             deploying: github::Nudge::new(),
+            users: Arc::new(UserRepository::new(db.clone())),
+            auth_log: Arc::new(AuthLogRepository::new(db.clone())),
             db,
             certificates: None,
             reconciled,

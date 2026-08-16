@@ -14,6 +14,7 @@ use spaceport_core::app::{
     self, AppId, AppRepository, AppStore, Applier, DataDir, Pattern, SecretRepository, VarName,
     reconcile, supervise,
 };
+use spaceport_core::auth::{AuthLogRepository, UserId, UserRef, UserRepository, UserSlug};
 use spaceport_core::build;
 use spaceport_core::build::dir::BuildDir;
 use spaceport_core::build::repository::BuildRepository;
@@ -75,6 +76,12 @@ enum Command {
     Apps {
         #[command(subcommand)]
         command: AppsCommand,
+    },
+    /// Manage who a running spaceport knows: the user pool, and the record of
+    /// what happened to it.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
     },
     /// Manage what a running spaceport is registered as, out on the internet.
     Connect {
@@ -226,6 +233,89 @@ struct SecretDeleteArgs {
 
     /// The name of the secret to remove.
     name: VarName,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthCommand {
+    /// Manage the global user pool.
+    ///
+    /// Users are the stable identities everything else will hang off:
+    /// sessions, API keys and entitlements are later milestones, but the ids
+    /// minted here are the ones they will name. Whoever can reach the operator
+    /// socket is the admin — there is no separate in-band admin role.
+    User(UserArgs),
+    /// Print the append-only auth event log.
+    ///
+    /// Every mutating auth command lands in it with a timestamp and where it
+    /// came from, and it outlives the users it is about: after a drop, the log
+    /// is the only record the user ever existed.
+    Log(AuthLogArgs),
+}
+
+#[derive(Debug, Args)]
+struct UserArgs {
+    #[command(subcommand)]
+    command: UserCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum UserCommand {
+    /// List the users spaceport knows.
+    List(UserListArgs),
+    /// Create a user, minting the id it keeps for life.
+    Create(UserCreateArgs),
+    /// Suspend a user, keeping the record but letting nothing in.
+    Suspend(UserRefArgs),
+    /// Let a suspended user back in.
+    Resume(UserRefArgs),
+    /// Drop a user entirely. The slug can be created again — and names a
+    /// different user then, because an id is never reused.
+    Drop(UserRefArgs),
+}
+
+#[derive(Debug, Args)]
+struct UserListArgs {
+    /// Only list users whose slug matches, where `*` stands for any
+    /// characters.
+    pattern: Option<Pattern>,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
+struct UserCreateArgs {
+    /// The name the user answers to: a lowercase letter, then lowercase
+    /// letters, digits and hyphens.
+    slug: UserSlug,
+
+    /// The user's email address. Optional, because a technical user has no
+    /// reason to have one; later it is where one-time codes go and what an
+    /// IdP login links through.
+    #[arg(long, value_name = "ADDR")]
+    email: Option<String>,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+/// The shape `suspend`, `resume` and `drop` share: one user, named either way.
+#[derive(Debug, Args)]
+struct UserRefArgs {
+    /// The user, as a slug or a user id.
+    user: UserRef,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
+struct AuthLogArgs {
+    /// Only the entries about this user id.
+    user: Option<UserId>,
 
     #[command(flatten)]
     server: ServerArgs,
@@ -625,6 +715,16 @@ async fn main() -> Result<()> {
                 SecretCommand::Delete(args) => secret_delete(args).await,
             },
         },
+        Command::Auth { command } => match command {
+            AuthCommand::User(args) => match args.command {
+                UserCommand::List(args) => user_list(args).await,
+                UserCommand::Create(args) => user_create(args).await,
+                UserCommand::Suspend(args) => user_suspend(args).await,
+                UserCommand::Resume(args) => user_resume(args).await,
+                UserCommand::Drop(args) => user_drop(args).await,
+            },
+            AuthCommand::Log(args) => auth_log(args).await,
+        },
         Command::Connect { command } => match command {
             ConnectCommand::Github(args) => connect_github(args).await,
             ConnectCommand::List(args) => connections(args).await,
@@ -911,6 +1011,8 @@ async fn run(args: RunArgs) -> Result<()> {
             // arming one, can make an image that already exists deployable
             // without anything being built to wake the loop on its own.
             deploying,
+            users: Arc::new(UserRepository::new(db.clone())),
+            auth_log: Arc::new(AuthLogRepository::new(db.clone())),
             db,
             certificates: certificates.clone(),
             reconciled: report,
@@ -1070,6 +1172,60 @@ async fn secret_delete(args: SecretDeleteArgs) -> Result<()> {
     print!(
         "{}",
         client::delete_secret(&args.server.server, &args.app_id, &args.name).await?
+    );
+
+    Ok(())
+}
+
+async fn user_list(args: UserListArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::auth_user_list(&args.server.server, args.pattern.as_ref()).await?
+    );
+
+    Ok(())
+}
+
+async fn user_create(args: UserCreateArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::auth_user_create(&args.server.server, &args.slug, args.email.as_deref()).await?
+    );
+
+    Ok(())
+}
+
+async fn user_suspend(args: UserRefArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::auth_user_suspend(&args.server.server, &args.user).await?
+    );
+
+    Ok(())
+}
+
+async fn user_resume(args: UserRefArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::auth_user_resume(&args.server.server, &args.user).await?
+    );
+
+    Ok(())
+}
+
+async fn user_drop(args: UserRefArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::auth_user_drop(&args.server.server, &args.user).await?
+    );
+
+    Ok(())
+}
+
+async fn auth_log(args: AuthLogArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::auth_log(&args.server.server, args.user.as_ref()).await?
     );
 
     Ok(())

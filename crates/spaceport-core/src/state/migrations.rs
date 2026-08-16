@@ -357,6 +357,59 @@ const MIGRATIONS: &[&str] = &[
         spaceport_app TEXT    NOT NULL PRIMARY KEY,
         latest        INTEGER NOT NULL
     ) STRICT;",
+    // 10 — who spaceport knows, and the append-only record of what happened to
+    // them.
+    //
+    // `users` is the global pool the auth spec builds everything else on:
+    // sessions, entitlements and API keys will all hang off `user_id`, which is
+    // a UUID minted at creation and never reused. The slug is the name an
+    // operator types, unique among *live* users only — dropping a user deletes
+    // its row, so the same slug can be created again, and the fresh row gets a
+    // fresh id. That is the whole design: identity is the UUID, the slug is a
+    // handle, and anything that remembered a dropped user by slug would be
+    // remembering the wrong one. `user_slug` and not `slug`, for the reason
+    // step 5 spells `spaceport_app` out: `github_apps.slug` already means a
+    // different id-space, and two columns called `slug` would be the join that
+    // runs, returns nothing, and looks correct.
+    //
+    // `suspended` is a column and not a state machine, exactly as
+    // `apps.suspended` is: a user is one record either way, and the flag says
+    // only whether spaceport should be letting them in right now. Dropping is
+    // different in kind — the row goes, and only the event log remembers.
+    //
+    // `email` is nullable because a technical user made through the CLI has no
+    // reason to have one, and "no address" is a different answer from "the
+    // empty string". When SSO lands it becomes the join point an IdP login
+    // links through, which is why it is stored here and not bolted on later.
+    //
+    // `auth_events` is append-only and deliberately skeletal: a timestamp, a
+    // `kind` that is extensible text rather than an enum column (the spec
+    // already names logins, mints and grants as future kinds, and a row whose
+    // kind this build has never heard of must still read back as a row), the
+    // user it is about when it is about one, where the command came from
+    // (`operator` for the CLI, an IdP's name later), and free-text detail.
+    // `user_id` has no foreign key on purpose — beyond the step-4 reasoning,
+    // the log *must* outlive the user: the events of a dropped user are the
+    // only record that the user ever existed.
+    //
+    // `auth_events_by_user` is the index `spaceport auth log <user-id>` reads:
+    // one user's history, in order.
+    "CREATE TABLE users (
+        user_id    TEXT NOT NULL PRIMARY KEY,
+        user_slug  TEXT NOT NULL UNIQUE,
+        email      TEXT,
+        suspended  INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE auth_events (
+        id      INTEGER PRIMARY KEY,
+        at      TEXT NOT NULL,
+        kind    TEXT NOT NULL,
+        user_id TEXT,
+        origin  TEXT NOT NULL,
+        detail  TEXT
+    ) STRICT;
+    CREATE INDEX auth_events_by_user ON auth_events (user_id, at);",
 ];
 
 /// The schema version this build writes.
@@ -674,6 +727,40 @@ mod tests {
                 )
                 .unwrap(),
             1
+        );
+    }
+
+    /// A fresh user is live: `suspended` defaults to 0, so the one column an
+    /// operator's command flips is the only one an insert has to mention.
+    #[test]
+    fn the_tenth_migration_creates_the_user_pool_and_the_auth_log() {
+        let connection = empty();
+        migrate(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO users (user_id, user_slug, created_at)
+                 VALUES ('3f29b1d4-8a6e-4c2b-9e77-1d5f6a2b9c40', 'alice', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            columns(&connection, "users"),
+            ["user_id", "user_slug", "email", "suspended", "created_at"]
+        );
+        assert_eq!(
+            columns(&connection, "auth_events"),
+            ["id", "at", "kind", "user_id", "origin", "detail"]
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT suspended, email FROM users WHERE user_slug = 'alice'",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+                )
+                .unwrap(),
+            (0, None)
         );
     }
 

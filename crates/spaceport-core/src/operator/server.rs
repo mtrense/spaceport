@@ -30,6 +30,7 @@ use crate::app::apply::{Applied, Applier, ApplyError, DestroyError, ResumeError,
 use crate::app::manifest::VarName;
 use crate::app::secrets::Set;
 use crate::app::{App, AppId, AppManifest, AppRecord, AppRepository, DataDir, Pattern, health};
+use crate::auth::{AuthLogRepository, UserError, UserId, UserRecord, UserRef, UserRepository};
 use crate::build::repository::{Build, BuildRepository, BuildState};
 use crate::connections::github::{
     Client, ConnectionRepository, Installation, Nudge, Registration, Tracking, TrackingRepository,
@@ -136,6 +137,11 @@ fn router(instance: Arc<Instance>, events: Arc<EventBus>, shutdown: Cancellation
             "/apps/{id}/secrets/{name}",
             put(set_secret).delete(delete_secret),
         )
+        .route("/auth/users", get(list_users))
+        .route("/auth/users/{user}", put(create_user).delete(drop_user))
+        .route("/auth/users/{user}/suspend", post(suspend_user))
+        .route("/auth/users/{user}/resume", post(resume_user))
+        .route("/auth/log", get(auth_log))
         .route("/connections", get(connections))
         .route("/connections/github", post(connect_github))
         .route("/connections/github/register", post(register_github))
@@ -193,6 +199,20 @@ impl FromRef<Operator> for Arc<TrackingRepository> {
 impl FromRef<Operator> for Arc<BuildRepository> {
     fn from_ref(operator: &Operator) -> Self {
         operator.instance.builds.clone()
+    }
+}
+
+/// The same, for the handlers that manage the user pool.
+impl FromRef<Operator> for Arc<UserRepository> {
+    fn from_ref(operator: &Operator) -> Self {
+        operator.instance.users.clone()
+    }
+}
+
+/// And for the one that reads the auth event log back.
+impl FromRef<Operator> for Arc<AuthLogRepository> {
+    fn from_ref(operator: &Operator) -> Self {
+        operator.instance.auth_log.clone()
     }
 }
 
@@ -3342,6 +3362,269 @@ fn unconnected(slug: &str) -> String {
     format!("`{slug}` is not connected — `spaceport connect list` says what is")
 }
 
+/// `GET /auth/users?pattern=…`: who spaceport knows, as a table.
+///
+/// The id is a column and not an aside: it is the stable identity everything
+/// later hangs off, and the listing is where an operator goes to copy one.
+async fn list_users(
+    State(users): State<Arc<UserRepository>>,
+    Query(query): Query<ListQuery>,
+) -> Response {
+    let pattern = match query
+        .pattern
+        .as_deref()
+        .map(str::parse::<Pattern>)
+        .transpose()
+    {
+        Ok(pattern) => pattern,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    let listed = match users.list(pattern.as_ref()).await {
+        Ok(listed) => listed,
+        Err(error) => {
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not read the users: {error:#}"),
+            );
+        }
+    };
+
+    if listed.is_empty() {
+        let body = match &pattern {
+            Some(pattern) => format!("no user matches `{pattern}`\n"),
+            None => {
+                "no users exist — create one with `spaceport auth user create <slug>`\n".to_owned()
+            }
+        };
+
+        return (StatusCode::OK, body).into_response();
+    }
+
+    let rows: Vec<Vec<String>> = listed
+        .iter()
+        .map(|user| {
+            vec![
+                user.slug.to_string(),
+                user.id.to_string(),
+                user_status(user).to_owned(),
+                user.email.clone().unwrap_or_default(),
+                user.created_at.clone(),
+            ]
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        columns(&["USER", "ID", "STATUS", "EMAIL", "CREATED"], &rows),
+    )
+        .into_response()
+}
+
+/// The one word a listing and a report say about a user's standing.
+fn user_status(user: &UserRecord) -> &'static str {
+    match user.suspended {
+        true => "suspended",
+        false => "active",
+    }
+}
+
+/// `PUT /auth/users/{slug}` with the email, if any, as the body: know this
+/// person, under this name.
+///
+/// The email travels in the body rather than the query string for the small
+/// version of the reason a secret's value does: `user+ci@example.com` is an
+/// ordinary address, and a query string reads its `+` as a space — silently,
+/// which is the worst way. A body carries it as it is, and an absent email is
+/// an empty body.
+///
+/// A `PUT` like applying an app, and unlike it in one way: applying twice is
+/// idempotent because the id *is* the document, while a user's identity is
+/// minted here — so a slug that already exists is a 409, not a replacement.
+/// Replacing would quietly hand the same name a new UUID, which is exactly the
+/// confusion the never-reused rule exists to prevent.
+async fn create_user(
+    State(users): State<Arc<UserRepository>>,
+    UrlPath(slug): UrlPath<String>,
+    body: String,
+) -> Response {
+    let slug: crate::auth::UserSlug = match slug.parse() {
+        Ok(slug) => slug,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    // The lightest check that catches a slug pasted where the address goes.
+    // Anything stricter would be this build deciding what an address is, and
+    // the address's real test — a code arriving — is a later milestone's.
+    let email = body.trim();
+    let email = match email {
+        "" => None,
+        address if address.contains('@') && !address.contains(char::is_whitespace) => Some(address),
+        address => {
+            return refuse(
+                StatusCode::BAD_REQUEST,
+                &format!("`{address}` does not read as an email address"),
+            );
+        }
+    };
+
+    match users.create(&slug, email).await {
+        Ok(created) => {
+            let mut body = format!("user `{slug}` created\n  id     {}\n", created.id);
+            if let Some(email) = &created.email {
+                body.push_str(&format!("  email  {email}\n"));
+            }
+
+            (StatusCode::OK, body).into_response()
+        }
+        Err(error) => refuse_user(error),
+    }
+}
+
+/// `POST /auth/users/{ref}/suspend`: keep the record, close the door.
+async fn suspend_user(
+    State(users): State<Arc<UserRepository>>,
+    UrlPath(user): UrlPath<String>,
+) -> Response {
+    let user: UserRef = match user.parse() {
+        Ok(user) => user,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    match users.suspend(&user).await {
+        Ok(suspended) => {
+            let body = format!(
+                "user `{}` suspended\n  the record and its id {} are kept\n  `spaceport auth user resume {}` lets them back in\n",
+                suspended.slug, suspended.id, suspended.slug,
+            );
+
+            (StatusCode::OK, body).into_response()
+        }
+        Err(error) => refuse_user(error),
+    }
+}
+
+/// `POST /auth/users/{ref}/resume`: open the door again.
+async fn resume_user(
+    State(users): State<Arc<UserRepository>>,
+    UrlPath(user): UrlPath<String>,
+) -> Response {
+    let user: UserRef = match user.parse() {
+        Ok(user) => user,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    match users.resume(&user).await {
+        Ok(resumed) => {
+            let body = format!("user `{}` resumed\n", resumed.slug);
+
+            (StatusCode::OK, body).into_response()
+        }
+        Err(error) => refuse_user(error),
+    }
+}
+
+/// `DELETE /auth/users/{ref}`: forget the user, keeping only the log.
+async fn drop_user(
+    State(users): State<Arc<UserRepository>>,
+    UrlPath(user): UrlPath<String>,
+) -> Response {
+    let user: UserRef = match user.parse() {
+        Ok(user) => user,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    match users.drop_user(&user).await {
+        Ok(dropped) => {
+            let body = format!(
+                "user `{}` dropped\n  its id {} is never reused — `{}` created again is a different user\n  the auth log keeps its history\n",
+                dropped.slug, dropped.id, dropped.slug,
+            );
+
+            (StatusCode::OK, body).into_response()
+        }
+        Err(error) => refuse_user(error),
+    }
+}
+
+/// One mapping from what went wrong to whose problem it is, for every verb on
+/// the user pool: a mistyped name is a 404, a slug already held is a 409, and
+/// a store that would not answer is a 500.
+fn refuse_user(error: UserError) -> Response {
+    let status = match &error {
+        UserError::Unknown(_) => StatusCode::NOT_FOUND,
+        UserError::SlugTaken(_) => StatusCode::CONFLICT,
+        UserError::Failed(_) => {
+            warn!(%error, "a user command failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+
+    refuse(status, &error.to_string())
+}
+
+/// `GET /auth/log?user=…`: the append-only record, oldest first.
+///
+/// A table like the listings rather than lines of prose: the log is read to
+/// answer "what happened to this user, when", and aligned columns are how a
+/// timestamp and a kind scan. An entry about no user leaves the column empty.
+async fn auth_log(
+    State(log): State<Arc<AuthLogRepository>>,
+    Query(query): Query<AuthLogQuery>,
+) -> Response {
+    let user = match query.user.as_deref().map(str::parse::<UserId>).transpose() {
+        Ok(user) => user,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    let entries = match log.entries(user.as_ref()).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not read the auth log: {error:#}"),
+            );
+        }
+    };
+
+    if entries.is_empty() {
+        let body = match &user {
+            Some(user) => format!("nothing is recorded about `{user}`\n"),
+            None => {
+                "nothing has happened yet — every auth command that changes something lands here\n"
+                    .to_owned()
+            }
+        };
+
+        return (StatusCode::OK, body).into_response();
+    }
+
+    let rows: Vec<Vec<String>> = entries
+        .iter()
+        .map(|entry| {
+            vec![
+                entry.at.clone(),
+                entry.kind.clone(),
+                entry.user.clone().unwrap_or_default(),
+                entry.origin.clone(),
+                entry.detail.clone().unwrap_or_default(),
+            ]
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        columns(&["AT", "KIND", "USER", "ORIGIN", "DETAIL"], &rows),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthLogQuery {
+    /// Only the entries about this user id.
+    user: Option<String>,
+}
+
 fn refuse(status: StatusCode, message: &str) -> Response {
     (status, format!("{message}\n")).into_response()
 }
@@ -3594,6 +3877,8 @@ container:
             nudge: Nudge::new(),
             building: building.clone(),
             deploying: deploying.clone(),
+            users: Arc::new(UserRepository::new(db.clone())),
+            auth_log: Arc::new(AuthLogRepository::new(db.clone())),
             db: db.clone(),
             certificates: None,
             reconciled: crate::app::reconcile::Report::default(),
@@ -6918,5 +7203,226 @@ container:
         assert!(body.contains("DB_PASSWORD (set)"), "{body}");
         assert!(body.contains("API_KEY (not set"), "{body}");
         assert!(!body.contains("hunter2"), "{body}");
+    }
+
+    async fn create_user_named(router: &Router, slug: &str, email: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/auth/users/{slug}"))
+            .body(Body::from(email.to_owned()))
+            .unwrap();
+
+        call(router, request).await
+    }
+
+    async fn user_command(router: &Router, method: &str, uri: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+
+        call(router, request).await
+    }
+
+    /// The id in a `created` response, which is the only place a test can
+    /// learn the UUID the server minted.
+    fn id_in(body: &str) -> String {
+        let id = body
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("id"))
+            .expect("the response names the id")
+            .trim()
+            .to_owned();
+        id.parse::<crate::auth::UserId>().expect("the id is a uuid");
+
+        id
+    }
+
+    #[tokio::test]
+    async fn creates_a_user_and_lists_them_over_http() {
+        let (_, router) = store_and_router();
+
+        let (status, created) = create_user_named(&router, "alice", "alice@example.com").await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert!(created.contains("user `alice` created"), "{created}");
+        assert!(created.contains("alice@example.com"), "{created}");
+
+        let (status, listed) = user_command(&router, "GET", "/auth/users").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(listed.contains("USER"), "{listed}");
+        assert!(listed.contains("alice"), "{listed}");
+        assert!(listed.contains("active"), "{listed}");
+        assert!(listed.contains(&id_in(&created)), "{listed}");
+    }
+
+    /// An empty pool answers with what to do about it, not with a bare header
+    /// over nothing.
+    #[tokio::test]
+    async fn an_empty_user_pool_says_how_to_fill_it() {
+        let (_, router) = store_and_router();
+
+        let (status, body) = user_command(&router, "GET", "/auth/users").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("no users exist"), "{body}");
+        assert!(body.contains("spaceport auth user create"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn lists_only_the_users_a_pattern_asks_for() {
+        let (_, router) = store_and_router();
+        for slug in ["alice", "bob", "ci-bot"] {
+            create_user_named(&router, slug, "").await;
+        }
+
+        let (status, body) = user_command(&router, "GET", "/auth/users?pattern=ci-*").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("ci-bot"), "{body}");
+        assert!(!body.contains("alice"), "{body}");
+
+        let (status, body) = user_command(&router, "GET", "/auth/users?pattern=ghost-*").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("no user matches `ghost-*`"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn refuses_a_second_user_under_the_same_slug() {
+        let (_, router) = store_and_router();
+        create_user_named(&router, "alice", "").await;
+
+        let (status, body) = create_user_named(&router, "alice", "").await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.contains("already answers to `alice`"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn refuses_a_slug_that_is_not_one() {
+        let (_, router) = store_and_router();
+
+        let (status, body) = create_user_named(&router, "2Fast", "").await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("lowercase"), "{body}");
+    }
+
+    /// `user+ci@example.com` is an ordinary address; a slug pasted where the
+    /// address goes is the mistake worth catching.
+    #[tokio::test]
+    async fn refuses_a_body_that_is_not_an_email_address() {
+        let (_, router) = store_and_router();
+
+        let (status, body) = create_user_named(&router, "alice", "not-an-address").await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("does not read as an email address"), "{body}");
+
+        let (status, _) = create_user_named(&router, "alice", "user+ci@example.com").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// The two halves of `<slug|user-id>`, driven over HTTP: the slug and the
+    /// UUID land on the same user, and suspension shows in the listing.
+    #[tokio::test]
+    async fn suspends_by_slug_and_resumes_by_id() {
+        let (_, router) = store_and_router();
+        let (_, created) = create_user_named(&router, "alice", "").await;
+        let id = id_in(&created);
+
+        let (status, body) = user_command(&router, "POST", "/auth/users/alice/suspend").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("user `alice` suspended"), "{body}");
+        let (_, listed) = user_command(&router, "GET", "/auth/users").await;
+        assert!(listed.contains("suspended"), "{listed}");
+
+        let (status, body) =
+            user_command(&router, "POST", &format!("/auth/users/{id}/resume")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("user `alice` resumed"), "{body}");
+        let (_, listed) = user_command(&router, "GET", "/auth/users").await;
+        assert!(listed.contains("active"), "{listed}");
+    }
+
+    #[tokio::test]
+    async fn a_command_aimed_at_no_user_is_not_found() {
+        let (_, router) = store_and_router();
+
+        for (method, uri) in [
+            ("POST", "/auth/users/ghost/suspend"),
+            ("POST", "/auth/users/ghost/resume"),
+            ("DELETE", "/auth/users/ghost"),
+        ] {
+            let (status, body) = user_command(&router, method, uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}: {body}");
+            assert!(body.contains("no user answers to `ghost`"), "{body}");
+        }
+    }
+
+    /// The never-reused rule, end to end: dropping frees the slug, and the
+    /// user created under it again is somebody else.
+    #[tokio::test]
+    async fn a_dropped_slug_recreated_over_http_yields_a_fresh_id() {
+        let (_, router) = store_and_router();
+        let (_, first) = create_user_named(&router, "alice", "").await;
+
+        let (status, dropped) = user_command(&router, "DELETE", "/auth/users/alice").await;
+        assert_eq!(status, StatusCode::OK, "{dropped}");
+        assert!(dropped.contains("never reused"), "{dropped}");
+
+        let (status, second) = create_user_named(&router, "alice", "").await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_ne!(id_in(&first), id_in(&second));
+    }
+
+    /// The route the spec calls the auth event log: every mutation lands in
+    /// it, and `?user=` narrows it to one user's story.
+    #[tokio::test]
+    async fn the_auth_log_records_every_mutation_and_filters_by_user() {
+        let (_, router) = store_and_router();
+        let (_, alice) = create_user_named(&router, "alice", "").await;
+        let alice = id_in(&alice);
+        create_user_named(&router, "bob", "").await;
+        user_command(&router, "POST", "/auth/users/alice/suspend").await;
+        user_command(&router, "POST", "/auth/users/alice/resume").await;
+        user_command(&router, "DELETE", "/auth/users/alice").await;
+
+        let (status, everything) = user_command(&router, "GET", "/auth/log").await;
+        assert_eq!(status, StatusCode::OK);
+        for kind in [
+            "user.created",
+            "user.suspended",
+            "user.resumed",
+            "user.dropped",
+        ] {
+            assert!(everything.contains(kind), "{everything}");
+        }
+        assert!(everything.contains("operator"), "{everything}");
+
+        let (status, hers) = user_command(&router, "GET", &format!("/auth/log?user={alice}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(hers.contains("user.dropped"), "{hers}");
+        assert!(hers.contains("slug `alice`"), "{hers}");
+        assert!(!hers.contains("slug `bob`"), "{hers}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_auth_log_says_what_it_is_for() {
+        let (_, router) = store_and_router();
+
+        let (status, body) = user_command(&router, "GET", "/auth/log").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("nothing has happened yet"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn refuses_an_auth_log_filter_that_is_not_a_user_id() {
+        let (_, router) = store_and_router();
+
+        let (status, body) = user_command(&router, "GET", "/auth/log?user=alice").await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("not a user id"), "{body}");
     }
 }

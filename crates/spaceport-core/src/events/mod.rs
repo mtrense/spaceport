@@ -138,6 +138,10 @@ pub struct Category(String);
 /// category: it means spaceport grew a module and nobody said where it belongs.
 const CATEGORIES: &[(&str, &str)] = &[
     ("spaceport_core::app::apply", "app.apply"),
+    // The user pool and its event log. One category for the whole module: to
+    // the operator watching, creating a user and recording that it happened
+    // are one story, and the day logins land they belong under the same word.
+    ("spaceport_core::auth", "auth"),
     // Under `app` beside the apply it performs, rather than under `build`: what
     // an automatic deployment does to a host is start and stop containers and
     // move routes, which is the apply story and not the story of turning a
@@ -410,6 +414,21 @@ mod tests {
         );
         assert!(Category::new("app.deploy").within(&Category::new("app")));
         assert!(!Category::new("app.deploy").within(&Category::new("app.apply")));
+    }
+
+    /// What happens to the user pool is its own kind of thing: an operator
+    /// offboarding somebody wants `--category auth` to be the whole story,
+    /// with nothing about containers or certificates in the way.
+    #[test]
+    fn categorises_what_the_user_pool_does() {
+        assert_eq!(
+            Category::for_target("spaceport_core::auth::repository").as_str(),
+            "auth"
+        );
+        assert_eq!(
+            Category::for_target("spaceport_core::auth").as_str(),
+            "auth"
+        );
     }
 
     /// The specific entries have to win over the module they sit in, or every
