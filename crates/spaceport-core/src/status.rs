@@ -483,7 +483,7 @@ pub struct Reconcile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{AppRepository, AppStore};
+    use crate::app::{AppRepository, AppStore, SecretRepository};
     use crate::runtime::{Container, ContainerId, ContainerRuntime, Managed};
     use anyhow::Result;
     use async_trait::async_trait;
@@ -576,6 +576,7 @@ container:
             Arc::new(Absent),
             AppRepository::new(db.clone()),
             BuildRepository::new(db.clone()),
+            SecretRepository::new(db.clone()),
         ));
 
         (db, applier)

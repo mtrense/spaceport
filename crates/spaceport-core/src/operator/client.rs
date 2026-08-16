@@ -18,9 +18,11 @@ use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
 
-use super::OperatorEndpoint;
+use super::{OperatorEndpoint, SecretSet};
+use crate::app::manifest::VarName;
 use crate::app::{AppId, Pattern};
 use crate::events::{Category, Event, Level};
+use crate::secret::Secret;
 use crate::status::Status;
 
 /// Ask a running spaceport to apply `manifest` as the app named `id`.
@@ -166,6 +168,66 @@ pub async fn show(endpoint: &OperatorEndpoint, id: &AppId, manifest: bool) -> Re
     send_to(endpoint, builder("GET", &uri).body(Full::default())?).await
 }
 
+/// Ask for the names of the secrets set for the app named `id`, optionally only
+/// those matching `pattern`.
+///
+/// Names, one per line, and never a value: the route behind this cannot answer
+/// with one.
+pub async fn secrets(
+    endpoint: &OperatorEndpoint,
+    id: &AppId,
+    pattern: Option<&Pattern>,
+) -> Result<String> {
+    // A pattern over secret names is letters, digits, underscores and `*`,
+    // which a query string carries as they are — the argument [`list`] makes.
+    let uri = match pattern {
+        Some(pattern) => format!("/apps/{id}/secrets?pattern={pattern}"),
+        None => format!("/apps/{id}/secrets"),
+    };
+
+    send_to(endpoint, builder("GET", &uri).body(Full::default())?).await
+}
+
+/// Ask it to set the secret `name` of the app named `id` to `value`.
+///
+/// The value goes in the body and emphatically not in the uri, which is the
+/// one thing about this call worth knowing: a query parameter would be written
+/// to every access log between here and the spaceport, and would rule out
+/// every value holding a character a url reserves. The name is safe there —
+/// the C rules for an environment variable admit nothing a url would swallow.
+///
+/// What comes back says what the spaceport did about it, because storing a
+/// value can leave an app untouched, resume it, or replace its container, and
+/// only this side knows how to say that to a person.
+pub async fn set_secret(
+    endpoint: &OperatorEndpoint,
+    id: &AppId,
+    name: &VarName,
+    value: &Secret,
+) -> Result<SecretSet> {
+    let request = builder("PUT", &format!("/apps/{id}/secrets/{name}"))
+        // Text rather than octets, because that is the promise being made: a
+        // value that is not utf-8 is one the far end refuses.
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Full::new(Bytes::from(value.expose().to_owned())))?;
+
+    let body = send_to(endpoint, request).await?;
+
+    serde_json::from_str(&body)
+        .context("the operator interface sent something that is not what setting a secret did")
+}
+
+/// Ask it to forget the secret `name` of the app named `id`.
+pub async fn delete_secret(
+    endpoint: &OperatorEndpoint,
+    id: &AppId,
+    name: &VarName,
+) -> Result<String> {
+    let request = builder("DELETE", &format!("/apps/{id}/secrets/{name}")).body(Full::default())?;
+
+    send_to(endpoint, request).await
+}
+
 /// Ask what this spaceport is and how it is doing.
 ///
 /// The one call that comes back as data rather than as prose: what a status
@@ -259,7 +321,7 @@ pub async fn forget_connection(endpoint: &OperatorEndpoint, slug: &str) -> Resul
 ///
 /// A type of this side's own rather than
 /// [`crate::connections::github::Registration`], because that one deliberately
-/// cannot be serialised: its secrets are [`crate::connections::Secret`]s, and
+/// cannot be serialised: its secrets are [`crate::secret::Secret`]s, and
 /// the whole point of that type is that nothing writes one out by accident.
 /// Writing one out is exactly what this does, so it says so.
 #[derive(Debug, Clone, Serialize)]

@@ -7,6 +7,14 @@
 //! going to be reachable, having already torn down the one it replaced on the
 //! way in.
 //!
+//! There is a fourth thing that can fail, and it fails differently: the secrets
+//! a manifest declares have to be set before there is anything to start. An
+//! apply that finds one missing does not refuse outright — it stages the app
+//! suspended, claiming its hosts and recording what it would run, and *then*
+//! says which secrets it is waiting for. That is the only failure here that
+//! leaves the app in a state somebody can finish, because finishing it is
+//! setting a value and resuming, and the resume is what resolves them again.
+//!
 //! Suspending is the fourth verb, and the only one that leaves an app halfway:
 //! recorded, claiming its hosts, not served. Everything it does happens in the
 //! same order a destroy does — the routes go first, so nothing is forwarded to
@@ -22,8 +30,9 @@ use std::time::Instant;
 use anyhow::anyhow;
 use tracing::{debug, info, warn};
 
-use super::manifest::Source;
+use super::manifest::{Source, VarName};
 use super::repository::AppRepository;
+use super::secrets::SecretRepository;
 use super::store::{Removed, Suspended};
 use super::{App, AppId, AppManifest, AppStore, health};
 use crate::build::repository::BuildRepository;
@@ -36,6 +45,15 @@ use crate::runtime::{Adopted, Container, ContainerRuntime};
 pub enum ApplyError {
     /// Another app already serves one of the manifest's hosts.
     Conflict(anyhow::Error),
+    /// The manifest declares secrets nothing has set, so the app was staged
+    /// suspended rather than started.
+    ///
+    /// A variant of its own because it is neither of the other two: the host is
+    /// fine and the document is fine, and what is missing is a value somebody
+    /// has to go and set. It is an error all the same — the operator asked for
+    /// a running app and has not got one — and it carries the names, because
+    /// "which secret" is the only thing they need to know.
+    MissingSecrets(Vec<VarName>),
     /// The app could not be started.
     Failed(anyhow::Error),
 }
@@ -44,8 +62,30 @@ impl fmt::Display for ApplyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Conflict(error) | Self::Failed(error) => write!(f, "{error:#}"),
+            // Two cases and one sentence, because both are true of the app the
+            // operator is holding: one that was never started is suspended
+            // waiting, and one that *was* running has been taken down by
+            // `stage` — its container was built from the manifest this one
+            // replaces. Saying only "it stays suspended" would let somebody
+            // who re-applied a manifest with a new secret in it believe their
+            // app is still serving, which is the one thing it is not.
+            Self::MissingSecrets(secrets) => write!(
+                f,
+                "this app needs secrets nothing has set: {} — it is suspended until they are set, and it is not serving: an app that was running has been taken down for this",
+                named(secrets)
+            ),
         }
     }
+}
+
+/// Secret names as a sentence lists them: quoted, in the order they were
+/// declared, and nothing else about them.
+fn named<'a>(secrets: impl IntoIterator<Item = &'a VarName>) -> String {
+    secrets
+        .into_iter()
+        .map(|secret| format!("`{secret}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl std::error::Error for ApplyError {}
@@ -96,6 +136,11 @@ pub enum ResumeError {
     /// Another app claimed one of its hosts. Only reachable for an app that was
     /// suspended by a spaceport that did not hold its hosts for it.
     Conflict(anyhow::Error),
+    /// Secrets its manifest declares are still not set. The way back for an app
+    /// suspended for a missing secret is a resume, so this is the answer
+    /// somebody who tries it too early gets — and the app is left exactly where
+    /// it was rather than started with a placeholder in its environment.
+    MissingSecrets(Vec<VarName>),
     /// It could not be started.
     Failed(anyhow::Error),
 }
@@ -106,6 +151,15 @@ impl fmt::Display for ResumeError {
             Self::Unknown(error) | Self::Conflict(error) | Self::Failed(error) => {
                 write!(f, "{error:#}")
             }
+            // A resume never takes anything down — a running app is answered
+            // before this is reachable — so what is true here is only the
+            // second half of what an apply says: still suspended, still not
+            // serving.
+            Self::MissingSecrets(secrets) => write!(
+                f,
+                "this app needs secrets nothing has set: {} — it stays suspended, and not serving, until they are set",
+                named(secrets)
+            ),
         }
     }
 }
@@ -116,6 +170,10 @@ impl From<ApplyError> for ResumeError {
     fn from(error: ApplyError) -> Self {
         match error {
             ApplyError::Conflict(error) => Self::Conflict(error),
+            // Kept as itself rather than flattened into `Failed`: this is the
+            // one refusal a resume has that an operator can do something about,
+            // and it is worth its own answer all the way out to HTTP.
+            ApplyError::MissingSecrets(secrets) => Self::MissingSecrets(secrets),
             ApplyError::Failed(error) => Self::Failed(error),
         }
     }
@@ -202,6 +260,11 @@ pub struct Applier {
     /// run as. Read on the way in to every verb that starts an app, and never
     /// written to from here — building is somebody else's business.
     builds: BuildRepository,
+    /// The values an app's manifest names and never contains. Read on the way
+    /// in to every verb that starts an app, for the same reason `builds` is: a
+    /// manifest that reaches the runtime has to be one the runtime can run, and
+    /// one whose environment still says `{{DB_PASSWORD}}` is not.
+    secrets: SecretRepository,
     /// The apps something is in the middle of doing something to.
     ///
     /// Every verb here takes containers down and puts them up, and the engine
@@ -222,12 +285,14 @@ impl Applier {
         runtime: Arc<dyn ContainerRuntime>,
         repository: AppRepository,
         builds: BuildRepository,
+        secrets: SecretRepository,
     ) -> Self {
         Self {
             store,
             runtime,
             repository,
             builds,
+            secrets,
             settling: Mutex::default(),
         }
     }
@@ -238,7 +303,13 @@ impl Applier {
     /// same app still race each other exactly as they did before — the store is
     /// what settles that — and all this says is that whatever the engine
     /// reports about this app in the meantime was asked for.
-    fn settling(&self, id: &AppId) -> Settling<'_> {
+    ///
+    /// Public for one caller outside this type: the operator interface's
+    /// `set`, which writes a secret of an app it did not start. That is not a
+    /// verb here, but it runs alongside the ones that are — a `set` overlapping
+    /// a `destroy` is the app being seen to as much as either half is — so it
+    /// takes the same mark rather than reaching for a second mechanism.
+    pub fn settling(&self, id: &AppId) -> Settling<'_> {
         *self.settle_marks().entry(id.clone()).or_insert(0) += 1;
 
         Settling {
@@ -272,6 +343,15 @@ impl Applier {
     /// What this applier has been told to run, across restarts.
     pub fn repository(&self) -> &AppRepository {
         &self.repository
+    }
+
+    /// The secrets of the apps it runs.
+    ///
+    /// Exposed for the same reason the record is: setting and listing secrets
+    /// is the operator interface's business, and the applier is what holds the
+    /// one repository every start already reads.
+    pub fn secrets(&self) -> &SecretRepository {
+        &self.secrets
     }
 
     /// The engine it runs apps on.
@@ -314,7 +394,17 @@ impl Applier {
             },
         };
 
-        match self.start(id.clone(), manifest.clone()).await {
+        // Resolved again rather than taken off the manifest the store is
+        // holding: a restart is a container being built afresh, and it must be
+        // built from the secrets as they are now — including one an operator
+        // set in the minute since the app broke, which is a fair description of
+        // why it broke.
+        let started = match self.runnable(id, manifest).await {
+            Ok(manifest) => self.start(id.clone(), manifest).await,
+            Err(error) => Err(error),
+        };
+
+        match started {
             Ok(app) => {
                 info!(app = %id, container = %app.container, upstream = %app.upstream, "app restarted");
 
@@ -349,6 +439,20 @@ impl Applier {
         // — rather than a record for an app that is not coming back.
         if let Err(error) = self.repository.forget(id).await {
             warn!(app = %id, %error, "could not forget the app, it will come back on restart");
+        }
+
+        // Secrets go with the app, unlike its volumes: a volume is the data an
+        // operator may still want after the app is gone, and a secret is a
+        // value that only ever meant anything to the app that read it. Leaving
+        // them would mean an app applied under the same id tomorrow silently
+        // inheriting the credentials of the one destroyed today.
+        //
+        // Warned about rather than fatal, exactly as forgetting the record is:
+        // the app is already unrouted and about to have no container, and
+        // failing here would report a destroy that did not happen when what did
+        // not happen is a `DELETE` against the state store.
+        if let Err(error) = self.secrets.forget(id).await {
+            warn!(app = %id, %error, "could not forget the app's secrets, they will outlive it");
         }
 
         // A suspended app that was applied and never started has no container,
@@ -443,7 +547,13 @@ impl Applier {
         let suspended = self.store.suspended(id).ok_or_else(|| {
             ResumeError::Unknown(anyhow!("no app named `{id}` is running or suspended"))
         })?;
-        let manifest = suspended.manifest;
+        // Resolved here and not taken as the manifest was staged, because this
+        // is how an app suspended for a missing secret comes back: the secret
+        // was set between the apply that refused and this call, and the whole
+        // point of resuming is to pick it up. One that is still missing refuses
+        // rather than starting a container with a placeholder in its
+        // environment, and leaves the app suspended exactly as it was.
+        let manifest = self.runnable(id, suspended.manifest).await?;
 
         // Asked of the engine rather than taken from the store: what spaceport
         // last saw is not what is true after somebody has used `docker` by
@@ -548,26 +658,22 @@ impl Applier {
     ) -> Result<Applied, ApplyError> {
         let _settling = self.settling(&id);
 
-        // Refused here rather than while parsing, so that a manifest written
-        // against a spaceport that has secrets still reads on one that does
-        // not — and so that what is refused is running the app, not describing
-        // it. An app started with `{{DB_PASSWORD}}` in its connection string
-        // would come up and fail at whatever it does first, which is a far
-        // worse way to find this out.
-        if let Some(secret) = manifest.container.secrets.first() {
-            return Err(ApplyError::Failed(anyhow!(
-                "app `{id}` needs the secret `{secret}`, and secrets are not supported yet"
-            )));
-        }
-
         // The document, taken before anything is resolved: what is recorded is
         // what the operator or the repository wrote, and resolving a build
         // deliberately leaves that text alone.
         let recorded = manifest.source_text().to_owned();
         let manifest = self.resolved(&id, manifest, revision).await?;
+        let (manifest, missing) = self.with_secrets(&id, manifest).await?;
 
         let held = self.store.suspended(&id);
-        let suspend = suspend || held.is_some();
+        // A secret nothing has set is the third way to be suspended, alongside
+        // being asked for it and already being it. Suspended and not failed,
+        // because everything a suspend is for applies: the hosts are this app's
+        // and stay claimed and certified, the manifest is what a resume will
+        // run, and the one thing missing is a value somebody can go and set.
+        // Starting it instead would put `{{DB_PASSWORD}}` in a connection
+        // string, and the app would report that as a database problem.
+        let suspend = suspend || held.is_some() || !missing.is_empty();
 
         let applied = if suspend {
             self.stage(id, manifest, held).await?
@@ -579,12 +685,24 @@ impl Applier {
         // something to bring back at the next start. The cost is a window —
         // from here to the commit — in which a successful apply can be lost to
         // a crash, and the answer to that is to apply it again.
+        //
+        // A staged app whose secrets are missing counts as a success for this
+        // purpose, and is recorded suspended: it is in the store, it is holding
+        // its hosts, and a restart that brought it back running would start the
+        // container this refused to start.
         if let Err(error) = self
             .repository
             .record_applied(applied.id(), &recorded, revision, suspend)
             .await
         {
             warn!(app = %applied.id(), %error, "the app was not recorded, so it will not survive a restart");
+        }
+
+        // Everything is in place and the answer is still no. The operator asked
+        // for a running app and has a suspended one, and nothing else in this
+        // function is in a position to say which secrets it is waiting for.
+        if !missing.is_empty() {
+            return Err(ApplyError::MissingSecrets(missing));
         }
 
         Ok(applied)
@@ -657,10 +775,23 @@ impl Applier {
     ) -> Result<Restored, ApplyError> {
         let _settling = self.settling(&id);
         let manifest = self.resolved(&id, manifest, revision).await?;
+        let (manifest, missing) = self.with_secrets(&id, manifest).await?;
         self.free_of_conflict(&id, &manifest)?;
 
+        // Before the missing ones are refused, and deliberately: an app that
+        // was suspended because a secret was never set is recorded suspended,
+        // and a restart has to put it back the way it was left rather than
+        // refuse to bring it back at all. Nothing is started here, so nothing
+        // can be started with a placeholder in it.
         if suspended {
             return self.restore_suspended(id, manifest).await;
+        }
+
+        // A running app whose secret has been deleted since. It stays down,
+        // claiming its hosts and saying what it is waiting for, which is what
+        // the reconciler does with every other app it cannot start.
+        if !missing.is_empty() {
+            return Err(ApplyError::MissingSecrets(missing));
         }
 
         match self.runtime.adopt(&id, &manifest).await {
@@ -788,8 +919,80 @@ impl Applier {
         manifest.built_as(&image).map_err(ApplyError::Failed)
     }
 
+    /// The manifest with the app's stored secrets to hand, and the names of the
+    /// ones it declares that nothing has set.
+    ///
+    /// Every verb that can reach the runtime goes through here, because every
+    /// one of them renders a container spec: `launch` builds the environment
+    /// from it, and `adopt` and `start` fingerprint it — a manifest that
+    /// arrived without its secrets would not match the container it belongs to,
+    /// and the app would be given a new one for no reason.
+    ///
+    /// Missing secrets are reported rather than refused, because the two
+    /// callers want different things: an apply stages the app suspended and
+    /// says so, and everything that starts one refuses. Both need the names.
+    ///
+    /// Every stored secret is attached and not only the declared ones — that is
+    /// what [`AppManifest::with_secrets`] takes — and what the manifest does not
+    /// declare is said out loud once here. A stored value nothing reads is a
+    /// typo or the leftovers of an env line somebody deleted, and neither is
+    /// worth failing an apply for.
+    async fn with_secrets(
+        &self,
+        id: &AppId,
+        manifest: AppManifest,
+    ) -> Result<(AppManifest, Vec<VarName>), ApplyError> {
+        let stored = self.secrets.resolve(id).await.map_err(|error| {
+            ApplyError::Failed(error.context(format!("resolving the secrets of app `{id}`")))
+        })?;
+        let manifest = manifest.with_secrets(stored);
+
+        let unused = manifest.container.unused_secrets();
+        if !unused.is_empty() {
+            warn!(
+                app = %id,
+                secrets = %named(unused),
+                "these secrets are set for this app and its manifest declares none of them, so nothing will read them",
+            );
+        }
+
+        let missing = manifest
+            .container
+            .missing_secrets()
+            .into_iter()
+            .cloned()
+            .collect();
+
+        Ok((manifest, missing))
+    }
+
+    /// The same, for the verbs that are about to start something: a manifest
+    /// that can actually be run, or the names of the secrets stopping it.
+    async fn runnable(&self, id: &AppId, manifest: AppManifest) -> Result<AppManifest, ApplyError> {
+        let (manifest, missing) = self.with_secrets(id, manifest).await?;
+        if !missing.is_empty() {
+            return Err(ApplyError::MissingSecrets(missing));
+        }
+
+        Ok(manifest)
+    }
+
     /// Everything an apply does except remember it.
+    ///
+    /// The manifest must already carry its secrets — every caller has been
+    /// through [`Applier::with_secrets`] — and the check below is the last line
+    /// of defence for a path that forgets, in the shape of the runtime's own
+    /// refusal of `Source::Build`: it costs one comparison and it is the
+    /// difference between an app that will not start and an app that starts
+    /// with `{{DB_PASSWORD}}` in its environment.
     async fn start(&self, id: AppId, manifest: AppManifest) -> Result<Arc<App>, ApplyError> {
+        let missing = manifest.container.missing_secrets();
+        if !missing.is_empty() {
+            return Err(ApplyError::MissingSecrets(
+                missing.into_iter().cloned().collect(),
+            ));
+        }
+
         self.free_of_conflict(&id, &manifest)?;
 
         let container = self
@@ -891,10 +1094,11 @@ mod tests {
     use crate::app::store::Downed;
     use crate::build::repository::{Build, BuildState};
     use crate::runtime::{Container, ContainerId, Managed};
+    use crate::secret::Secret;
     use crate::state::Db;
     use anyhow::{Result, bail};
     use async_trait::async_trait;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::net::SocketAddr;
     use std::sync::Mutex;
 
@@ -907,6 +1111,10 @@ mod tests {
         /// manifest resolved to — and, for a manifest that builds, that it was
         /// resolved at all before it got this far.
         images: Mutex<Vec<String>>,
+        /// The environment each launch was asked to run with, rendered as the
+        /// engine would see it — which is the one place a secret's value is
+        /// supposed to appear at all.
+        environments: Mutex<Vec<BTreeMap<VarName, String>>>,
         removed: Mutex<Vec<ContainerId>>,
         /// Containers this runtime has been asked to stop and keep, and the
         /// ones it has been asked to start again.
@@ -981,6 +1189,14 @@ mod tests {
                 bail!("app `{app}` builds its own image, which spaceport cannot do yet");
             };
             self.images.lock().unwrap().push(image.clone());
+            // Refused exactly where the real runtime refuses it: a manifest
+            // whose placeholders nothing has filled in cannot be rendered into
+            // an environment, and a fake that shrugged at one would be a fake
+            // accepting what production cannot.
+            self.environments
+                .lock()
+                .unwrap()
+                .push(manifest.container.environment()?);
 
             let mut launched = self.launched.lock().unwrap();
             launched.push(app.clone());
@@ -1068,10 +1284,16 @@ container:
     ) -> (Applier, Arc<AppStore>, BuildRepository) {
         let store = Arc::new(AppStore::new());
         let repository = AppRepository::new(db.clone());
-        let builds = BuildRepository::new(db);
+        let builds = BuildRepository::new(db.clone());
 
         (
-            Applier::new(store.clone(), runtime, repository, builds.clone()),
+            Applier::new(
+                store.clone(),
+                runtime,
+                repository,
+                builds.clone(),
+                SecretRepository::new(db),
+            ),
             store,
             builds,
         )
@@ -1097,43 +1319,6 @@ container:
         assert_eq!(store.routes().serving("alpha.test").unwrap().id, app.id);
         assert_eq!(store.routes().serving("beta.test").unwrap().id, app.id);
         assert_eq!(runtime.launched.lock().unwrap().len(), 1);
-    }
-
-    /// A manifest may say it needs a secret — that is how an operator writes
-    /// down what the app will want — but nothing can supply one yet, and an
-    /// app started with `{{DB_PASSWORD}}` in its connection string would come
-    /// up and fail at whatever it does first.
-    #[tokio::test]
-    async fn refuses_to_run_an_app_that_needs_a_secret() {
-        let runtime = Arc::new(FakeRuntime::default());
-        let (applier, store) = applier(runtime.clone());
-
-        let manifest = AppManifest::parse(
-            "schema_version: 1
-source:
-  type: image
-  image: strm/helloworld-http:latest
-routing:
-  hosts: [alpha.test]
-container:
-  secrets: [DB_PASSWORD]
-  env:
-    DATABASE_URL: \"postgres://user:{{DB_PASSWORD}}@db/app\"
-",
-        )
-        .unwrap();
-
-        let error = applier
-            .apply("hello".parse().unwrap(), manifest, false)
-            .await
-            .unwrap_err();
-
-        assert!(error.to_string().contains("DB_PASSWORD"), "{error}");
-        assert!(error.to_string().contains("not supported yet"), "{error}");
-        // And it stopped before doing anything: no container, no route, and
-        // nothing recorded to bring back at the next start.
-        assert!(runtime.launched.lock().unwrap().is_empty());
-        assert!(store.routes().serving("alpha.test").is_none());
     }
 
     #[tokio::test]
@@ -1313,7 +1498,8 @@ container:
             store.clone(),
             runtime,
             AppRepository::new(db.clone()),
-            BuildRepository::new(db),
+            BuildRepository::new(db.clone()),
+            SecretRepository::new(db),
         );
 
         let error = applier
@@ -1981,7 +2167,8 @@ container:
             store.clone(),
             runtime,
             AppRepository::new(db.clone()),
-            BuildRepository::new(db),
+            BuildRepository::new(db.clone()),
+            SecretRepository::new(db),
         );
 
         let error = applier
@@ -2343,6 +2530,304 @@ container:
         assert_eq!(
             *runtime.images.lock().unwrap(),
             ["strm/helloworld-http:latest".to_owned()]
+        );
+    }
+
+    // The values a manifest names and never contains.
+
+    /// A manifest that reads a secret out of its environment, which is the only
+    /// way a container ever sees one.
+    fn manifest_needing_a_secret(hosts: &str) -> AppManifest {
+        AppManifest::parse(&format!(
+            "schema_version: 1
+source:
+  type: image
+  image: strm/helloworld-http:latest
+routing:
+  hosts: [{hosts}]
+container:
+  secrets: [DB_PASSWORD]
+  env:
+    DATABASE_URL: \"postgres://user:{{{{DB_PASSWORD}}}}@db/app\"
+  health:
+    readiness:
+      type: none
+"
+        ))
+        .unwrap()
+    }
+
+    fn secret(name: &str) -> VarName {
+        name.parse().unwrap()
+    }
+
+    /// What the app being started was given as `DATABASE_URL`, on the launch
+    /// numbered `launch`.
+    fn database_url(runtime: &FakeRuntime, launch: usize) -> String {
+        runtime.environments.lock().unwrap()[launch]["DATABASE_URL"].clone()
+    }
+
+    /// The connection string the manifest above describes once `DB_PASSWORD` is
+    /// `hunter2`. Spelled out, because a test that built it from the same
+    /// pieces the code does would pass however the interpolation went wrong.
+    const INTERPOLATED: &str = "postgres://user:hunter2@db/app";
+
+    /// The refusal an operator gets for a secret nobody set, and what it leaves
+    /// behind: an app that exists, holds its hosts and is not running, rather
+    /// than a container coming up with `{{DB_PASSWORD}}` in its connection
+    /// string and reporting it as a database problem an hour later.
+    #[tokio::test]
+    async fn applying_a_manifest_whose_secret_is_not_set_suspends_the_app() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+        let id: AppId = "hello".parse().unwrap();
+
+        let error = applier
+            .apply(id.clone(), manifest_needing_a_secret("alpha.test"), false)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ApplyError::MissingSecrets(_)), "{error:?}");
+        assert!(error.to_string().contains("DB_PASSWORD"), "{error}");
+        // Nothing was started, and the app is suspended rather than absent: its
+        // hosts are claimed, so nothing else can take them and they can be
+        // certified while somebody goes and finds the password.
+        assert!(runtime.launched.lock().unwrap().is_empty());
+        assert!(store.apps().is_empty());
+        assert!(store.suspended(&id).is_some());
+        assert!(store.routes().lookup("alpha.test").is_some());
+        assert!(store.routes().serving("alpha.test").is_none());
+        // And it is recorded as suspended, so a restart agrees with the store
+        // rather than trying to start the app this refused to start.
+        let desired = applier.repository().desired().await.unwrap();
+        assert_eq!(desired.len(), 1);
+        assert!(desired[0].suspended);
+
+        // Applying it again says the same thing and leaves the same app: an
+        // apply is a `PUT`, whatever it happens to be waiting for.
+        let again = applier
+            .apply(id.clone(), manifest_needing_a_secret("alpha.test"), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(again, ApplyError::MissingSecrets(_)), "{again:?}");
+        assert!(store.suspended(&id).is_some());
+        assert!(runtime.launched.lock().unwrap().is_empty());
+    }
+
+    /// The way back: the resume re-resolves, so the app that was staged waiting
+    /// for a password comes up with the password in it, and nothing had to be
+    /// applied a second time.
+    #[tokio::test]
+    async fn once_the_secret_is_set_resuming_starts_the_app_with_its_value() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+        let id: AppId = "hello".parse().unwrap();
+        applier
+            .apply(id.clone(), manifest_needing_a_secret("alpha.test"), false)
+            .await
+            .unwrap_err();
+
+        applier
+            .secrets()
+            .set(&id, &secret("DB_PASSWORD"), &Secret::new("hunter2"))
+            .await
+            .unwrap();
+        let app = applier.resume(&id).await.unwrap();
+
+        assert_eq!(runtime.launched.lock().unwrap().len(), 1);
+        assert_eq!(database_url(&runtime, 0), INTERPOLATED);
+        assert_eq!(store.routes().serving("alpha.test").unwrap().id, app.id);
+        assert!(!applier.repository().desired().await.unwrap()[0].suspended);
+    }
+
+    /// Resuming is the one command that would start the container, so it is the
+    /// one that has to refuse: an operator who resumes before they have set the
+    /// secret is told which one, and finds their app exactly where they left it.
+    #[tokio::test]
+    async fn resuming_while_a_secret_is_still_missing_leaves_the_app_suspended() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+        let id: AppId = "hello".parse().unwrap();
+        applier
+            .apply(id.clone(), manifest_needing_a_secret("alpha.test"), false)
+            .await
+            .unwrap_err();
+
+        let error = applier.resume(&id).await.unwrap_err();
+
+        assert!(matches!(error, ResumeError::MissingSecrets(_)), "{error:?}");
+        assert!(error.to_string().contains("DB_PASSWORD"), "{error}");
+        assert!(runtime.launched.lock().unwrap().is_empty());
+        assert!(store.suspended(&id).is_some());
+        assert!(store.routes().serving("alpha.test").is_none());
+        // Still recorded as suspended, so nothing brings it back running later.
+        assert!(applier.repository().desired().await.unwrap()[0].suspended);
+    }
+
+    /// The ordinary case, and the only one in which a value reaches a
+    /// container: every declared secret is set, so the app starts like any
+    /// other and its environment holds the value rather than the placeholder.
+    #[tokio::test]
+    async fn an_app_whose_secrets_are_all_set_starts_with_them_interpolated() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+        let id: AppId = "hello".parse().unwrap();
+        applier
+            .secrets()
+            .set(&id, &secret("DB_PASSWORD"), &Secret::new("hunter2"))
+            .await
+            .unwrap();
+
+        let app = started(
+            applier
+                .apply(id.clone(), manifest_needing_a_secret("alpha.test"), false)
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(database_url(&runtime, 0), INTERPOLATED);
+        assert_eq!(store.routes().serving("alpha.test").unwrap().id, app.id);
+        assert!(!applier.repository().desired().await.unwrap()[0].suspended);
+    }
+
+    /// A stored secret the manifest stopped reading is dead weight or a typo,
+    /// and neither is a reason to refuse to run somebody's app.
+    #[tokio::test]
+    async fn a_stored_secret_the_manifest_does_not_declare_does_not_stop_it() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, store) = applier(runtime.clone());
+        let id: AppId = "hello".parse().unwrap();
+        applier
+            .secrets()
+            .set(&id, &secret("DB_PASSWORD"), &Secret::new("hunter2"))
+            .await
+            .unwrap();
+        applier
+            .secrets()
+            .set(&id, &secret("LEFTOVER"), &Secret::new("from last year"))
+            .await
+            .unwrap();
+
+        applier
+            .apply(id.clone(), manifest_needing_a_secret("alpha.test"), false)
+            .await
+            .unwrap();
+
+        assert!(store.routes().serving("alpha.test").is_some());
+        // The value nothing declares reached no container: the environment is
+        // what the manifest wrote, and the manifest never mentions it.
+        let environment = runtime.environments.lock().unwrap()[0].clone();
+        assert_eq!(environment[&secret("DATABASE_URL")], INTERPOLATED);
+        assert!(!environment.contains_key(&secret("LEFTOVER")));
+    }
+
+    /// A restart resolves secrets again, exactly as it resolves revisions
+    /// again: an app comes back with the values as they are now, not with the
+    /// placeholders its recorded document still carries.
+    #[tokio::test]
+    async fn a_restart_brings_back_an_app_with_its_secrets_resolved() {
+        let db = Db::in_memory().unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _, _) = applier_over(runtime, db.clone());
+        let id: AppId = "hello".parse().unwrap();
+        applier
+            .secrets()
+            .set(&id, &secret("DB_PASSWORD"), &Secret::new("hunter2"))
+            .await
+            .unwrap();
+        applier
+            .apply(id.clone(), manifest_needing_a_secret("alpha.test"), false)
+            .await
+            .unwrap();
+
+        // A new spaceport over the same records, with a runtime that has
+        // nothing left in it, so the app has to be started from what was
+        // written down — which is a document with `{{DB_PASSWORD}}` in it.
+        let restarted = Arc::new(FakeRuntime::default());
+        let (applier, store, _) = applier_over(restarted.clone(), db);
+        let record = applier.repository().desired().await.unwrap().remove(0);
+        applier
+            .restore(
+                record.id.clone(),
+                AppManifest::parse(&record.manifest).unwrap(),
+                record.revision.as_deref(),
+                record.suspended,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(database_url(&restarted, 0), INTERPOLATED);
+        assert!(store.routes().serving("alpha.test").is_some());
+    }
+
+    /// A restart of an app that was left waiting for a secret has to put it
+    /// back as it was — suspended and claiming its hosts — rather than refuse
+    /// it and leave the hosts to whoever asks next.
+    #[tokio::test]
+    async fn a_restart_brings_back_an_app_that_is_still_waiting_for_a_secret() {
+        let db = Db::in_memory().unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _, _) = applier_over(runtime, db.clone());
+        let id: AppId = "hello".parse().unwrap();
+        applier
+            .apply(id.clone(), manifest_needing_a_secret("alpha.test"), false)
+            .await
+            .unwrap_err();
+
+        let restarted = Arc::new(FakeRuntime::default());
+        let (applier, store, _) = applier_over(restarted.clone(), db);
+        let record = applier.repository().desired().await.unwrap().remove(0);
+        let restored = applier
+            .restore(
+                record.id.clone(),
+                AppManifest::parse(&record.manifest).unwrap(),
+                record.revision.as_deref(),
+                record.suspended,
+            )
+            .await
+            .unwrap();
+
+        assert!(restored.was_suspended(), "{restored:?}");
+        assert!(restarted.launched.lock().unwrap().is_empty());
+        assert!(store.routes().lookup("alpha.test").is_some());
+        // And setting the secret now is all it takes, on this spaceport as much
+        // as on the one that refused.
+        applier
+            .secrets()
+            .set(&id, &secret("DB_PASSWORD"), &Secret::new("hunter2"))
+            .await
+            .unwrap();
+        applier.resume(&id).await.unwrap();
+        assert_eq!(database_url(&restarted, 0), INTERPOLATED);
+    }
+
+    /// Secrets go with the app they belonged to, and with no other: unlike a
+    /// volume, a secret means nothing once the app that read it is gone, and an
+    /// app applied under the same id tomorrow must not inherit it.
+    #[tokio::test]
+    async fn destroying_an_app_forgets_its_secrets_and_only_its_own() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _) = applier(runtime);
+        let id: AppId = "hello".parse().unwrap();
+        let other: AppId = "other".parse().unwrap();
+        for app in [&id, &other] {
+            applier
+                .secrets()
+                .set(app, &secret("DB_PASSWORD"), &Secret::new("hunter2"))
+                .await
+                .unwrap();
+        }
+        applier
+            .apply(id.clone(), manifest_needing_a_secret("alpha.test"), false)
+            .await
+            .unwrap();
+
+        applier.destroy(&id).await.unwrap();
+
+        assert!(applier.secrets().names(&id, None).await.unwrap().is_empty());
+        assert_eq!(
+            applier.secrets().names(&other, None).await.unwrap(),
+            [secret("DB_PASSWORD")]
         );
     }
 }

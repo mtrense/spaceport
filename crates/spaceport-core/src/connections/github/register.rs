@@ -39,7 +39,7 @@ use super::api::{Client, Transport};
 use super::key;
 use super::reconcile::Nudge;
 use super::repository::{Connection, ConnectionRepository};
-use crate::connections::Secret;
+use crate::secret::Secret;
 
 /// Everything GitHub tells an operator when they create an App by hand.
 ///

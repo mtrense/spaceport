@@ -121,6 +121,54 @@ impl AppRepository {
             .await
     }
 
+    /// Write `record` back exactly as it was read, `applied_at` and all.
+    ///
+    /// For the one caller that has to undo a record rather than write one: an
+    /// automatic deployment that failed *after* the applier had recorded what
+    /// it was staging, which then rolls the app back to what it was running.
+    /// [`AppRepository::record_applied`] would be wrong there twice over — it
+    /// would say the app was applied at the moment of the rollback, and it is
+    /// this record's own values that are going back, not new intent.
+    ///
+    /// Idempotent, and a no-op in every other sense: a rollback that had
+    /// nothing to undo writes the same row it read.
+    pub async fn put_back(&self, record: &AppRecord) -> Result<()> {
+        let id = record.id.to_string();
+        let schema_version = stored(record.schema_version);
+        let manifest = record.manifest.clone();
+        let applied_at = record.applied_at.clone();
+        let suspended = record.suspended;
+        let revision = record.revision.clone();
+
+        self.db
+            .call(move |connection| {
+                connection
+                    .execute(
+                        "INSERT INTO apps
+                             (id, schema_version, manifest, applied_at, suspended, revision)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                         ON CONFLICT(id) DO UPDATE SET
+                             schema_version = excluded.schema_version,
+                             manifest       = excluded.manifest,
+                             applied_at     = excluded.applied_at,
+                             suspended      = excluded.suspended,
+                             revision       = excluded.revision",
+                        rusqlite::params![
+                            id,
+                            schema_version,
+                            manifest,
+                            applied_at,
+                            suspended,
+                            revision
+                        ],
+                    )
+                    .context("putting an app's record back")?;
+
+                Ok(())
+            })
+            .await
+    }
+
     /// Remember that the app named `id` is, or is no longer, suspended.
     ///
     /// Only the flag: the manifest and `applied_at` are left as they were,
@@ -465,6 +513,30 @@ routing:
 
         assert!(repository.set_suspended(&id("hello"), false).await.unwrap());
         assert!(!repository.desired().await.unwrap()[0].suspended);
+    }
+
+    /// What a rollback is for: the record of a deployment that failed halfway
+    /// through recording itself goes back to the app that is running again,
+    /// down to the day it was applied.
+    #[tokio::test]
+    async fn puts_a_record_back_the_way_it_was() {
+        let repository = repository();
+        repository
+            .record_applied(&id("hello"), MANIFEST, Some("abc1234"), false)
+            .await
+            .unwrap();
+        let before = repository.recorded(&id("hello")).await.unwrap().unwrap();
+        repository
+            .record_applied(&id("hello"), "schema_version: 1\n", Some("def5678"), true)
+            .await
+            .unwrap();
+
+        repository.put_back(&before).await.unwrap();
+
+        assert_eq!(
+            repository.recorded(&id("hello")).await.unwrap().unwrap(),
+            before
+        );
     }
 
     /// Suspending is not applying: the manifest and the day the operator

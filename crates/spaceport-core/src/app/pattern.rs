@@ -1,4 +1,4 @@
-//! Picking apps out of the list by name.
+//! Picking apps, and the things that belong to them, out of a list by name.
 
 use std::fmt;
 use std::str::FromStr;
@@ -6,12 +6,14 @@ use std::str::FromStr;
 use anyhow::{Result, bail};
 
 use super::AppId;
+use super::manifest::VarName;
 
-/// A glob over app ids, as `spaceport apps list` takes one.
+/// A glob over names, as `spaceport apps list` takes one.
 ///
 /// `*` matches any run of characters, including none; every other character
-/// matches itself. Deliberately not a regex: ids are lowercase letters, digits
-/// and hyphens, and `web-*` is the whole of what anyone wants to ask for.
+/// matches itself. Deliberately not a regex: the names it filters are lowercase
+/// letters, digits and hyphens, or the C rules for an environment variable, and
+/// `web-*` is the whole of what anyone wants to ask for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pattern {
     raw: String,
@@ -23,16 +25,30 @@ pub struct Pattern {
 impl Pattern {
     /// Whether `id` matches.
     pub fn matches(&self, id: &AppId) -> bool {
+        self.matches_str(id.as_str())
+    }
+
+    /// Whether the secret or environment variable called `name` matches.
+    ///
+    /// The same glob, spelled as a second method rather than as a generic one:
+    /// an id and a variable name are different alphabets, and a caller should
+    /// have to say which of them it is filtering.
+    pub fn matches_name(&self, name: &VarName) -> bool {
+        self.matches_str(name.as_str())
+    }
+
+    /// The glob itself, over whatever the callers above have unwrapped.
+    fn matches_str(&self, candidate: &str) -> bool {
         let mut parts = self.parts.iter();
         let first = parts.next().expect("a pattern has at least one part");
 
         // The leading and trailing pieces are anchored — only the ones in
         // between are free to slide.
-        let Some(mut rest) = id.as_str().strip_prefix(first.as_str()) else {
+        let Some(mut rest) = candidate.strip_prefix(first.as_str()) else {
             return false;
         };
         let Some(last) = parts.next_back() else {
-            // No `*` at all, so the one piece had to be the whole id.
+            // No `*` at all, so the one piece had to be the whole name.
             return rest.is_empty();
         };
 
@@ -126,6 +142,16 @@ mod tests {
     fn anchored_pieces_do_not_share_characters() {
         assert!(!matches("a*a", "a"));
         assert!(matches("a*a", "aa"));
+    }
+
+    /// The same glob, over the other alphabet: secret names are uppercase and
+    /// hold underscores, and nothing in the matching may assume otherwise.
+    #[test]
+    fn matches_a_variable_name_by_the_same_rules() {
+        let pattern = "DATABASE_*".parse::<Pattern>().unwrap();
+
+        assert!(pattern.matches_name(&"DATABASE_URL".parse().unwrap()));
+        assert!(!pattern.matches_name(&"REDIS_URL".parse().unwrap()));
     }
 
     #[test]

@@ -752,11 +752,11 @@ mod tests {
     use tar::{Builder as TarBuilder, EntryType, Header};
 
     use super::super::image::BuiltImage;
-    use crate::connections::Secret;
     use crate::connections::github::api::testing::FakeGitHub;
     use crate::connections::github::key;
     use crate::connections::github::repository::{Connection, Installation};
     use crate::connections::github::tracking::Tracking;
+    use crate::secret::Secret;
     use crate::state::Db;
 
     const APP_ID: i64 = 42;

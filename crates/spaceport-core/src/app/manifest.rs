@@ -14,6 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, de};
 
+use super::secrets::StoredSecret;
 use crate::config::SchemaVersion;
 use crate::duration;
 
@@ -176,9 +177,9 @@ pub struct Container {
     #[serde(default)]
     pub volumes: Vec<Volume>,
 
-    /// Secrets the app's `env` may interpolate. Parses and validates, but
-    /// nothing supplies a value yet, so applying a manifest that declares one
-    /// is refused — see `apply`.
+    /// Secrets the app's `env` may interpolate. What is declared here has to be
+    /// set for the app before it can run: an apply whose secrets are not all
+    /// set stages the app suspended and says which are missing — see `apply`.
     ///
     /// Declared as a list of bare names rather than name-and-value: the whole
     /// point is that the value is not in the document.
@@ -192,6 +193,21 @@ pub struct Container {
     /// reads of the same document would make an unchanged app look changed.
     #[serde(default)]
     pub env: BTreeMap<VarName, String>,
+
+    /// The values behind [`Container::secrets`], once something has looked them
+    /// up. Empty on a manifest that was only parsed — see
+    /// [`AppManifest::with_secrets`], which is the only thing that fills it in.
+    ///
+    /// `#[serde(skip)]` because this is not a field of the schema and must
+    /// never become one: a manifest is a document an operator commits, and the
+    /// whole point of a secret is that it is not in it. Skipping it on the way
+    /// in means a document that tried to set it is refused by
+    /// `deny_unknown_fields`; there is no way out because [`Secret`] has no
+    /// `Serialize`.
+    ///
+    /// [`Secret`]: crate::secret::Secret
+    #[serde(skip)]
+    pub resolved: BTreeMap<VarName, StoredSecret>,
 }
 
 /// A directory the app keeps.
@@ -319,13 +335,29 @@ impl Borrow<str> for VarName {
     }
 }
 
-/// The secrets an env value interpolates, in the order they appear.
+/// One piece of an environment value, as written.
+#[derive(Debug, PartialEq, Eq)]
+enum Piece<'a> {
+    /// Text that means itself.
+    Text(&'a str),
+    /// The name between a `{{` and the `}}` that closes it, trimmed.
+    Reference(&'a str),
+}
+
+/// Split an environment value into the text it contains and the secrets it
+/// interpolates, in the order they appear.
 ///
 /// `{{` always opens a reference and there is no way to escape it. A literal
 /// `{{` in an environment value is rare enough to wait for someone to want
 /// one; inventing an escape now would be guessing at a syntax nobody has had
 /// to write yet, and the guess would be permanent.
-fn placeholders(value: &str) -> Result<Vec<&str>> {
+///
+/// One scanner and not two: validation asks which secrets a value names and
+/// rendering asks what to put where they were, and a second parser for the
+/// second question could disagree with the first about what `{{ A }}` means —
+/// which would be a value validated against one secret and rendered from
+/// another.
+fn pieces(value: &str) -> Result<Vec<Piece<'_>>> {
     let mut found = Vec::new();
     let mut rest = value;
 
@@ -334,14 +366,92 @@ fn placeholders(value: &str) -> Result<Vec<&str>> {
         let Some(close) = after.find("}}") else {
             bail!("`{value}` opens a `{{{{` that is never closed");
         };
-        found.push(after[..close].trim());
+        found.push(Piece::Text(&rest[..open]));
+        found.push(Piece::Reference(after[..close].trim()));
         rest = &after[close + 2..];
     }
+    found.push(Piece::Text(rest));
 
     Ok(found)
 }
 
+/// The secrets an env value interpolates, in the order they appear.
+fn placeholders(value: &str) -> Result<Vec<&str>> {
+    Ok(pieces(value)?
+        .into_iter()
+        .filter_map(|piece| match piece {
+            Piece::Reference(name) => Some(name),
+            Piece::Text(_) => None,
+        })
+        .collect())
+}
+
 impl Container {
+    /// The secrets this container declares that nothing has resolved.
+    ///
+    /// The question an apply asks before it starts anything: a container whose
+    /// `DATABASE_URL` still says `{{DB_PASSWORD}}` would come up and fail
+    /// against a database, which is a far worse way to be told a secret was
+    /// never set. Reported and not acted on here — deciding what to do about a
+    /// missing secret belongs to whoever is applying.
+    pub fn missing_secrets(&self) -> Vec<&VarName> {
+        self.secrets
+            .iter()
+            .filter(|secret| !self.resolved.contains_key(*secret))
+            .collect()
+    }
+
+    /// The resolved secrets this container's manifest does not declare.
+    ///
+    /// Not an error and not this type's business to make one: an operator sets
+    /// a secret before the manifest that reads it, or removes the last
+    /// reference to one and leaves the value behind, and both are ordinary. It
+    /// is worth being able to say so, which is what this is for.
+    pub fn unused_secrets(&self) -> Vec<&VarName> {
+        let declared: HashSet<&VarName> = self.secrets.iter().collect();
+
+        self.resolved
+            .keys()
+            .filter(|name| !declared.contains(*name))
+            .collect()
+    }
+
+    /// The environment to run this container with: every value as the manifest
+    /// wrote it, with each `{{NAME}}` replaced by the secret it names.
+    ///
+    /// The one place a secret's plaintext is put into an env value, and it is
+    /// on the way to the engine only. Nothing stores what comes back, and
+    /// nothing hashes it.
+    ///
+    /// An unresolved placeholder is refused rather than passed through. It
+    /// cannot be an operator's mistake by the time this runs — the manifest
+    /// only parses if every reference is declared, and an apply refuses a
+    /// manifest whose declared secrets are not all set — so it is spaceport
+    /// having failed to resolve, and the two ways to be wrong here are to hand
+    /// the app a literal `{{DB_PASSWORD}}` in a connection string, which it
+    /// will report as a database problem, or to say so. This says so.
+    pub fn environment(&self) -> Result<BTreeMap<VarName, String>> {
+        let mut environment = BTreeMap::new();
+
+        for (name, value) in &self.env {
+            let mut rendered = String::with_capacity(value.len());
+            for piece in pieces(value)? {
+                match piece {
+                    Piece::Text(text) => rendered.push_str(text),
+                    Piece::Reference(reference) => {
+                        let secret = self.resolved.get(reference).with_context(|| {
+                            format!("`{name}` interpolates `{reference}`, which is not resolved")
+                        })?;
+                        rendered.push_str(secret.value.expose());
+                    }
+                }
+            }
+            environment.insert(name.clone(), rendered);
+        }
+
+        Ok(environment)
+    }
+
     /// What serde cannot express about a container: the rules that span more
     /// than one field.
     fn validate(&self) -> Result<()> {
@@ -730,6 +840,35 @@ impl AppManifest {
         manifest.validate().context("resolving a built image")?;
 
         Ok(manifest)
+    }
+
+    /// This manifest with the values behind its secrets to hand.
+    ///
+    /// In the shape of [`AppManifest::built_as`], and for the same reason: what
+    /// this spaceport can run right now is a copy on the way to the runtime,
+    /// and the document is left as the operator wrote it.
+    ///
+    /// The values sit beside `env` rather than being substituted into it,
+    /// because `env` is what the fingerprint is computed from and the
+    /// fingerprint is written onto the container as a label anybody who can
+    /// talk to the daemon can read. Keeping the `{{NAME}}` placeholders in the
+    /// text means that text contains no secret and never will; the value is
+    /// only ever put in its place by [`Container::environment`], on its way to
+    /// the engine.
+    ///
+    /// Everything is taken, not only what `container.secrets` declares:
+    /// resolving is a lookup of the app's secrets and deciding which of them
+    /// this manifest wanted is [`Container::missing_secrets`] and
+    /// [`Container::unused_secrets`]' question, asked by whoever cares about
+    /// the answer.
+    pub fn with_secrets(&self, secrets: BTreeMap<VarName, StoredSecret>) -> Self {
+        Self {
+            container: Container {
+                resolved: secrets,
+                ..self.container.clone()
+            },
+            ..self.clone()
+        }
     }
 
     /// What serde cannot express: the rules that span more than one field.
@@ -1224,6 +1363,85 @@ env:
         );
 
         assert!(AppManifest::parse(&raw).is_ok());
+    }
+
+    /// A container declaring `PW` and reading it, with `resolved` filled in
+    /// from the given names and values.
+    fn with_secrets(secrets: &[(&str, &str)]) -> AppManifest {
+        let raw = with_container("secrets: [PW]\nenv:\n  A: \"pw={{PW}}\"");
+        let resolved = secrets
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.parse().unwrap(),
+                    StoredSecret {
+                        value: crate::secret::Secret::new(*value),
+                        version: 1,
+                    },
+                )
+            })
+            .collect();
+
+        AppManifest::parse(&raw).unwrap().with_secrets(resolved)
+    }
+
+    /// The values are not in the document and must not get into it: what an
+    /// operator committed is what a later spaceport reads back, and a manifest
+    /// carrying a resolved secret in its text would be a secret in the state
+    /// database's copy of a repository's file.
+    #[test]
+    fn resolving_a_secret_leaves_the_document_and_its_environment_alone() {
+        let manifest = with_secrets(&[("PW", "hunter2")]);
+
+        assert_eq!(manifest.container.env["A"], "pw={{PW}}");
+        assert!(!manifest.source_text().contains("hunter2"));
+    }
+
+    #[test]
+    fn a_parsed_manifest_has_resolved_nothing() {
+        let manifest = AppManifest::parse(MINIMAL).unwrap();
+
+        assert!(manifest.container.resolved.is_empty());
+    }
+
+    /// `resolved` is not a field of the schema, so a document that names it is
+    /// a document with an unknown field — and, more to the point, no way for a
+    /// value to be smuggled in as though something had resolved it.
+    #[test]
+    fn rejects_a_document_that_tries_to_supply_a_resolved_secret() {
+        let raw = with_container("resolved:\n  PW:\n    value: hunter2\n    version: 1");
+
+        assert!(AppManifest::parse(&raw).is_err());
+    }
+
+    /// What an apply asks before it starts anything: an app whose password is
+    /// missing would otherwise come up and fail against its database, which is
+    /// a terrible way to be told a secret was never set.
+    #[test]
+    fn says_which_declared_secrets_nothing_has_resolved() {
+        assert_eq!(
+            with_secrets(&[]).container.missing_secrets(),
+            [&"PW".parse::<VarName>().unwrap()]
+        );
+        assert!(
+            with_secrets(&[("PW", "hunter2")])
+                .container
+                .missing_secrets()
+                .is_empty()
+        );
+    }
+
+    /// The other direction, and not an error: a secret set before the manifest
+    /// that reads it, or left behind when the last reference went, is ordinary.
+    #[test]
+    fn says_which_resolved_secrets_nothing_declares() {
+        let manifest = with_secrets(&[("PW", "hunter2"), ("LEFTOVER", "old")]);
+
+        assert_eq!(
+            manifest.container.unused_secrets(),
+            [&"LEFTOVER".parse::<VarName>().unwrap()]
+        );
+        assert!(manifest.container.missing_secrets().is_empty());
     }
 
     /// `MINIMAL` with a readiness section, indented into place.

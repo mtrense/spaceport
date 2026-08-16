@@ -8,15 +8,17 @@ pub mod manifest;
 pub mod pattern;
 pub mod reconcile;
 pub mod repository;
+pub mod secrets;
 pub mod store;
 pub mod supervisor;
 
 pub use apply::{Applied, Applier, Restored};
 pub use data::DataDir;
-pub use manifest::AppManifest;
+pub use manifest::{AppManifest, VarName};
 pub use pattern::Pattern;
 pub use reconcile::reconcile;
 pub use repository::{AppRecord, AppRepository};
+pub use secrets::{SecretRepository, StoredSecret};
 pub use store::{App, AppStore, Downed, Removed, Route, Routes, Suspended};
 pub use supervisor::supervise;
 

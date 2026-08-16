@@ -39,7 +39,7 @@ use time::{Duration, OffsetDateTime};
 use super::jwt;
 use super::key;
 use super::repository::Connection;
-use crate::connections::Secret;
+use crate::secret::Secret;
 
 /// Where GitHub's REST API lives.
 ///

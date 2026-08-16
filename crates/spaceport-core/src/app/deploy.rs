@@ -426,8 +426,20 @@ async fn failed(worker: &Worker, app: &AppId, revision: &str, reason: &str) {
 /// crashed on its own would be in. The rollback is not a second safety net —
 /// it is the same net, arriving in a second rather than in a minute.
 ///
+/// **It puts the record back too.** Nearly every failed deployment leaves the
+/// record untouched, because `record_applied` runs only when an apply has
+/// worked — but one does not: a manifest whose secrets are not all set is
+/// *staged*, recorded, and only then refused, which is what makes an app
+/// waiting for a secret survive a restart. Left alone, that record would say
+/// this app is suspended on the manifest of a commit that never ran, while it
+/// is in fact serving the one before it — and the next restart would take the
+/// running container away to honour it, with no further commit involved. So the
+/// record read at the top of the deployment is written back, which is a no-op
+/// for every other kind of failure.
+///
 /// An app with no record was never running, so there is nothing to go back to.
-/// It stays down, saying why.
+/// It stays down, saying why — or, if the deployment got as far as staging it,
+/// suspended and waiting for its secrets, which is a state a resume can finish.
 async fn roll_back(worker: &Worker, app: &AppId, record: Option<&AppRecord>) {
     let Some(record) = record else {
         warn!(
@@ -456,6 +468,19 @@ async fn roll_back(worker: &Worker, app: &AppId, record: Option<&AppRecord>) {
         }
     };
 
+    // Before the app is put back rather than after, because this is the half
+    // that must happen even if the restore does not: an app that cannot be
+    // started is one the supervisor will keep trying, and what it should keep
+    // trying is the manifest this record names.
+    if let Err(error) = worker.applier.repository().put_back(record).await {
+        warn!(
+            app = %app,
+            error = %format!("{error:#}"),
+            by = BY_SPACEPORT,
+            "could not put this app's record back, so a restart may bring back the manifest that failed",
+        );
+    }
+
     // `restore` and not `deploy`, because nothing new is being decided: this is
     // the record being made true again, and re-recording it would restate when
     // the app was applied as though somebody had just applied it.
@@ -475,6 +500,12 @@ async fn roll_back(worker: &Worker, app: &AppId, record: Option<&AppRecord>) {
             by = BY_SPACEPORT,
             "put this app back on what it was running",
         ),
+        // The one path where what this doc says about the supervisor's sweep
+        // does not hold. A restore that fails before it reaches the store
+        // leaves the app in neither the routing table nor the down list, and
+        // the sweep only looks at apps it can see — so nothing here retries it,
+        // and what brings it back is the next apply, deploy or restart of
+        // spaceport, which the record is now correct for.
         Err(error) => warn!(
             app = %app,
             error = %format!("{error:#}"),
@@ -497,6 +528,7 @@ mod tests {
 
     use crate::app::manifest::Source;
     use crate::app::repository::AppRepository;
+    use crate::app::secrets::SecretRepository;
     use crate::app::store::AppStore;
     use crate::build::repository::{Build, BuildState};
     use crate::connections::github::tracking::Tracking;
@@ -683,6 +715,7 @@ container:
                 runtime.clone(),
                 AppRepository::new(db.clone()),
                 builds.clone(),
+                SecretRepository::new(db.clone()),
             ));
             let trackings = Arc::new(TrackingRepository::new(db));
 
@@ -990,6 +1023,79 @@ container:
         assert!(fixture.runtime.launches().is_empty());
         let reason = fixture.build_of(PUSHED).await.deploy_reason.unwrap();
         assert!(reason.contains("kept no manifest"), "{reason}");
+    }
+
+    /// A commit that starts reading a secret, as one does the day somebody adds
+    /// a database to an app.
+    fn manifest_needing_a_secret() -> String {
+        format!(
+            "schema_version: 1
+source:
+  type: build
+  dockerfile: Dockerfile
+routing:
+  hosts: [{HOST}]
+container:
+  secrets: [DB_PASSWORD]
+  env:
+    DATABASE_URL: \"postgres://user:{{{{DB_PASSWORD}}}}@db/app\"
+  health:
+    readiness:
+      type: none
+"
+        )
+    }
+
+    /// The commit that adds a secret and lands before anybody sets it. Nothing
+    /// about it is special to this loop: it is a deployment that did not work,
+    /// so the app goes back to the revision that did and the row says which
+    /// secret it was — which is where an operator finds out that all they have
+    /// to do is set it and push again.
+    #[tokio::test]
+    async fn a_build_whose_manifest_needs_a_secret_nobody_set_is_rolled_back() {
+        let fixture = Fixture::new();
+        fixture.track(true).await;
+        fixture.already_running().await;
+        fixture.built(PUSHED, &manifest_needing_a_secret()).await;
+
+        fixture.pass().await;
+
+        // The new revision never reached the engine — there was nothing safe to
+        // start — and the old one is running again in a container of its own,
+        // because staging the new manifest took the one it had away.
+        assert_eq!(
+            fixture.runtime.launches(),
+            [image(RUNNING), image(RUNNING)],
+            "the image needing the secret must never have been launched",
+        );
+        assert!(fixture.store.routes().serving(HOST).is_some());
+        assert!(fixture.store.suspended(&fixture.app()).is_none());
+
+        // The record is the one it was running before, down to not being
+        // suspended: the applier records what it stages, and a rollback is what
+        // undoes that. Otherwise this app would come back suspended on a
+        // manifest that never ran, and no later commit would ever be deployed.
+        let record = fixture
+            .applier
+            .repository()
+            .recorded(&fixture.app())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.revision.as_deref(), Some(RUNNING));
+        assert_eq!(record.manifest, manifest_document());
+        assert!(!record.suspended);
+
+        // And the row names the secret, for whoever reads `spaceport apps show`
+        // tomorrow morning.
+        let reason = fixture.build_of(PUSHED).await.deploy_reason.unwrap();
+        assert!(reason.contains("DB_PASSWORD"), "{reason}");
+
+        // Tried once and never again: a secret nobody has set is not something
+        // the next pass can do any better at.
+        fixture.pass().await;
+        fixture.pass().await;
+        assert_eq!(fixture.runtime.launches(), [image(RUNNING), image(RUNNING)]);
     }
 
     /// Give the loop enough turns to have acted on what it was told, without

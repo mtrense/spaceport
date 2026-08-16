@@ -167,6 +167,7 @@ mod tests {
     use super::*;
     use crate::app::AppStore;
     use crate::app::repository::AppRepository;
+    use crate::app::secrets::SecretRepository;
     use crate::build::repository::BuildRepository;
     use crate::runtime::{Adopted, Container, ContainerId, ContainerRuntime, Managed};
     use crate::state::Db;
@@ -309,7 +310,8 @@ container:
             store.clone(),
             runtime,
             repository.clone(),
-            BuildRepository::new(db),
+            BuildRepository::new(db.clone()),
+            SecretRepository::new(db),
         ));
 
         (applier, store, repository)

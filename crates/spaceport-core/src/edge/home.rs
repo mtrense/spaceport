@@ -363,9 +363,9 @@ fn escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connections::Secret;
     use crate::connections::github::Connection;
     use crate::connections::github::api::testing::FakeGitHub;
+    use crate::secret::Secret;
     use crate::state::Db;
     use axum::body::Body;
     use http::Request;

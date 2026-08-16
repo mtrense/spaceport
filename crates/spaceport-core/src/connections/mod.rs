@@ -22,6 +22,3 @@
 //! second implementation to argue with.
 
 pub mod github;
-pub mod secret;
-
-pub use secret::Secret;

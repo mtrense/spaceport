@@ -536,6 +536,7 @@ fn missing(app: &App, containers: &[crate::runtime::Managed]) -> Option<&'static
 mod tests {
     use super::*;
     use crate::app::repository::AppRepository;
+    use crate::app::secrets::SecretRepository;
     use crate::app::{AppManifest, AppStore};
     use crate::build::repository::BuildRepository;
     use crate::runtime::{Container, ContainerId, ContainerRuntime, Managed};
@@ -696,7 +697,8 @@ container:
             store.clone(),
             runtime.clone(),
             AppRepository::new(db.clone()),
-            BuildRepository::new(db),
+            BuildRepository::new(db.clone()),
+            SecretRepository::new(db),
         ));
         applier
             .apply(id("hello"), manifest, false)
@@ -911,7 +913,8 @@ container:
             store.clone(),
             runtime.clone(),
             AppRepository::new(db.clone()),
-            BuildRepository::new(db),
+            BuildRepository::new(db.clone()),
+            SecretRepository::new(db),
         ));
         applier
             .apply(id("hello"), manifest(""), false)

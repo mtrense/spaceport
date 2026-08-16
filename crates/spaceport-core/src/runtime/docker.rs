@@ -184,7 +184,7 @@ impl ContainerRuntime for DockerRuntime {
 
         let body = ContainerCreateBody {
             image: Some(image.to_owned()),
-            env: Some(environment(manifest)),
+            env: Some(environment(manifest)?),
             labels: Some(HashMap::from([
                 (MANAGED_LABEL.to_owned(), "true".to_owned()),
                 (APP_LABEL.to_owned(), app.to_string()),
@@ -299,7 +299,13 @@ impl ContainerRuntime for DockerRuntime {
             // matches any manifest that asks for none — and an upgrade that
             // restarted every app on the host to relabel it would be a far
             // worse answer than leaving the ones that still fit alone.
-            None if manifest.container.env.is_empty() && manifest.container.volumes.is_empty() => {}
+            // The secrets are asked about here as well as the environment, so
+            // that this branch is safe by what it reads rather than by the
+            // validation two modules away which says a declared secret must be
+            // interpolated by some env value.
+            None if manifest.container.env.is_empty()
+                && manifest.container.volumes.is_empty()
+                && manifest.container.secrets.is_empty() => {}
             None => {
                 debug!(app = %app, container = %id, "the container from before predates app configuration");
                 return Ok(None);
@@ -858,7 +864,43 @@ fn tail(log: &VecDeque<String>) -> String {
 /// What it deliberately leaves out is the manifest's text. Two documents that
 /// describe the same container have to fingerprint the same however they were
 /// written, or an app would be restarted for having a comment added to it.
+///
+/// And what it leaves out for a second reason is any secret's value. The
+/// environment goes in exactly as the manifest wrote it, `{{NAME}}` and all,
+/// never as the container will actually see it. This string is hashed and the
+/// digest is written onto the container as a label, which anybody who can talk
+/// to the daemon can read — and a hash is only as unguessable as what went into
+/// it. A database password is not a random 32 bytes; it is something somebody
+/// can put through the same hash a few billion times offline.
+///
+/// So what stands in for the value is its `version`, one per secret the
+/// manifest declares, in the manifest's own order. A counter says "not the
+/// value you saw last time" and nothing else, which is the only thing the
+/// fingerprint is asking — and it is what makes a changed secret replace a
+/// container, since a container's environment is fixed when it is created.
+/// `UNSET` marks a secret nothing has resolved, so that setting one for the
+/// first time counts as a change too.
+///
+/// A manifest that declares no secrets fields nothing extra at all, and so
+/// fingerprints exactly as it did before secrets existed. Anything else would
+/// have replaced every container running on every host, on upgrade, to record
+/// the absence of something none of them had.
 fn fingerprint(data: &DataDir, app: &AppId, image: &str, manifest: &AppManifest) -> String {
+    let spec = specification(data, app, image, manifest);
+
+    let digest = ring::digest::digest(&ring::digest::SHA256, spec.as_bytes());
+    digest.as_ref()[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The string a fingerprint is the digest of.
+///
+/// Split out from [`fingerprint`] so that a test can read what is about to be
+/// hashed. Everything else about a hash can be asserted from the outside; that
+/// no secret went into it cannot, because a digest looks the same either way.
+fn specification(data: &DataDir, app: &AppId, image: &str, manifest: &AppManifest) -> String {
     let container = &manifest.container;
 
     let mut spec = String::new();
@@ -877,6 +919,25 @@ fn fingerprint(data: &DataDir, app: &AppId, image: &str, manifest: &AppManifest)
         field(&mut spec, value);
     }
 
+    // The names the manifest declares and not the ones that resolved: a value
+    // sitting in the database that this manifest never asks for reaches no
+    // container, so it must not restart one either.
+    //
+    // Sorted, for the reason the volumes below are: `secrets` is a list in a
+    // document, and an operator who alphabetises it has not changed the app.
+    let mut secrets: Vec<_> = container.secrets.iter().collect();
+    secrets.sort();
+    for secret in secrets {
+        field(&mut spec, secret.as_str());
+        field(
+            &mut spec,
+            &container
+                .resolved
+                .get(secret)
+                .map_or_else(|| UNSET.to_owned(), |secret| secret.version.to_string()),
+        );
+    }
+
     let mut volumes: Vec<_> = container.volumes.iter().collect();
     volumes.sort_by(|a, b| a.name.cmp(&b.name));
     for volume in volumes {
@@ -886,11 +947,7 @@ fn fingerprint(data: &DataDir, app: &AppId, image: &str, manifest: &AppManifest)
         field(&mut spec, if volume.read_only { "ro" } else { "rw" });
     }
 
-    let digest = ring::digest::digest(&ring::digest::SHA256, spec.as_bytes());
-    digest.as_ref()[..16]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    spec
 }
 
 /// What an image says about itself that spaceport has to know before it can
@@ -904,6 +961,10 @@ struct ImageConfig {
     user: String,
 }
 
+/// What a fingerprint says in place of the version of a secret nothing has
+/// resolved. Not a number, so that no version can ever be mistaken for it.
+const UNSET: &str = "unset";
+
 /// Append one length-prefixed field to a fingerprint.
 ///
 /// Length-prefixed rather than separated by some character, because an
@@ -916,14 +977,19 @@ fn field(spec: &mut String, value: &str) {
     spec.push_str(value);
 }
 
-/// The environment to give a container, as the engine wants it.
-fn environment(manifest: &AppManifest) -> Vec<String> {
-    manifest
+/// The environment to give a container, as the engine wants it: the manifest's
+/// own values with every secret it interpolates put in.
+///
+/// The grammar of a placeholder lives in the manifest module and is not
+/// repeated here — this only turns the map that comes back into the list of
+/// `NAME=value` strings docker takes.
+fn environment(manifest: &AppManifest) -> Result<Vec<String>> {
+    Ok(manifest
         .container
-        .env
-        .iter()
+        .environment()?
+        .into_iter()
         .map(|(name, value)| format!("{name}={value}"))
-        .collect()
+        .collect())
 }
 
 /// The container name spaceport gives an app. Prefixed, so a container that is
@@ -1048,6 +1114,8 @@ fn is_not_modified(error: &DockerError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::StoredSecret;
+    use crate::secret::Secret;
 
     fn exposed(ports: &[&str]) -> Vec<String> {
         ports.iter().map(|port| (*port).to_owned()).collect()
@@ -1177,26 +1245,212 @@ container:
     }
 
     fn spec(manifest: &AppManifest) -> String {
-        let data = DataDir::new(std::path::PathBuf::from("/var/lib/spaceport/apps"));
-
         fingerprint(
-            &data,
+            &data(),
             &"my-app".parse().unwrap(),
             "traefik/whoami:latest",
             manifest,
         )
     }
 
+    /// The string a fingerprint is taken of, for the one test that has to look
+    /// at what goes into the hash rather than at what comes out.
+    fn spec_input(manifest: &AppManifest) -> String {
+        specification(
+            &data(),
+            &"my-app".parse().unwrap(),
+            "traefik/whoami:latest",
+            manifest,
+        )
+    }
+
+    fn data() -> DataDir {
+        DataDir::new(std::path::PathBuf::from("/var/lib/spaceport/apps"))
+    }
+
     #[test]
     fn gives_the_container_its_environment_in_order() {
         let manifest = manifest("env:\n  ZULU: last\n  ALPHA: first");
 
-        assert_eq!(environment(&manifest), ["ALPHA=first", "ZULU=last"]);
+        assert_eq!(
+            environment(&manifest).unwrap(),
+            ["ALPHA=first", "ZULU=last"]
+        );
     }
 
     #[test]
     fn gives_a_container_with_no_environment_an_empty_one() {
-        assert!(environment(&manifest("port: 80")).is_empty());
+        assert!(environment(&manifest("port: 80")).unwrap().is_empty());
+    }
+
+    /// A manifest of `container` with `secrets` resolved to the given values,
+    /// each at the given version.
+    fn resolved(container: &str, secrets: &[(&str, &str, u64)]) -> AppManifest {
+        let values = secrets
+            .iter()
+            .map(|(name, value, version)| {
+                (
+                    name.parse().unwrap(),
+                    StoredSecret {
+                        value: Secret::new(*value),
+                        version: *version,
+                    },
+                )
+            })
+            .collect();
+
+        manifest(container).with_secrets(values)
+    }
+
+    /// The point of the whole feature: what the app actually reads from its
+    /// environment is the secret, not the name of one.
+    #[test]
+    fn puts_a_secret_where_the_environment_referred_to_it() {
+        let manifest = resolved(
+            "secrets: [DB_PASSWORD]
+env:
+  DATABASE_URL: postgres://user:{{DB_PASSWORD}}@db:5432/app",
+            &[("DB_PASSWORD", "hunter2", 1)],
+        );
+
+        assert_eq!(
+            environment(&manifest).unwrap(),
+            ["DATABASE_URL=postgres://user:hunter2@db:5432/app"]
+        );
+    }
+
+    /// Two secrets in one value, which is what any connection string with a
+    /// user and a password looks like — a substitution that stopped after the
+    /// first would leave the second as literal text in a URL.
+    #[test]
+    fn puts_several_secrets_into_one_value() {
+        let manifest = resolved(
+            "secrets: [USER, PW]
+env:
+  DATABASE_URL: \"postgres://{{USER}}:{{ PW }}@db/app\"",
+            &[("USER", "admin", 1), ("PW", "hunter2", 1)],
+        );
+
+        assert_eq!(
+            environment(&manifest).unwrap(),
+            ["DATABASE_URL=postgres://admin:hunter2@db/app"]
+        );
+    }
+
+    /// One secret read by two variables is the ordinary way an app and its
+    /// migration tool are given the same password.
+    #[test]
+    fn puts_one_secret_into_every_value_that_names_it() {
+        let manifest = resolved(
+            "secrets: [PW]
+env:
+  A: \"{{PW}}\"
+  B: \"before {{PW}} after\"",
+            &[("PW", "hunter2", 1)],
+        );
+
+        assert_eq!(
+            environment(&manifest).unwrap(),
+            ["A=hunter2", "B=before hunter2 after"]
+        );
+    }
+
+    /// Spaceport's own bug, not an operator's: applying refuses a manifest
+    /// whose secrets are not all set, so by here a missing value means the
+    /// resolution went wrong. Saying so beats handing the app a connection
+    /// string with `{{DB_PASSWORD}}` in it and letting it report a database
+    /// problem.
+    #[test]
+    fn refuses_to_run_an_app_whose_secret_never_resolved() {
+        let manifest = manifest(
+            "secrets: [DB_PASSWORD]
+env:
+  DATABASE_URL: \"pw={{DB_PASSWORD}}\"",
+        );
+
+        let err = environment(&manifest).unwrap_err().to_string();
+
+        assert!(err.contains("DB_PASSWORD"), "{err}");
+        assert!(err.contains("not resolved"), "{err}");
+    }
+
+    /// A container's environment is fixed when it is created, so a secret that
+    /// changed only reaches the app if the fingerprint changed with it — and
+    /// the document says exactly the same thing either way, so the version is
+    /// the only thing that can carry the difference.
+    #[test]
+    fn fingerprints_a_new_version_of_a_secret_differently() {
+        let container = "secrets: [PW]\nenv:\n  A: \"{{PW}}\"";
+        let before = resolved(container, &[("PW", "old", 1)]);
+        let after = resolved(container, &[("PW", "new", 2)]);
+
+        assert_ne!(spec(&before), spec(&after));
+        // And the text really is identical, so nothing else could have.
+        assert_eq!(before.source_text(), after.source_text());
+    }
+
+    /// Setting a secret for the first time has to count as a change too, or an
+    /// app that came up before its secret existed would never pick it up.
+    #[test]
+    fn fingerprints_an_unresolved_secret_differently_from_a_resolved_one() {
+        let container = "secrets: [PW]\nenv:\n  A: \"{{PW}}\"";
+
+        assert_ne!(
+            spec(&manifest(container)),
+            spec(&resolved(container, &[("PW", "hunter2", 1)]))
+        );
+    }
+
+    /// A secret the manifest does not declare reaches no container, so it must
+    /// not restart one. An operator setting a secret for an app that does not
+    /// read it yet — or leaving an old value behind — is ordinary.
+    #[test]
+    fn ignores_a_resolved_secret_the_manifest_does_not_declare() {
+        let container = "secrets: [PW]\nenv:\n  A: \"{{PW}}\"";
+        let declared = resolved(container, &[("PW", "hunter2", 1)]);
+        let with_extra = resolved(
+            container,
+            &[("PW", "hunter2", 1), ("LEFTOVER", "whatever", 7)],
+        );
+
+        assert_eq!(spec(&declared), spec(&with_extra));
+    }
+
+    /// The upgrade check. Every app already running was fingerprinted without
+    /// secrets in the spec at all, and a manifest that declares none has to
+    /// hash to the same 32 characters it did then — otherwise installing this
+    /// version replaces every container on the host to record the absence of
+    /// something none of them have. The digests are the ones the code produced
+    /// before this field existed, written down here so that nothing can quietly
+    /// change them again.
+    #[test]
+    fn fingerprints_a_manifest_without_secrets_as_it_always_did() {
+        assert_eq!(
+            spec(&manifest("port: 80")),
+            "43c46231dca4c839a69e6d80d74a324f"
+        );
+        assert_eq!(
+            spec(&manifest("port: 80\nenv:\n  MODE: production")),
+            "b90145b4ab7274240ae11e39438cdc86"
+        );
+    }
+
+    /// The fingerprint is a docker label, readable by anybody who can talk to
+    /// the daemon, and a hash of a password somebody chose is a password
+    /// somebody can guess offline. Asserted on the string that is hashed and
+    /// not only on the digest, because it is the input that has to be clean.
+    #[test]
+    fn never_puts_a_secret_into_what_it_hashes() {
+        let manifest = resolved(
+            "secrets: [PW]\nenv:\n  A: \"pw={{PW}}\"",
+            &[("PW", "hunter2", 1)],
+        );
+
+        let spec = spec_input(&manifest);
+
+        assert!(!spec.contains("hunter2"), "{spec}");
+        // The placeholder is what went in instead, exactly as written.
+        assert!(spec.contains("{{PW}}"), "{spec}");
     }
 
     /// The whole point of the label: neither of these can be asked of a

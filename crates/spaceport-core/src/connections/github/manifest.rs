@@ -42,7 +42,7 @@ use time::{Duration, OffsetDateTime};
 
 use super::api::{self, Transport};
 use super::register::Registration;
-use crate::connections::Secret;
+use crate::secret::Secret;
 
 /// Where GitHub takes a browser to create an App on an organisation.
 ///

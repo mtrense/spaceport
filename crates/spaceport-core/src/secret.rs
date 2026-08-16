@@ -1,25 +1,30 @@
 //! A string that must not turn up in a log line.
 //!
-//! A GitHub App hands a spaceport four things it has to keep — a client secret,
-//! a webhook secret and a private key among them — and every one of those is a
-//! value that grants somebody else the right to act as the app. The danger is
-//! never that an operator deliberately prints one; it is that a connection is
-//! `Debug`-formatted into a `tracing` field, or panics inside an `assert_eq!`,
-//! or gets a field added to a response struct one afternoon, and the secret
-//! rides along because a `String` has no opinion about where it is allowed to
-//! go.
+//! A spaceport holds values it has to keep: the client secret, webhook secret
+//! and private key of a connection, and the secrets an operator has set on an
+//! app. Every one of them grants somebody the right to act as something. The
+//! danger is never that an operator deliberately prints one; it is that the
+//! struct holding it is `Debug`-formatted into a `tracing` field, or panics
+//! inside an `assert_eq!`, or gets a field added to a response struct one
+//! afternoon, and the secret rides along because a `String` has no opinion
+//! about where it is allowed to go.
+//!
+//! It lives at the crate root and not under one of the things that has
+//! secrets, because both of those want the same type and neither owns it — a
+//! connection's private key and an app's database password are the same
+//! problem twice.
 //!
 //! So the plaintext lives behind a type whose `Debug` and `Display` both print
 //! `Secret(…)`, and whose only way out is [`Secret::expose`] — a name chosen to
 //! read badly at the call site, so that every place the plaintext is actually
 //! needed is one grep away and one review comment away.
 //!
-//! [`serde::Serialize`] is deliberately **not** implemented. A connection is
-//! rendered to an operator, and a derived `Serialize` would leak the moment
-//! somebody put the field in a response. `Deserialize` is implemented, because
-//! secrets arrive from GitHub's manifest-conversion response and from an
-//! operator on the command line, and refusing to read them in would only mean
-//! reading them in as a `String` somewhere less careful.
+//! [`serde::Serialize`] is deliberately **not** implemented. What holds a
+//! secret is rendered to an operator, and a derived `Serialize` would leak the
+//! moment somebody put the field in a response. `Deserialize` is implemented,
+//! because secrets arrive from GitHub's manifest-conversion response and from
+//! an operator on the command line, and refusing to read them in would only
+//! mean reading them in as a `String` somewhere less careful.
 //!
 //! What this is not: encryption at rest, or a guard against a process that can
 //! read spaceport's own memory. Anybody with the state database has the secrets

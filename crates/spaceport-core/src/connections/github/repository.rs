@@ -22,7 +22,7 @@
 use anyhow::{Context, Result};
 use rusqlite::OptionalExtension;
 
-use crate::connections::Secret;
+use crate::secret::Secret;
 use crate::state::Db;
 
 /// One GitHub App this spaceport has registered for itself.

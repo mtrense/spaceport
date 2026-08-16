@@ -463,7 +463,7 @@ mod tests {
 
     use super::super::api::testing::FakeGitHub;
     use super::super::key;
-    use crate::connections::Secret;
+    use crate::secret::Secret;
     use crate::state::Db;
 
     /// A connection as one is read back out of the state store, with the

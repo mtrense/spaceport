@@ -45,7 +45,7 @@ use super::push;
 use super::reconcile::Nudge;
 use super::repository::ConnectionRepository;
 use super::tracking::TrackingRepository;
-use crate::connections::Secret;
+use crate::secret::Secret;
 
 /// The header naming what happened — `push`, `installation`, `ping`.
 ///

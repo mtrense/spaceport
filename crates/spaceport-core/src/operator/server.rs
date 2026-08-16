@@ -25,9 +25,11 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use super::OperatorEndpoint;
+use super::{OperatorEndpoint, SecretOutcome, SecretSet};
 use crate::app::apply::{Applied, Applier, ApplyError, DestroyError, ResumeError, SuspendError};
-use crate::app::{App, AppId, AppManifest, AppRepository, DataDir, Pattern, health};
+use crate::app::manifest::VarName;
+use crate::app::secrets::Set;
+use crate::app::{App, AppId, AppManifest, AppRecord, AppRepository, DataDir, Pattern, health};
 use crate::build::repository::{Build, BuildRepository, BuildState};
 use crate::connections::github::{
     Client, ConnectionRepository, Installation, Nudge, Registration, Tracking, TrackingRepository,
@@ -35,6 +37,7 @@ use crate::connections::github::{
 };
 use crate::events::{Event, EventBus, EventFilter, Level};
 use crate::runtime::Adopted;
+use crate::secret::Secret;
 use crate::status::Instance;
 
 /// Only the owner may talk to the socket: reaching it is the right to start
@@ -128,6 +131,11 @@ fn router(instance: Arc<Instance>, events: Arc<EventBus>, shutdown: Cancellation
         .route("/apps/{id}/tracking", put(track))
         .route("/apps/{id}/suspend", post(suspend))
         .route("/apps/{id}/resume", post(resume))
+        .route("/apps/{id}/secrets", get(secrets))
+        .route(
+            "/apps/{id}/secrets/{name}",
+            put(set_secret).delete(delete_secret),
+        )
         .route("/connections", get(connections))
         .route("/connections/github", post(connect_github))
         .route("/connections/github/register", post(register_github))
@@ -602,10 +610,29 @@ async fn show(
         built: &built,
         deployment: &deployment,
     });
+    // A read that fails costs the stanza its second half rather than the whole
+    // report: an app that is running is worth reporting on whatever the secret
+    // store has to say, and every declared name then reads as not set — which
+    // is the safer way to be wrong here, because it is the answer that has an
+    // operator go and look.
+    let stored = instance
+        .applier
+        .secrets()
+        .names(&id, None)
+        .await
+        .unwrap_or_default();
 
     (
         StatusCode::OK,
-        report(&id, &held, &status, applied_at.as_deref(), &data, origin),
+        report(
+            &id,
+            &held,
+            &status,
+            applied_at.as_deref(),
+            &data,
+            origin,
+            &stored,
+        ),
     )
         .into_response()
 }
@@ -773,6 +800,10 @@ struct ShowQuery {
 /// Laid out rather than tabulated: this is one app, and the fields it has are
 /// worth naming. Sections an app does not use are left out entirely — an app
 /// with no volumes should not have to read a line saying so.
+// One more argument than is comfortable, and every one of them is a different
+// store's answer about the same app. Bundling them would mean a struct whose
+// only purpose is to be taken apart on the first line of this function.
+#[allow(clippy::too_many_arguments)]
 fn report(
     id: &AppId,
     held: &Held,
@@ -780,6 +811,9 @@ fn report(
     applied_at: Option<&str>,
     data: &DataDir,
     origin: Option<Origin<'_>>,
+    // The names of the secrets this app has values for, which is the half of
+    // the secrets stanza that is not in the manifest.
+    stored: &[VarName],
 ) -> String {
     let manifest = held.manifest();
     let container = &manifest.container;
@@ -850,10 +884,18 @@ fn report(
         );
     }
 
+    // The names and whether each has a value, and never a word about what the
+    // value is. Both halves are needed to answer the question this stanza is
+    // read for — "why is this app suspended?" — because a manifest that
+    // declares three secrets and a store that holds two is exactly what that
+    // looks like, and neither the document nor the listing says so alone.
     for (index, secret) in container.secrets.iter().enumerate() {
         out.field(
             if index == 0 { "secrets" } else { "" },
-            format!("{secret} (not supported yet)"),
+            match stored.contains(secret) {
+                true => format!("{secret} (set)"),
+                false => format!("{secret} (not set — the app stays suspended until it is)"),
+            },
         );
     }
 
@@ -1407,7 +1449,13 @@ async fn apply(
         Err(error) => {
             warn!(%error, "apply failed");
             let status = match error {
-                ApplyError::Conflict(_) => StatusCode::CONFLICT,
+                // A conflict in the sense the status code means it: the app is
+                // recorded, it is holding its hosts, and the state it is in is
+                // not the one that was asked for. Not a 500, because nothing is
+                // wrong with this host, and not a 422, because the document is
+                // fine — what is missing is a value that is deliberately not in
+                // it.
+                ApplyError::Conflict(_) | ApplyError::MissingSecrets(_) => StatusCode::CONFLICT,
                 ApplyError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };
 
@@ -1579,7 +1627,13 @@ async fn deploy(
         Err(error) => {
             warn!(%error, "deploy failed");
             let status = match error {
-                ApplyError::Conflict(_) => StatusCode::CONFLICT,
+                // A conflict in the sense the status code means it: the app is
+                // recorded, it is holding its hosts, and the state it is in is
+                // not the one that was asked for. Not a 500, because nothing is
+                // wrong with this host, and not a 422, because the document is
+                // fine — what is missing is a value that is deliberately not in
+                // it.
+                ApplyError::Conflict(_) | ApplyError::MissingSecrets(_) => StatusCode::CONFLICT,
                 ApplyError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };
 
@@ -1881,11 +1935,571 @@ async fn resume(
             warn!(%error, "resume failed");
             let status = match error {
                 ResumeError::Unknown(_) => StatusCode::NOT_FOUND,
-                ResumeError::Conflict(_) => StatusCode::CONFLICT,
+                // As for an apply: the app is still there, still suspended, and
+                // still waiting for a value somebody has to set.
+                ResumeError::Conflict(_) | ResumeError::MissingSecrets(_) => StatusCode::CONFLICT,
                 ResumeError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };
 
             refuse(status, &error.to_string())
+        }
+    }
+}
+
+/// `GET /apps/{id}/secrets?pattern=…`: the names of the secrets set for an app,
+/// one per line.
+///
+/// Names and nothing else, which is what the query behind it can answer — see
+/// [`SecretRepository::names`], which never reads the value column. There is no
+/// switch anywhere that turns values on: the only thing that reads them is the
+/// code that renders a container's environment, and an operator who has
+/// forgotten a password sets a new one.
+///
+/// Lines rather than a table, because this is the one listing something other
+/// than a person reads: `for name in $(spaceport apps secret list web)` is the
+/// shape of a rotation script, and a header would be its first secret.
+///
+/// An app nothing has heard of is answered with no names rather than a 404,
+/// unlike the two routes below it. Nothing is being changed here, an app that
+/// has no secrets and an app that does not exist have the same empty answer,
+/// and a listing that refused would be refusing to say the true thing.
+///
+/// [`SecretRepository::names`]: crate::app::SecretRepository::names
+async fn secrets(
+    State(applier): State<Arc<Applier>>,
+    UrlPath(id): UrlPath<String>,
+    Query(query): Query<ListQuery>,
+) -> Response {
+    let id: AppId = match id.parse() {
+        Ok(id) => id,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    let pattern = match query
+        .pattern
+        .as_deref()
+        .map(str::parse::<Pattern>)
+        .transpose()
+    {
+        Ok(pattern) => pattern,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    match applier.secrets().names(&id, pattern.as_ref()).await {
+        Ok(names) => {
+            let body: String = names.iter().map(|name| format!("{name}\n")).collect();
+
+            (StatusCode::OK, body).into_response()
+        }
+        Err(error) => refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not read the secrets of `{id}`: {error:#}"),
+        ),
+    }
+}
+
+/// `PUT /apps/{id}/secrets/{name}`: this is the value, and bring the app up to
+/// date with it.
+///
+/// The value is the request body, verbatim, and that is the whole reason this
+/// route is shaped the way it is. A value in the path or the query string is
+/// written into the access log of anything between here and the caller, into
+/// this process's own request logging the day somebody adds any, and into the
+/// url of every error message that quotes it. A body is none of those places.
+/// It is also the only shape that carries an arbitrary value: a secret is bytes
+/// somebody generated, and `&`, `#` and `%` are three of them.
+///
+/// It still has to be text, because what it becomes is an environment variable
+/// and an environment cannot hold a byte that is not one. A body that is not
+/// UTF-8 is refused without a word of it being quoted back.
+///
+/// What happens after it is stored is the substantive part:
+///
+/// * a value identical to the one already there changes nothing and starts
+///   nothing — see [`Set::Unchanged`], which exists for this;
+/// * a value that changed, on an app that now has every secret its manifest
+///   declares, brings the app up to date: a suspended one is resumed, and a
+///   running one is redeployed, because a changed value is a changed container
+///   fingerprint and the running container is carrying the old one;
+/// * a value that changed, on an app still missing others, is stored and
+///   reported — the app stays where it is, which is suspended;
+/// * a value for an app with no manifest applied here is simply stored.
+///   Setting the secrets before applying the manifest that needs them is the
+///   right order to do it in, and refusing would make it impossible.
+///
+/// An app this spaceport has never heard of at all — no record, nothing in the
+/// routing table, no tracking — is a 404. That is the difference between an
+/// app whose manifest has not arrived yet and a typo, and only the second is
+/// worth refusing.
+async fn set_secret(
+    State(instance): State<Arc<Instance>>,
+    State(applier): State<Arc<Applier>>,
+    State(deploying): State<Deploying>,
+    UrlPath((id, name)): UrlPath<(String, String)>,
+    body: Bytes,
+) -> Response {
+    let (id, name) = match about(&id, &name) {
+        Ok(named) => named,
+        Err(refusal) => return *refusal,
+    };
+
+    // Never quoted back, however wrong it is: the bytes of a value that failed
+    // to decode are still the bytes of somebody's secret.
+    let Ok(value) = std::str::from_utf8(&body) else {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "a secret's value is the body of the request, and this one is not valid utf-8 — a value has to be text, because what it becomes is an environment variable",
+        );
+    };
+    let value = Secret::new(value);
+
+    // Held from before the app is looked up until after its value is written,
+    // the way every verb on the applier holds it: this is the app being seen
+    // to, and a `destroy` that runs alongside must not report the container it
+    // is removing as one that broke. The mark excludes nobody, which is why the
+    // orphan below is caught by looking again rather than by holding this.
+    let _settling = applier.settling(&id);
+
+    let record = match AppRepository::new(instance.db.clone()).recorded(&id).await {
+        Ok(record) => record,
+        Err(error) => {
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not read what is recorded for `{id}`: {error:#}"),
+            );
+        }
+    };
+    if !known(&instance, &id, record.as_ref()).await {
+        return refuse(StatusCode::NOT_FOUND, &format!("no app named `{id}`"));
+    }
+
+    let set = match applier.secrets().set(&id, &name, &value).await {
+        Ok(set) => set,
+        Err(error) => {
+            warn!(app = %id, secret = %name, %error, "could not set an app secret");
+
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not set the secret `{name}` of app `{id}`: {error:#}"),
+            );
+        }
+    };
+
+    // Asked again, after the write, because the check above and the write are
+    // two awaits and a `destroy` fits between them: it removes the app from the
+    // store, forgets its record, and only then forgets its secrets, so a value
+    // written after that step is one nothing will ever remove. An app of the
+    // same id applied tomorrow would inherit the credentials of the one
+    // destroyed today, which is the outcome `Applier::destroy` forgets secrets
+    // to prevent. Looking again strictly after the write closes it: either the
+    // destroy's own forget runs later and takes this row with it, or it has
+    // already run and the app is gone from everywhere this looks.
+    match AppRepository::new(instance.db.clone()).recorded(&id).await {
+        Ok(still) if !known(&instance, &id, still.as_ref()).await => {
+            if let Err(error) = applier.secrets().delete(&id, &name).await {
+                warn!(app = %id, secret = %name, %error, "the app was destroyed while its secret was being set, and the value could not be removed");
+            }
+
+            return refuse(
+                StatusCode::NOT_FOUND,
+                &format!("no app named `{id}` — it was destroyed while this secret was being set"),
+            );
+        }
+        Ok(_) => {}
+        // A read that failed says nothing about whether the app is gone, and
+        // dropping a value on the strength of it would throw away what an
+        // operator has just set. This check is a net, not a gate.
+        Err(error) => {
+            warn!(app = %id, %error, "could not check that the app still exists after setting its secret");
+        }
+    }
+
+    // Nothing observable changed, so nothing observable happens. This is the
+    // whole reason `set` answers with three states rather than two: a rotation
+    // script that re-sets what it set yesterday must not restart production.
+    if set == Set::Unchanged {
+        return answered(&SecretSet {
+            created: false,
+            outcome: SecretOutcome::Unchanged,
+        });
+    }
+
+    let created = set == Set::Created;
+    // Stored, and there is no manifest here to be brought up to date by it.
+    let Some(record) = record else {
+        return answered(&SecretSet {
+            created,
+            outcome: SecretOutcome::Stored,
+        });
+    };
+
+    let manifest = match AppManifest::parse(&record.manifest) {
+        Ok(manifest) => manifest,
+        // Recorded by a build that understood something this one does not. The
+        // value is stored either way — it is a row in a table, and nothing
+        // about the manifest makes it less stored — so what is refused is only
+        // the part this cannot do.
+        Err(error) => {
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!(
+                    "the secret `{name}` of app `{id}` is stored, but this spaceport cannot read the app's manifest, so it did not act on it: {error:#}"
+                ),
+            );
+        }
+    };
+
+    let held = match applier.secrets().names(&id, None).await {
+        Ok(held) => held,
+        Err(error) => {
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!(
+                    "the secret `{name}` of app `{id}` is stored, but the secrets of the app could not be read back, so it did not act on it: {error:#}"
+                ),
+            );
+        }
+    };
+
+    // Asked of the store rather than of the manifest's resolved values, because
+    // the manifest was just parsed out of a text column and carries none.
+    let missing: Vec<String> = manifest
+        .container
+        .secrets
+        .iter()
+        .filter(|secret| !held.contains(secret))
+        .map(ToString::to_string)
+        .collect();
+    if !missing.is_empty() {
+        return answered(&SecretSet {
+            created,
+            outcome: SecretOutcome::Missing { secrets: missing },
+        });
+    }
+
+    // A value nothing reads. The fingerprint a container is labelled with
+    // covers the secrets the manifest *declares* — see `manifest::written` —
+    // so this one has not changed what the running container should be, and
+    // replacing it would be a restart of somebody's app for nothing. Checked
+    // after the missing ones on purpose: an operator who typed `DB_PASSWD` is
+    // better served by being told the app is still waiting for `DB_PASSWORD`
+    // than by being told this name is unused.
+    if !manifest.container.secrets.contains(&name) {
+        warn!(app = %id, secret = %name, "the app's manifest declares no such secret, so nothing will read it");
+
+        return answered(&SecretSet {
+            created,
+            outcome: SecretOutcome::Stored,
+        });
+    }
+
+    // The store is asked before the record, and asked what is *running* first,
+    // because the two can disagree and only one of them knows what is serving
+    // traffic. A record saying an app is suspended while the app is up is not a
+    // hypothetical: `suspend` and `resume` both warn and carry on when the flag
+    // cannot be written, which leaves exactly that. Reading the record first
+    // would answer `Stored` with a 200 for an app that is up and would go on
+    // serving the value this call replaced — for good, since nothing else is
+    // coming to notice.
+    if applier.store().get(&id).is_some() {
+        return redeployed(&applier, record, id, name, manifest, created, true).await;
+    }
+
+    if applier.store().suspended(&id).is_some() {
+        return resumed(&applier, &deploying, &id, &name, created).await;
+    }
+
+    // Suspended in the record and neither running nor suspended in the store,
+    // which is an app this spaceport failed to bring back at its last start.
+    // There is nothing to resume and starting it would overrule the suspension,
+    // so the value is stored and left for whatever brings the app back.
+    if record.suspended {
+        return answered(&SecretSet {
+            created,
+            outcome: SecretOutcome::Stored,
+        });
+    }
+
+    // Recorded as wanting to run and not running: down, or never brought back.
+    // The same call puts it up, and it is not a redeploy — there is no
+    // container to replace.
+    redeployed(&applier, record, id, name, manifest, created, false).await
+}
+
+/// The app was waiting for exactly this, so put it back into service.
+async fn resumed(
+    applier: &Applier,
+    deploying: &Deploying,
+    id: &AppId,
+    name: &VarName,
+    created: bool,
+) -> Response {
+    match applier.resume(id).await {
+        Ok(_) => {
+            // After the app is serving and never before, exactly as `resume`
+            // does it and for its reason: an app that came back may have an
+            // image built during the suspension that nothing has run.
+            deploying.0.nudge();
+
+            answered(&SecretSet {
+                created,
+                outcome: SecretOutcome::Resumed,
+            })
+        }
+        // The value is stored and the app is not up. Said as a refusal rather
+        // than as an outcome, so that a script setting the last missing secret
+        // of an app exits non-zero when the app did not actually come back.
+        Err(error) => {
+            warn!(app = %id, secret = %name, %error, "the secret was set and the app did not resume");
+            let status = match error {
+                ResumeError::Unknown(_) => StatusCode::NOT_FOUND,
+                ResumeError::Conflict(_) | ResumeError::MissingSecrets(_) => StatusCode::CONFLICT,
+                ResumeError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+
+            refuse(
+                status,
+                &format!(
+                    "the secret `{name}` of app `{id}` is stored, but the app did not come back: {error}"
+                ),
+            )
+        }
+    }
+}
+
+/// The app is on a container built from the value this one replaced — or on no
+/// container at all — so put it on one built from this value.
+///
+/// A redeploy of the manifest the record holds and not a restart, because that
+/// is what a changed secret is: the version of every secret goes into the
+/// fingerprint the container is labelled with — deliberately the version and
+/// never the value — so a container built from the old value no longer matches
+/// the app's spec, and replacing it is what applying the same manifest already
+/// means.
+///
+/// `running` says which of the two this was, and it changes only what is
+/// reported: an app that was down had no container to replace, and telling an
+/// operator one was replaced would describe something that did not happen.
+async fn redeployed(
+    applier: &Applier,
+    record: AppRecord,
+    id: AppId,
+    name: VarName,
+    manifest: AppManifest,
+    created: bool,
+    running: bool,
+) -> Response {
+    let revision = record.revision.clone();
+
+    match applier
+        .deploy(id.clone(), manifest, revision.as_deref(), false)
+        .await
+    {
+        Ok(Applied::Running(_)) => {
+            // `deploy` records what it applied, and recording says the app was
+            // applied now — but nobody applied anything here, somebody rotated
+            // a password. So the record read on the way in goes back exactly as
+            // it was read, the way a rolled-back deployment puts one back, and
+            // `apps show` goes on saying when the app was last applied. Not
+            // suspended, whatever it said before: the app is running, and this
+            // is the one field that has genuinely changed.
+            let applied = AppRecord {
+                suspended: false,
+                ..record
+            };
+            if let Err(error) = applier.repository().put_back(&applied).await {
+                warn!(app = %id, %error, "the app is running on the new value, and its record now says it was applied just now");
+            }
+
+            answered(&SecretSet {
+                created,
+                outcome: match running {
+                    true => SecretOutcome::Redeployed,
+                    false => SecretOutcome::Started,
+                },
+            })
+        }
+        // Nothing here asked for a suspension and every secret was in hand, so
+        // this is the app having been suspended between two of these awaits —
+        // and staging takes the container with it. Refused rather than
+        // answered, for the reason a failed resume is: the value is stored and
+        // the app is not serving, and a script that got a 200 for that would
+        // carry on to the next thing.
+        Ok(Applied::Suspended(_)) => {
+            warn!(app = %id, secret = %name, "the secret was set and the app was suspended while it was being applied");
+
+            refuse(
+                StatusCode::CONFLICT,
+                &format!(
+                    "the secret `{name}` of app `{id}` is stored, but the app was suspended while it was being applied, so it is not serving — `spaceport apps resume {id}` puts it back on the new value"
+                ),
+            )
+        }
+        Err(error) => {
+            warn!(app = %id, secret = %name, %error, "the secret was set and the app was not redeployed");
+            let status = match error {
+                ApplyError::Conflict(_) | ApplyError::MissingSecrets(_) => StatusCode::CONFLICT,
+                ApplyError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+
+            // Not "it is still running the value from before": replacing a
+            // container removes the old one before it creates the new one, so
+            // an app whose replacement never became ready is not running at
+            // all. What is true is that the value is stored, the app is not
+            // back, and somebody has to look at it.
+            refuse(
+                status,
+                &format!(
+                    "the secret `{name}` of app `{id}` is stored, but the app did not come back on it and is not serving — it needs attention: {error}"
+                ),
+            )
+        }
+    }
+}
+
+/// `DELETE /apps/{id}/secrets/{name}`: forget this value.
+///
+/// Refused with a 409 while the app's recorded manifest declares the name. A
+/// secret an app declares is one it cannot start without, so deleting one under
+/// a running app arms a trap: the app carries on serving from the container it
+/// already has, and the next thing that restarts it — a redeploy, a crash, a
+/// reboot of the host at four in the morning — finds a manifest it cannot run.
+/// The order that works is the other one: take the name out of the manifest,
+/// apply that, and the value is then a leftover this will remove.
+async fn delete_secret(
+    State(instance): State<Arc<Instance>>,
+    State(applier): State<Arc<Applier>>,
+    UrlPath((id, name)): UrlPath<(String, String)>,
+) -> Response {
+    let (id, name) = match about(&id, &name) {
+        Ok(named) => named,
+        Err(refusal) => return *refusal,
+    };
+
+    let record = match AppRepository::new(instance.db.clone()).recorded(&id).await {
+        Ok(record) => record,
+        Err(error) => {
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not read what is recorded for `{id}`: {error:#}"),
+            );
+        }
+    };
+    if !known(&instance, &id, record.as_ref()).await {
+        return refuse(StatusCode::NOT_FOUND, &format!("no app named `{id}`"));
+    }
+
+    // Every manifest this spaceport is holding for the app, not only the
+    // recorded one. A record can be out of date in the direction that matters:
+    // an apply that could not write its row warns and carries on, and the app
+    // is running on the manifest it was given whatever the table ended up
+    // saying. So the store is asked too — running, suspended and down all carry
+    // a manifest — and either of them declaring the name is a refusal.
+    //
+    // What is deliberately not asked is the manifest of a build that has been
+    // built and not yet deployed. No container carries those values, and a
+    // deploy that then finds the secret missing stages the app suspended and
+    // rolls it back onto what it was running: a bad minute, rather than a
+    // running app quietly losing the credential it cannot restart without.
+    //
+    // A manifest this spaceport cannot parse is treated as declaring nothing,
+    // which is the wrong way round from the check above and is deliberate:
+    // there is no version of this where a document nobody can read makes a
+    // value undeletable forever.
+    let store = applier.store();
+    let declared = [
+        record
+            .as_ref()
+            .and_then(|record| AppManifest::parse(&record.manifest).ok()),
+        store.get(&id).map(|app| app.manifest.clone()),
+        store.suspended(&id).map(|app| app.manifest),
+        store.downed(&id).map(|app| app.manifest),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|manifest| manifest.container.secrets.contains(&name));
+    if declared {
+        return refuse(
+            StatusCode::CONFLICT,
+            &format!(
+                "app `{id}` declares the secret `{name}` in its manifest, so spaceport will not delete it — the app is running on it and would not start again without it\n  take `{name}` out of the manifest, apply that, and delete the value then"
+            ),
+        );
+    }
+
+    match applier.secrets().delete(&id, &name).await {
+        Ok(true) => (
+            StatusCode::OK,
+            format!(
+                "the secret `{name}` of app `{id}` is deleted\n  nothing was restarted — its manifest does not declare it, so nothing was reading it\n"
+            ),
+        )
+            .into_response(),
+        // The difference between having removed it and having spelled it wrong,
+        // which is the one thing an operator deleting a secret wants to know.
+        Ok(false) => refuse(
+            StatusCode::NOT_FOUND,
+            &format!(
+                "app `{id}` has no secret named `{name}` — `spaceport apps secret list {id}` says which it has"
+            ),
+        ),
+        Err(error) => refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not delete the secret `{name}` of app `{id}`: {error:#}"),
+        ),
+    }
+}
+
+/// The app and the secret a request is about, or the refusal that says which of
+/// the two was not a name.
+fn about(id: &str, name: &str) -> Result<(AppId, VarName), Box<Response>> {
+    let refusal =
+        |error: anyhow::Error| Box::new(refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")));
+
+    let id: AppId = id.parse().map_err(refusal)?;
+    let name: VarName = name.parse().map_err(refusal)?;
+
+    Ok((id, name))
+}
+
+/// Whether spaceport has heard of this app at all.
+///
+/// The same three places [`show`] looks, and for its reason: an app exists here
+/// as a record, as something in the routing table, or as a tracking that took
+/// the name before any manifest was applied under it. Setting a secret before
+/// the manifest arrives is the ordinary order — an app whose first deploy needs
+/// a database password needs it set beforehand — so all three count.
+async fn known(instance: &Instance, id: &AppId, recorded: Option<&AppRecord>) -> bool {
+    if recorded.is_some() {
+        return true;
+    }
+
+    let store = instance.applier.store();
+
+    store.get(id).is_some()
+        || store.suspended(id).is_some()
+        || store.downed(id).is_some()
+        || tracked(instance, id).await.is_some()
+}
+
+/// What a `set` did, as the JSON the CLI turns into a sentence.
+fn answered(set: &SecretSet) -> Response {
+    match serde_json::to_vec(set) {
+        Ok(body) => (
+            StatusCode::OK,
+            [(http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        // Nothing in here can fail to serialise — it is a bool, a tag and a
+        // list of names — and if one ever does, the operator has just changed
+        // a secret and should hear that something went wrong.
+        Err(error) => {
+            warn!(%error, "could not serialise what setting a secret did");
+            refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not say what setting the secret did: {error}"),
+            )
         }
     }
 }
@@ -2704,7 +3318,7 @@ fn refuse(status: StatusCode, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, AppRepository, AppStore};
+    use crate::app::{App, AppRepository, AppStore, SecretRepository};
     use crate::connections::github::api::testing::{FakeGitHub, HEAD};
     use crate::events::Level;
     use crate::runtime::{Container, ContainerId, ContainerRuntime, Managed};
@@ -2713,33 +3327,70 @@ mod tests {
     use axum::body::Body;
     use http::Request;
     use http_body_util::BodyExt;
+    use std::collections::{BTreeMap, HashMap};
     use std::net::SocketAddr;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
+    use tracing_subscriber::layer::SubscriberExt as _;
 
     /// Every app it starts ends up at the same address, which nothing is
     /// listening on unless a test says otherwise.
     struct OneContainer {
         upstream: SocketAddr,
+        /// How many containers it has been asked to build.
+        ///
+        /// The one thing a fake runtime can say that the store cannot: every
+        /// container it makes has the same id, so "was this app given a fresh
+        /// container?" is not a question the routing table answers. Shared
+        /// rather than owned, so a test can still read it after the runtime has
+        /// gone into the applier.
+        launches: Arc<AtomicUsize>,
+        /// The environment the last container of each app was launched with,
+        /// rendered as the engine would see it — the one place a secret's value
+        /// is supposed to appear, and the only place a test can check that a
+        /// value set over HTTP reached the process that was going to read it.
+        environments: Arc<Mutex<HashMap<AppId, BTreeMap<VarName, String>>>>,
+        /// The containers it has been asked to remove, so that a test can tell
+        /// an app that stopped being routed to from one whose container really
+        /// went away with it.
+        removed: Arc<Mutex<Vec<ContainerId>>>,
     }
 
     impl Default for OneContainer {
         fn default() -> Self {
             Self {
                 upstream: SocketAddr::from(([127, 0, 0, 1], 9000)),
+                launches: Arc::default(),
+                environments: Arc::default(),
+                removed: Arc::default(),
             }
         }
     }
 
     #[async_trait]
     impl ContainerRuntime for OneContainer {
-        async fn launch(&self, app: &AppId, _manifest: &AppManifest) -> Result<Container> {
+        async fn launch(&self, app: &AppId, manifest: &AppManifest) -> Result<Container> {
+            self.launches.fetch_add(1, Ordering::SeqCst);
+            // Rendered exactly where the real runtime renders it, and refused
+            // exactly where it refuses: a manifest whose placeholders nothing
+            // has filled in cannot become an environment. A fake that ignored
+            // the manifest would pass every secret test in this file even if
+            // interpolation did nothing at all.
+            self.environments
+                .lock()
+                .unwrap()
+                .insert(app.clone(), manifest.container.environment()?);
+
             Ok(Container {
                 id: ContainerId::new(format!("{app}0123456789abcdef")),
                 upstream: self.upstream,
             })
         }
 
-        async fn remove(&self, _id: &ContainerId) -> Result<()> {
+        async fn remove(&self, id: &ContainerId) -> Result<()> {
+            self.removed.lock().unwrap().push(id.clone());
+
             Ok(())
         }
 
@@ -2854,6 +3505,14 @@ container:
     }
 
     fn parts_configured(runtime: OneContainer, config: &str) -> Parts {
+        parts_with_state(runtime, config).0
+    }
+
+    /// The same, and the two things behind the router that no route exposes:
+    /// the state database, for a test that has to read what a route recorded,
+    /// and the applier, for one that has to put an app into a state no request
+    /// can ask for — a record that disagrees with the store, say.
+    fn parts_with_state(runtime: OneContainer, config: &str) -> (Parts, Db, Arc<Applier>) {
         let store = Arc::new(AppStore::new());
         let db = Db::in_memory().unwrap();
         let applier = Arc::new(Applier::new(
@@ -2861,6 +3520,7 @@ container:
             Arc::new(runtime),
             AppRepository::new(db.clone()),
             BuildRepository::new(db.clone()),
+            SecretRepository::new(db.clone()),
         ));
         let events = Arc::new(EventBus::new());
         let shutdown = CancellationToken::new();
@@ -2903,22 +3563,27 @@ container:
             nudge: Nudge::new(),
             building: building.clone(),
             deploying: deploying.clone(),
-            db,
+            db: db.clone(),
             certificates: None,
             reconciled: crate::app::reconcile::Report::default(),
         });
+        let applier = instance.applier.clone();
 
         (
-            store,
-            router(instance, events.clone(), shutdown.clone()),
-            events,
-            shutdown,
-            github,
-            connections,
-            tracking,
-            builds,
-            building,
-            deploying,
+            (
+                store,
+                router(instance, events.clone(), shutdown.clone()),
+                events,
+                shutdown,
+                github,
+                connections,
+                tracking,
+                builds,
+                building,
+                deploying,
+            ),
+            db,
+            applier,
         )
     }
 
@@ -3490,6 +4155,7 @@ container:
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (_, router) = store_and_router_on(OneContainer {
             upstream: listener.local_addr().unwrap(),
+            ..OneContainer::default()
         });
         put_app(&router, "hello", MANIFEST).await;
 
@@ -5616,5 +6282,572 @@ container:
 
         let app: Arc<App> = store.get(&"hello".parse().unwrap()).unwrap();
         assert_eq!(store.routes().serving("alpha.test").unwrap().id, app.id);
+    }
+
+    /// An app whose manifest declares a secret and interpolates it, which is
+    /// the app every test below is about. Applying it before the value is set
+    /// stages it suspended — that is the state a `set` is there to end.
+    const NEEDS_SECRET: &str = "schema_version: 1
+source:
+  type: image
+  image: strm/helloworld-http:latest
+routing:
+  hosts: [alpha.test]
+container:
+  secrets: [DB_PASSWORD]
+  env:
+    DATABASE_URL: \"postgres://user:{{DB_PASSWORD}}@db/app\"
+  health:
+    readiness:
+      type: none
+";
+
+    /// The same, waiting on two values rather than one.
+    const NEEDS_TWO: &str = "schema_version: 1
+source:
+  type: image
+  image: strm/helloworld-http:latest
+routing:
+  hosts: [alpha.test]
+container:
+  secrets: [DB_PASSWORD, API_KEY]
+  env:
+    DATABASE_URL: \"postgres://user:{{DB_PASSWORD}}@db/app\"
+    TOKEN: \"{{API_KEY}}\"
+  health:
+    readiness:
+      type: none
+";
+
+    fn app_id(id: &str) -> AppId {
+        id.parse().expect("a test names an app it can name")
+    }
+
+    fn var(name: &str) -> VarName {
+        name.parse().expect("a test names a variable it can name")
+    }
+
+    async fn get_secrets(router: &Router, id: &str, query: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .uri(format!("/apps/{id}/secrets{query}"))
+            .body(Body::empty())
+            .unwrap();
+
+        call(router, request).await
+    }
+
+    async fn put_secret(
+        router: &Router,
+        id: &str,
+        name: &str,
+        value: &str,
+    ) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/apps/{id}/secrets/{name}"))
+            .body(Body::from(value.to_owned()))
+            .unwrap();
+
+        call(router, request).await
+    }
+
+    async fn delete_secret_of(router: &Router, id: &str, name: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/apps/{id}/secrets/{name}"))
+            .body(Body::empty())
+            .unwrap();
+
+        call(router, request).await
+    }
+
+    /// What a `PUT` of a secret answered — JSON, where its neighbours are prose,
+    /// because the CLI decides which sentence this becomes.
+    fn outcome(body: &str) -> SecretSet {
+        serde_json::from_str(body).expect("setting a secret answers with what it did")
+    }
+
+    /// The value the app's container would actually be given, read off the
+    /// manifest the routing table is holding.
+    ///
+    /// The only way a test can see the whole path a value takes: it went up as
+    /// a request body, through the store, and back out of the resolution the
+    /// container was rendered from.
+    fn carried(store: &AppStore, id: &str, name: &str) -> Secret {
+        store
+            .get(&app_id(id))
+            .expect("the app is running")
+            .manifest
+            .container
+            .resolved[&var(name)]
+            .value
+            .clone()
+    }
+
+    /// The point of the whole feature: an app that could not start because
+    /// nobody had set its password starts the moment somebody does, without the
+    /// operator having to know that `spaceport apps resume` is the second half
+    /// of the job.
+    #[tokio::test]
+    async fn setting_the_last_secret_an_app_is_missing_brings_it_up() {
+        let runtime = OneContainer::default();
+        let environments = runtime.environments.clone();
+        let (store, router, _, _, _, _, _, _, _, deploying) = parts_on(runtime);
+        let (applied, _) = put_app(&router, "hello", NEEDS_SECRET).await;
+        assert_eq!(applied, StatusCode::CONFLICT);
+        assert!(store.suspended(&app_id("hello")).is_some());
+        let woken = deploying.changed();
+
+        let (status, body) = put_secret(&router, "hello", "DB_PASSWORD", "hunter2").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(outcome(&body).outcome, SecretOutcome::Resumed);
+        assert!(outcome(&body).created);
+        assert!(store.suspended(&app_id("hello")).is_none());
+        assert!(store.routes().serving("alpha.test").is_some());
+        assert_eq!(
+            carried(&store, "hello", "DB_PASSWORD"),
+            Secret::new("hunter2")
+        );
+        // The whole path, end to end: the value went up as a request body and
+        // came out interpolated in the environment the engine was handed. Every
+        // other assertion here would hold even if `{{DB_PASSWORD}}` reached the
+        // container verbatim.
+        assert_eq!(
+            environments.lock().unwrap()[&app_id("hello")][&var("DATABASE_URL")],
+            "postgres://user:hunter2@db/app"
+        );
+        // An app that came back may have an image built during its suspension
+        // that nothing has run, exactly as a resume does.
+        assert!(woken.has_changed().unwrap());
+    }
+
+    /// A rotation script that re-sets what it set yesterday, or an operator who
+    /// runs the same command twice after losing a terminal, must not restart
+    /// production for it. This is the reason the store answers with three
+    /// states rather than two.
+    #[tokio::test]
+    async fn setting_a_secret_to_the_value_it_already_has_replaces_nothing() {
+        let runtime = OneContainer::default();
+        let launches = runtime.launches.clone();
+        let (store, router, _, _, _, _, _, _, _, _) = parts_on(runtime);
+        put_app(&router, "hello", NEEDS_SECRET).await;
+        put_secret(&router, "hello", "DB_PASSWORD", "hunter2").await;
+        let before = launches.load(Ordering::SeqCst);
+
+        let (status, body) = put_secret(&router, "hello", "DB_PASSWORD", "hunter2").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(outcome(&body).outcome, SecretOutcome::Unchanged);
+        assert!(!outcome(&body).created);
+        assert_eq!(launches.load(Ordering::SeqCst), before);
+        assert!(store.routes().serving("alpha.test").is_some());
+    }
+
+    /// And the other half. A value that really did change only reaches the app
+    /// through a new container: the old one has the old value baked into the
+    /// environment it was started with, and no amount of updating a row changes
+    /// a process that is already running.
+    #[tokio::test]
+    async fn setting_a_secret_on_a_running_app_replaces_its_container() {
+        let runtime = OneContainer::default();
+        let launches = runtime.launches.clone();
+        let (store, router, _, _, _, _, _, _, _, _) = parts_on(runtime);
+        put_app(&router, "hello", NEEDS_SECRET).await;
+        put_secret(&router, "hello", "DB_PASSWORD", "hunter2").await;
+        let before = launches.load(Ordering::SeqCst);
+
+        let (status, body) = put_secret(&router, "hello", "DB_PASSWORD", "hunter3").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(outcome(&body).outcome, SecretOutcome::Redeployed);
+        assert!(!outcome(&body).created);
+        assert_eq!(launches.load(Ordering::SeqCst), before + 1);
+        assert_eq!(
+            carried(&store, "hello", "DB_PASSWORD"),
+            Secret::new("hunter3")
+        );
+    }
+
+    /// The record and the store can disagree, and only one of them knows what
+    /// is serving traffic. Both `suspend` and `resume` warn and carry on when
+    /// they cannot write the flag, so a running app whose record says
+    /// "suspended" is a state this spaceport reaches on its own — and reading
+    /// the record first would answer 200 to a rotation while leaving the app
+    /// serving the credential that was rotated away, with nothing else coming
+    /// to notice.
+    #[tokio::test]
+    async fn redeploys_a_running_app_whose_record_says_it_is_suspended() {
+        let runtime = OneContainer::default();
+        let launches = runtime.launches.clone();
+        let ((store, router, _, _, _, _, _, _, _, _), _, applier) =
+            parts_with_state(runtime, CONFIG);
+        put_app(&router, "hello", NEEDS_SECRET).await;
+        put_secret(&router, "hello", "DB_PASSWORD", "hunter2").await;
+        // Exactly what a failed `set_suspended` leaves behind.
+        applier
+            .repository()
+            .set_suspended(&app_id("hello"), true)
+            .await
+            .unwrap();
+        let before = launches.load(Ordering::SeqCst);
+
+        let (status, body) = put_secret(&router, "hello", "DB_PASSWORD", "hunter3").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(outcome(&body).outcome, SecretOutcome::Redeployed);
+        assert_eq!(launches.load(Ordering::SeqCst), before + 1);
+        assert_eq!(
+            carried(&store, "hello", "DB_PASSWORD"),
+            Secret::new("hunter3")
+        );
+    }
+
+    /// An app that is down has no container to replace, so saying its container
+    /// was replaced would describe something that did not happen — and the
+    /// value did put it back up, which is the part the operator wants.
+    #[tokio::test]
+    async fn setting_a_secret_on_an_app_that_is_down_starts_it() {
+        let (store, router, _, _, _, _, _, _, _, _) = parts_on(OneContainer::default());
+        put_app(&router, "hello", NEEDS_SECRET).await;
+        put_secret(&router, "hello", "DB_PASSWORD", "hunter2").await;
+        store.take_down(&app_id("hello"), "its container went away");
+
+        let (status, body) = put_secret(&router, "hello", "DB_PASSWORD", "hunter3").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(outcome(&body).outcome, SecretOutcome::Started);
+        assert!(store.get(&app_id("hello")).is_some());
+        assert_eq!(
+            carried(&store, "hello", "DB_PASSWORD"),
+            Secret::new("hunter3")
+        );
+    }
+
+    /// Rotating a password is not applying an app. The redeploy behind it goes
+    /// through the same call an apply does, which records the app as applied
+    /// now — so `apps show` would tell an operator their app was applied at
+    /// four in the morning by the cron job that rotates its credentials.
+    #[tokio::test]
+    async fn rotating_a_secret_does_not_restate_when_the_app_was_applied() {
+        let ((_, router, _, _, _, _, _, _, _, _), db, _) =
+            parts_with_state(OneContainer::default(), CONFIG);
+        put_app(&router, "hello", NEEDS_SECRET).await;
+        put_secret(&router, "hello", "DB_PASSWORD", "hunter2").await;
+        // Dated in the past rather than read back, so that the assertion cannot
+        // pass by two writes landing within the same second.
+        let repository = AppRepository::new(db.clone());
+        let record = repository
+            .recorded(&app_id("hello"))
+            .await
+            .unwrap()
+            .unwrap();
+        const APPLIED: &str = "1999-01-01T00:00:00Z";
+        repository
+            .put_back(&AppRecord {
+                applied_at: APPLIED.to_owned(),
+                ..record
+            })
+            .await
+            .unwrap();
+
+        put_secret(&router, "hello", "DB_PASSWORD", "hunter3").await;
+
+        let record = repository
+            .recorded(&app_id("hello"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.applied_at, APPLIED);
+        assert!(!record.suspended, "{record:?}");
+    }
+
+    /// Setting the secrets before applying the manifest that needs them is the
+    /// right order to do it in — an app whose first deploy talks to a database
+    /// needs the password beforehand — so a spaceport that refused would be
+    /// refusing the ordinary case.
+    #[tokio::test]
+    async fn setting_a_secret_for_an_app_that_is_not_applied_stores_it_and_deploys_nothing() {
+        let runtime = OneContainer::default();
+        let launches = runtime.launches.clone();
+        let (store, router, _, _, _, _, tracking, _, _, _) = parts_on(runtime);
+        tracking
+            .record(
+                &Tracking {
+                    app: app_id("hello"),
+                    github_app_id: 42,
+                    repository: "an-organisation/site".to_owned(),
+                    branch: "main".to_owned(),
+                    manifest_path: "spaceport.yaml".to_owned(),
+                    tracked_at: String::new(),
+                    revision: None,
+                    revision_seen_at: None,
+                    automatic: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (status, body) = put_secret(&router, "hello", "DB_PASSWORD", "hunter2").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(outcome(&body).outcome, SecretOutcome::Stored);
+        assert!(outcome(&body).created);
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        assert!(store.get(&app_id("hello")).is_none());
+        assert_eq!(get_secrets(&router, "hello", "").await.1, "DB_PASSWORD\n");
+    }
+
+    /// The app is not up yet and this did not put it up, so what an operator
+    /// needs is the list of what is still missing — which is also the answer
+    /// that catches a name typed wrong, since the secret they meant to set is
+    /// on it.
+    #[tokio::test]
+    async fn setting_one_of_the_secrets_an_app_needs_says_which_are_left() {
+        let (store, router) = store_and_router();
+        put_app(&router, "hello", NEEDS_TWO).await;
+
+        let (status, body) = put_secret(&router, "hello", "DB_PASSWORD", "hunter2").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            outcome(&body).outcome,
+            SecretOutcome::Missing {
+                secrets: vec!["API_KEY".to_owned()],
+            }
+        );
+        assert!(store.suspended(&app_id("hello")).is_some());
+        assert!(store.routes().serving("alpha.test").is_none());
+    }
+
+    /// Deleting a secret an app declares would arm a trap: the app carries on
+    /// serving from the container it already has, and the next thing that
+    /// restarts it — a redeploy, a crash, a reboot at four in the morning —
+    /// finds a manifest it cannot run. So the manifest goes first, and until it
+    /// does the value stays exactly where it was.
+    #[tokio::test]
+    async fn refuses_to_delete_a_secret_the_manifest_declares() {
+        let (store, router) = store_and_router();
+        put_app(&router, "hello", NEEDS_SECRET).await;
+        put_secret(&router, "hello", "DB_PASSWORD", "hunter2").await;
+
+        let (status, body) = delete_secret_of(&router, "hello", "DB_PASSWORD").await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body.contains("app `hello` declares the secret `DB_PASSWORD`"),
+            "{body}"
+        );
+        assert_eq!(get_secrets(&router, "hello", "").await.1, "DB_PASSWORD\n");
+        assert_eq!(
+            carried(&store, "hello", "DB_PASSWORD"),
+            Secret::new("hunter2")
+        );
+    }
+
+    /// The record is not the only place a manifest lives, and it is the one
+    /// that can be missing: an apply whose record could not be written warns
+    /// and carries on, leaving an app that is running on a manifest no row
+    /// mentions. Consulting only the record there would hand out the deletion
+    /// that takes a running app's credential away.
+    #[tokio::test]
+    async fn refuses_to_delete_a_secret_only_the_store_knows_is_declared() {
+        let ((store, router, _, _, _, _, _, _, _, _), _, applier) =
+            parts_with_state(OneContainer::default(), CONFIG);
+        put_app(&router, "hello", NEEDS_SECRET).await;
+        put_secret(&router, "hello", "DB_PASSWORD", "hunter2").await;
+        // Exactly what an apply that could not write its row leaves behind.
+        applier.repository().forget(&app_id("hello")).await.unwrap();
+        assert!(store.get(&app_id("hello")).is_some());
+
+        let (status, body) = delete_secret_of(&router, "hello", "DB_PASSWORD").await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body.contains("app `hello` declares the secret `DB_PASSWORD`"),
+            "{body}"
+        );
+        assert_eq!(get_secrets(&router, "hello", "").await.1, "DB_PASSWORD\n");
+    }
+
+    /// Adding a secret to the manifest of an app that is already up is the
+    /// ordinary way a secret arrives, and it is not free: staging the new
+    /// manifest takes the container built from the old one away, so the app
+    /// stops serving there and then. That is intended — the alternative is an
+    /// app running a manifest nobody applied — but it has to be said out loud,
+    /// because an operator reading "it stays suspended" would think their
+    /// running app was untouched.
+    #[tokio::test]
+    async fn re_applying_a_manifest_with_a_secret_nobody_has_set_takes_a_running_app_down() {
+        let runtime = OneContainer::default();
+        let removed = runtime.removed.clone();
+        let (store, router, _, _, _, _, _, _, _, _) = parts_on(runtime);
+        let (applied, _) = put_app(&router, "hello", MANIFEST).await;
+        assert_eq!(applied, StatusCode::OK);
+        let container = store.get(&app_id("hello")).unwrap().container.clone();
+
+        let (status, body) = put_app(&router, "hello", NEEDS_SECRET).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.contains("`DB_PASSWORD`"), "{body}");
+        assert!(body.contains("not serving"), "{body}");
+        assert!(store.get(&app_id("hello")).is_none());
+        assert!(store.suspended(&app_id("hello")).is_some());
+        assert!(store.routes().serving("alpha.test").is_none());
+        assert!(removed.lock().unwrap().contains(&container), "{container}");
+    }
+
+    /// The leftovers of an env line somebody deleted, or a name typed wrong
+    /// once. Nothing reads it, so removing it is a row and not a restart.
+    #[tokio::test]
+    async fn deletes_a_secret_the_manifest_does_not_declare() {
+        let runtime = OneContainer::default();
+        let launches = runtime.launches.clone();
+        let (_, router, _, _, _, _, _, _, _, _) = parts_on(runtime);
+        put_app(&router, "hello", MANIFEST).await;
+        put_secret(&router, "hello", "LEFTOVER", "whatever").await;
+        let before = launches.load(Ordering::SeqCst);
+
+        let (status, body) = delete_secret_of(&router, "hello", "LEFTOVER").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("is deleted"), "{body}");
+        assert_eq!(get_secrets(&router, "hello", "").await.1, "");
+        assert_eq!(launches.load(Ordering::SeqCst), before);
+        assert_eq!(
+            delete_secret_of(&router, "hello", "LEFTOVER").await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// Names, filtered as `spaceport apps list` filters apps, and no value
+    /// anywhere near the answer — the query behind this one does not read the
+    /// column values live in.
+    #[tokio::test]
+    async fn lists_the_names_of_an_apps_secrets_and_never_a_value() {
+        let (_, router) = store_and_router();
+        put_app(&router, "hello", MANIFEST).await;
+        put_secret(&router, "hello", "DB_PASSWORD", "hunter2").await;
+        put_secret(&router, "hello", "DB_HOST", "db.internal").await;
+        put_secret(&router, "hello", "API_KEY", "sk-live-9").await;
+
+        let (status, all) = get_secrets(&router, "hello", "").await;
+        let (_, matching) = get_secrets(&router, "hello", "?pattern=DB_*").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(all, "API_KEY\nDB_HOST\nDB_PASSWORD\n");
+        assert_eq!(matching, "DB_HOST\nDB_PASSWORD\n");
+        for body in [&all, &matching] {
+            assert!(!body.contains("hunter2"), "{body}");
+            assert!(!body.contains("db.internal"), "{body}");
+            assert!(!body.contains("sk-live-9"), "{body}");
+        }
+    }
+
+    /// The one promise the whole feature rests on. A value goes up in a request
+    /// body and must not come back out anywhere: not in what the route answers,
+    /// not in what the route logs, and not in what any of the routes around it
+    /// say afterwards. Asserted rather than reasoned about, because every one of
+    /// those is one careless `{value}` away.
+    ///
+    /// What it does *not* cover, because nothing here can: a subscriber
+    /// installed with `set_default` is this thread's, and a value logged from a
+    /// task somebody spawns later would go past it unseen. The alternative is a
+    /// global default, which is one per process and would be this test
+    /// collecting every other test's logging for the rest of the run. Nothing
+    /// on the routes below spawns anything today — the applier does its work in
+    /// the caller's task — so the net covers what it is aimed at, and the day
+    /// one of them spawns, this test will not notice.
+    #[tokio::test]
+    async fn never_says_a_secret_value_in_a_response_or_a_log() {
+        const VALUE: &str = "s3cr3t-nobody-should-see";
+        let (_, router, _, _, _, _, _, _, _, _) = parts_on(OneContainer::default());
+        put_app(&router, "hello", NEEDS_SECRET).await;
+
+        // Installed for this thread only, and around the request itself, so
+        // what it collects is what this route logged.
+        let bus = Arc::new(EventBus::new());
+        let (_, mut logged) = bus.watch(0, &EventFilter::default());
+        let bodies = {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(crate::events::layer(bus.clone())),
+            );
+
+            let (status, set) = put_secret(&router, "hello", "DB_PASSWORD", VALUE).await;
+            assert_eq!(status, StatusCode::OK);
+
+            let (_, again) = put_secret(&router, "hello", "DB_PASSWORD", VALUE).await;
+            let (_, shown) = show_app(&router, "hello", "").await;
+            let (_, listed) = get_secrets(&router, "hello", "").await;
+            let (_, refused) = delete_secret_of(&router, "hello", "DB_PASSWORD").await;
+
+            [set, again, shown, listed, refused]
+        };
+
+        for body in &bodies {
+            assert!(!body.contains(VALUE), "{body}");
+        }
+        while let Ok(event) = logged.try_recv() {
+            assert!(!event.message.contains(VALUE), "{}", event.message);
+            for (field, value) in &event.fields {
+                assert!(!value.contains(VALUE), "{field} = {value}");
+            }
+        }
+    }
+
+    /// A typo in an app id must not quietly store a value under a name nothing
+    /// will ever read — where it would sit until somebody applied an app that
+    /// happened to be called that.
+    #[tokio::test]
+    async fn setting_a_secret_for_an_app_nobody_has_heard_of_is_a_404() {
+        let (_, router) = store_and_router();
+
+        let (status, body) = put_secret(&router, "ghost", "DB_PASSWORD", "hunter2").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("no app named `ghost`"), "{body}");
+        assert_eq!(
+            delete_secret_of(&router, "ghost", "DB_PASSWORD").await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(get_secrets(&router, "ghost", "").await.1, "");
+    }
+
+    /// A value is bytes somebody generated, and an environment variable is not:
+    /// a value that cannot be one has to be refused here rather than at the
+    /// moment the container will not start.
+    #[tokio::test]
+    async fn refuses_a_value_that_is_not_text() {
+        let (_, router) = store_and_router();
+        put_app(&router, "hello", MANIFEST).await;
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/apps/hello/secrets/DB_PASSWORD")
+            .body(Body::from(vec![0xff, 0xfe]))
+            .unwrap();
+
+        let (status, body) = call(&router, request).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("not valid utf-8"), "{body}");
+        assert_eq!(get_secrets(&router, "hello", "").await.1, "");
+    }
+
+    /// The question an operator asks a suspended app: why. The manifest says
+    /// what it needs and the store says what it has, and only the two together
+    /// name the value that is missing.
+    #[tokio::test]
+    async fn says_which_of_an_apps_secrets_are_set() {
+        let (_, router) = store_and_router();
+        put_app(&router, "hello", NEEDS_TWO).await;
+        put_secret(&router, "hello", "DB_PASSWORD", "hunter2").await;
+
+        let (status, body) = show_app(&router, "hello", "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("DB_PASSWORD (set)"), "{body}");
+        assert!(body.contains("API_KEY (not set"), "{body}");
+        assert!(!body.contains("hunter2"), "{body}");
     }
 }

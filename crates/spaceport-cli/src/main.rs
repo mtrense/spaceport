@@ -1,5 +1,6 @@
 mod render;
 
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,7 +11,8 @@ use render::Colour;
 use spaceport_core::acme::account::{AcmeCa, Transport};
 use spaceport_core::acme::{CertificateRepository, Certificates, Challenges};
 use spaceport_core::app::{
-    self, AppId, AppRepository, AppStore, Applier, DataDir, Pattern, reconcile, supervise,
+    self, AppId, AppRepository, AppStore, Applier, DataDir, Pattern, SecretRepository, VarName,
+    reconcile, supervise,
 };
 use spaceport_core::build;
 use spaceport_core::build::dir::BuildDir;
@@ -19,8 +21,11 @@ use spaceport_core::config::TlsProvider;
 use spaceport_core::connections::github::{self, ConnectionRepository};
 use spaceport_core::events::{self, Category, Event, EventBus, Level};
 use spaceport_core::operator::client::Watch;
-use spaceport_core::operator::{DEFAULT_OPERATOR_ENDPOINT, client, server};
+use spaceport_core::operator::{
+    DEFAULT_OPERATOR_ENDPOINT, SecretOutcome, SecretSet, client, server,
+};
 use spaceport_core::runtime::DockerRuntime;
+use spaceport_core::secret::Secret;
 use spaceport_core::setup;
 use spaceport_core::state::{self, Db, StateLock};
 use spaceport_core::status::Instance;
@@ -144,6 +149,86 @@ enum AppsCommand {
     Resume(ResumeArgs),
     /// Stop an app and remove it.
     Destroy(DestroyArgs),
+    /// Set, list and remove the values an app's manifest names and never
+    /// contains.
+    ///
+    /// A manifest declares which secrets its container needs and interpolates
+    /// them into its environment; what they are is set here, because a manifest
+    /// is a document that gets committed to a repository.
+    Secret(SecretArgs),
+}
+
+#[derive(Debug, Args)]
+struct SecretArgs {
+    #[command(subcommand)]
+    command: SecretCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SecretCommand {
+    /// List the names of the secrets set for an app.
+    ///
+    /// Names only. There is no way to read a value back out of spaceport, on
+    /// purpose: an operator who has lost one sets a new one.
+    List(SecretListArgs),
+    /// Set one of an app's secrets, and bring the app up to date with it.
+    ///
+    /// An app that was suspended waiting for this value starts serving; an app
+    /// that was already running has its container replaced with one carrying
+    /// the new value. Setting a secret to the value it already has does
+    /// neither.
+    Set(SecretSetArgs),
+    /// Remove one of an app's secrets.
+    ///
+    /// Refused while the app's manifest still declares the name — the app could
+    /// not be started again without it, so the manifest goes first.
+    Delete(SecretDeleteArgs),
+}
+
+#[derive(Debug, Args)]
+struct SecretListArgs {
+    /// The app whose secrets to list.
+    app_id: AppId,
+
+    /// Only list secrets whose name matches, where `*` stands for any
+    /// characters.
+    pattern: Option<Pattern>,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
+struct SecretSetArgs {
+    /// The app the secret belongs to.
+    app_id: AppId,
+
+    /// The environment variable the app reads the value as.
+    name: VarName,
+
+    /// The value, or `-` to read it from standard input.
+    ///
+    /// `-` is what to use for anything that matters. A value typed on the
+    /// command line is written to the shell's history file, which outlives the
+    /// terminal and is rarely treated as a file holding credentials, and it is
+    /// visible in `ps` to every user on the host for as long as the command
+    /// runs. Neither is somewhere a database password belongs.
+    value: String,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
+struct SecretDeleteArgs {
+    /// The app the secret belongs to.
+    app_id: AppId,
+
+    /// The name of the secret to remove.
+    name: VarName,
+
+    #[command(flatten)]
+    server: ServerArgs,
 }
 
 #[derive(Debug, Subcommand)]
@@ -534,6 +619,11 @@ async fn main() -> Result<()> {
             AppsCommand::Suspend(args) => suspend(args).await,
             AppsCommand::Resume(args) => resume(args).await,
             AppsCommand::Destroy(args) => destroy(args).await,
+            AppsCommand::Secret(args) => match args.command {
+                SecretCommand::List(args) => secret_list(args).await,
+                SecretCommand::Set(args) => secret_set(args).await,
+                SecretCommand::Delete(args) => secret_delete(args).await,
+            },
         },
         Command::Connect { command } => match command {
             ConnectCommand::Github(args) => connect_github(args).await,
@@ -631,6 +721,7 @@ async fn run(args: RunArgs) -> Result<()> {
         runtime.clone(),
         AppRepository::new(db.clone()),
         BuildRepository::new(db.clone()),
+        SecretRepository::new(db.clone()),
     ));
 
     // Ahead of the listeners, so a restart does not answer 404 for apps it is
@@ -949,6 +1040,134 @@ async fn resume(args: ResumeArgs) -> Result<()> {
     Ok(())
 }
 
+/// Print the names of an app's secrets, one per line.
+///
+/// Nothing at all when the app has none, where `spaceport apps list` says "no
+/// apps are running". They differ because their readers do: an app table is
+/// read by a person, and this is the one listing meant to be read by a loop —
+/// `for name in $(spaceport apps secret list web)` — where a sentence would be
+/// three secrets named `no`, `secrets` and `are`. Still an exit code of 0: an
+/// app with no secrets is an answer, not a failure.
+async fn secret_list(args: SecretListArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::secrets(&args.server.server, &args.app_id, args.pattern.as_ref()).await?
+    );
+
+    Ok(())
+}
+
+async fn secret_set(args: SecretSetArgs) -> Result<()> {
+    let value = value_of(&args.value)?;
+    let set = client::set_secret(&args.server.server, &args.app_id, &args.name, &value).await?;
+
+    println!("{}", set_line(&args.app_id, &args.name, &set));
+
+    Ok(())
+}
+
+async fn secret_delete(args: SecretDeleteArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::delete_secret(&args.server.server, &args.app_id, &args.name).await?
+    );
+
+    Ok(())
+}
+
+/// What the operator wants stored: the argument itself, or whatever was piped
+/// in when they said `-`.
+///
+/// The only thing in this CLI that reads standard input, and it exists so that
+/// a value never has to be typed. An argument on the command line is written to
+/// the shell's history file, which outlives the terminal, and it is visible in
+/// `ps` to every user on the host for as long as the command runs — so
+/// `spaceport apps secret set web DB_PASSWORD hunter2` leaks the password twice
+/// before it has finished running.
+fn value_of(value: &str) -> Result<Secret> {
+    if value != STDIN {
+        return Ok(Secret::new(value.to_owned()));
+    }
+
+    let mut piped = String::new();
+    std::io::stdin()
+        .read_to_string(&mut piped)
+        .context("reading the secret's value from standard input")?;
+
+    read(piped)
+}
+
+/// The argument that means "the value is on standard input".
+const STDIN: &str = "-";
+
+/// What was piped in, as the value it is meant to be.
+///
+/// Exactly one trailing newline is taken off and nothing else is touched.
+/// `echo hunter2 |` and `printf hunter2 |` have to set the same secret, and the
+/// newline `echo` adds is the shell's rather than the operator's. Every other
+/// byte stays: leading spaces, tabs, a second trailing newline and a `\r` are
+/// all bytes a generated key can genuinely end in, and a token stored without
+/// one it arrived with fails to authenticate for a reason nobody can see by
+/// looking.
+///
+/// Nothing at all is a refusal rather than an empty secret. A pipe that
+/// produced nothing is a command that failed further up the line, and storing
+/// the empty string would answer that by starting the app with an empty
+/// password.
+fn read(mut piped: String) -> Result<Secret> {
+    if piped.ends_with('\n') {
+        piped.pop();
+    }
+
+    if piped.is_empty() {
+        anyhow::bail!(
+            "nothing arrived on standard input — `-` reads the value from there, and a secret with no value is not one"
+        );
+    }
+
+    Ok(Secret::new(piped))
+}
+
+/// What setting a secret did, as one line for the person who typed it.
+///
+/// Composed here rather than by the spaceport because the outcomes differ in
+/// what the operator does next — nothing, set the other secrets, or go and look
+/// at an app that should now be up — and because this side is the one that
+/// knows a person is reading. Never a value: there is not one in [`SecretSet`]
+/// to print.
+fn set_line(id: &AppId, name: &VarName, set: &SecretSet) -> String {
+    let what = match set.created {
+        true => "set",
+        false => "replaced",
+    };
+
+    match &set.outcome {
+        SecretOutcome::Unchanged => {
+            format!("secret `{name}` of app `{id}` already had that value — nothing was restarted")
+        }
+        SecretOutcome::Stored => format!(
+            "secret `{name}` {what} for app `{id}` — nothing here is waiting on it, so nothing was started"
+        ),
+        SecretOutcome::Missing { secrets } => format!(
+            "secret `{name}` {what} for app `{id}` — it is still waiting for {}",
+            secrets
+                .iter()
+                .map(|secret| format!("`{secret}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        SecretOutcome::Resumed => format!(
+            "secret `{name}` {what} for app `{id}` — it has every secret it declares, and is serving again"
+        ),
+        SecretOutcome::Redeployed => format!(
+            "secret `{name}` {what} for app `{id}` — its container was replaced with one carrying the new value"
+        ),
+        SecretOutcome::Started => format!(
+            "secret `{name}` {what} for app `{id}` — it was not running, and it has been started on the new value"
+        ),
+    }
+}
+
 /// Print what spaceport is doing until the operator has seen enough.
 ///
 /// Ends on ctrl-c, which is the only way it ends while spaceport is up — and
@@ -1149,4 +1368,124 @@ fn check_config(args: ConfigArgs) -> Result<()> {
 fn listeners(config: &Config) -> impl Iterator<Item = (&'static str, SocketAddr)> {
     let listen = &config.edge.listen;
     [("http", listen.http), ("https", listen.https)].into_iter()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `echo hunter2 | spaceport apps secret set …` is how a secret is set by
+    /// anybody who has read the help, and the newline `echo` adds is the
+    /// shell's rather than part of the password. A value stored with it would
+    /// be a password that fails to authenticate and looks identical to the one
+    /// that works everywhere it is printed.
+    #[test]
+    fn takes_the_newline_a_pipe_added_off_a_value() {
+        assert_eq!(read("hunter2\n".to_owned()).unwrap().expose(), "hunter2");
+    }
+
+    /// And exactly one of them. A key really can end in a blank line — a `.pem`
+    /// does — and trimming until there was nothing left to trim would quietly
+    /// store something the app cannot use.
+    #[test]
+    fn takes_only_one_newline_off_a_value() {
+        assert_eq!(read("a key\n\n".to_owned()).unwrap().expose(), "a key\n");
+    }
+
+    /// Nothing else is touched either. Every one of these is a byte somebody's
+    /// generated token can genuinely carry, and a value stored without one it
+    /// arrived with fails for a reason nobody can see by looking at it.
+    #[test]
+    fn keeps_every_other_byte_of_a_value() {
+        assert_eq!(
+            read("  spaced \tand\ttabbed\r\n".to_owned())
+                .unwrap()
+                .expose(),
+            "  spaced \tand\ttabbed\r",
+        );
+    }
+
+    /// A pipe that produced nothing is a command that failed further up the
+    /// line — `pass show db | spaceport apps secret set …` with the wrong
+    /// name — and storing the empty string would answer that by starting the
+    /// app with an empty password.
+    #[test]
+    fn refuses_a_value_that_is_not_there() {
+        assert!(read(String::new()).is_err());
+        assert!(read("\n".to_owned()).is_err());
+    }
+
+    /// The other half of the argument: a value that is not `-` is the value,
+    /// untouched, newline and all.
+    #[test]
+    fn takes_a_value_off_the_command_line_as_it_is() {
+        assert_eq!(value_of("hunter2").unwrap().expose(), "hunter2");
+    }
+
+    fn app() -> AppId {
+        "web".parse().unwrap()
+    }
+
+    fn name() -> VarName {
+        "DB_PASSWORD".parse().unwrap()
+    }
+
+    /// The outcomes an operator acts on differently have to read differently,
+    /// and none of them may name a value — which is why there is no value in
+    /// [`SecretSet`] to name.
+    #[test]
+    fn says_which_of_the_things_setting_a_secret_did() {
+        let line = |created, outcome| set_line(&app(), &name(), &SecretSet { created, outcome });
+
+        assert!(
+            line(false, SecretOutcome::Unchanged).contains("already had that value"),
+            "{}",
+            line(false, SecretOutcome::Unchanged),
+        );
+        assert!(line(true, SecretOutcome::Stored).contains("nothing here is waiting on it"));
+        assert!(
+            line(
+                true,
+                SecretOutcome::Missing {
+                    secrets: vec!["API_KEY".to_owned()],
+                },
+            )
+            .contains("`API_KEY`")
+        );
+        assert!(line(false, SecretOutcome::Resumed).contains("serving again"));
+        assert!(line(false, SecretOutcome::Redeployed).contains("container was replaced"));
+        // And the app that had no container to replace, which must not be told
+        // that one was.
+        let started = line(false, SecretOutcome::Started);
+        assert!(started.contains("it was not running"), "{started}");
+        assert!(!started.contains("replaced with"), "{started}");
+    }
+
+    /// Created and replaced are the two things an operator is told apart,
+    /// because one of them means they have just overwritten something.
+    #[test]
+    fn says_whether_a_secret_was_new() {
+        assert!(
+            set_line(
+                &app(),
+                &name(),
+                &SecretSet {
+                    created: true,
+                    outcome: SecretOutcome::Stored,
+                }
+            )
+            .contains("set for app")
+        );
+        assert!(
+            set_line(
+                &app(),
+                &name(),
+                &SecretSet {
+                    created: false,
+                    outcome: SecretOutcome::Stored,
+                }
+            )
+            .contains("replaced for app")
+        );
+    }
 }

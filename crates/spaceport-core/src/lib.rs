@@ -10,6 +10,7 @@ pub mod edge;
 pub mod events;
 pub mod operator;
 pub mod runtime;
+pub mod secret;
 pub mod setup;
 pub mod state;
 pub mod status;

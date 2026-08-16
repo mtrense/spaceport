@@ -302,6 +302,61 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE github_tracking ADD COLUMN automatic INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE app_builds ADD COLUMN deployed_at TEXT;
     ALTER TABLE app_builds ADD COLUMN deploy_reason TEXT;",
+    // 9 — the secrets an operator has set for an app, which its manifest names
+    // but never contains.
+    //
+    // Keyed by `(spaceport_app, name)`, because that pair is the identity of a
+    // secret: an app has one value for `DATABASE_URL`, and setting it again
+    // replaces the one that was there. `spaceport_app` is spaceport's own
+    // `AppId` and is spelled as step 5 spells it, so that nothing here can be
+    // confused with GitHub's numeric app id in the neighbouring tables.
+    //
+    // `value` is a plain column, exactly as `github_apps.client_secret` and
+    // `acme_accounts.credentials` are: the protection is a `0700` directory and
+    // a `0600` file. Encrypting it here would only move the question to where
+    // the key that decrypts it lives, and on a single host that key would end
+    // up in the same directory.
+    //
+    // `version` is what makes a container notice. A container's spec is
+    // fingerprinted to decide whether it has to be recreated, and the
+    // fingerprint must change when a secret's value changes — but putting the
+    // value, or a hash of it, into that fingerprint would mean the plaintext,
+    // or something an attacker can test guesses against, ends up in a container
+    // label that every `docker inspect` prints. A counter says "this is a
+    // different value from the one before" and says nothing else about it,
+    // which is the entire question the fingerprint has to answer. It starts at
+    // 1 so that a row which exists has a version, and only a write that
+    // actually changes the value moves it: setting a secret to what it already
+    // was must not restart the app.
+    //
+    // `app_secret_versions` is where that counter is actually kept, one row per
+    // app, and it exists because the counter cannot live in the rows it numbers:
+    // deleting a secret takes its row away, and a counter derived from what is
+    // left would hand the next value a number a container is already labelled
+    // with — which is a container running the credential that was rotated away,
+    // matching the app's spec and being adopted. It holds a number and an app
+    // id and never a value, so the destroy cascade leaves it alone: what it
+    // remembers is how many values an app has had, which is the one thing that
+    // must survive the values themselves.
+    //
+    // No foreign key to `apps(id)`, for the reason step 4 gives and one more.
+    // None of the per-app tables — `github_tracking`, `app_builds` — declares
+    // one, the destroy cascade is written by hand where the knowledge belongs,
+    // and a constraint would make setting a secret depend on the app already
+    // having been applied. Setting the secrets first and then applying the
+    // manifest that reads them is the ordinary way round, and the schema should
+    // not forbid it.
+    "CREATE TABLE app_secrets (
+        spaceport_app TEXT    NOT NULL,
+        name          TEXT    NOT NULL,
+        value         TEXT    NOT NULL,
+        version       INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY (spaceport_app, name)
+    ) STRICT;
+    CREATE TABLE app_secret_versions (
+        spaceport_app TEXT    NOT NULL PRIMARY KEY,
+        latest        INTEGER NOT NULL
+    ) STRICT;",
 ];
 
 /// The schema version this build writes.
@@ -589,6 +644,36 @@ mod tests {
                 )
                 .unwrap(),
             (None, None)
+        );
+    }
+
+    /// A secret that has just been set is at version 1, so that the fingerprint
+    /// of a container reading it has something to change away from.
+    #[test]
+    fn the_ninth_migration_starts_a_secret_at_version_one() {
+        let connection = empty();
+        migrate(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO app_secrets (spaceport_app, name, value)
+                 VALUES ('hello', 'DATABASE_URL', 'postgres://localhost')",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            columns(&connection, "app_secrets"),
+            ["spaceport_app", "name", "value", "version"]
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT version FROM app_secrets WHERE spaceport_app = 'hello'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
         );
     }
 
