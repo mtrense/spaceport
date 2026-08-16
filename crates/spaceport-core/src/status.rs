@@ -23,7 +23,10 @@ use time::OffsetDateTime;
 use crate::acme::{CertificateRepository, Certificates};
 use crate::app::reconcile::Report;
 use crate::app::{AppId, Applier, health};
-use crate::auth::{AuthLogRepository, EntitlementRepository, SessionRepository, UserRepository};
+use crate::auth::{
+    AuthLogRepository, EntitlementRepository, IdentityRepository, MappingRepository,
+    SessionRepository, UserRepository,
+};
 use crate::build::repository::BuildRepository;
 use crate::config::{Config, TlsProvider};
 use crate::connections::github::{self, ConnectionRepository, TrackingRepository};
@@ -111,6 +114,14 @@ pub struct Instance {
     /// becoming one. Beside the other three for the same reason: the socket's
     /// mint and drop must move the same rows the login page reads.
     pub sessions: Arc<SessionRepository>,
+    /// The SSO mapping rules that will turn IdP logins into entitlements.
+    /// Beside the entitlements because dropping a rule cascades into their
+    /// table, and the two must be moving the same rows in one transaction.
+    pub mappings: Arc<MappingRepository>,
+    /// Who those users are at their IdPs, and the attribute snapshot a
+    /// `mapping test` replays. Beside `mappings` because the two tables are
+    /// the two halves of one evaluation.
+    pub identities: Arc<IdentityRepository>,
     /// The Ed25519 key that signs app JWTs — the very signer the edge mints
     /// through and serves the JWKS from, because `auth key rotate` on this
     /// socket must retire the key the next request would otherwise sign with,
@@ -592,6 +603,8 @@ container:
             auth_log: Arc::new(AuthLogRepository::new(db.clone())),
             entitlements: Arc::new(EntitlementRepository::new(db.clone())),
             sessions: Arc::new(SessionRepository::new(db.clone())),
+            mappings: Arc::new(MappingRepository::new(db.clone())),
+            identities: Arc::new(IdentityRepository::new(db.clone())),
             signer: Arc::new(crate::auth::JwtSigner::new(db.clone())),
             db,
             certificates: None,

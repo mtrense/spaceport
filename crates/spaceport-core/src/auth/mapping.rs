@@ -1,0 +1,1336 @@
+//! SSO role mappings, and the IdP identities they will one day be evaluated
+//! against.
+//!
+//! A mapping is the rule the spec writes as `<role>[,<role>...]@<app-id> --via
+//! <idp> --when <attr>=<value> ...`: whoever arrives through that connection
+//! carrying attributes that satisfy *every* condition holds those roles at
+//! that app. The rules land in the store now, ahead of the OAuth flow that
+//! will apply them, because the operator commands that manage them — add,
+//! list, test, drop — are how an operator prepares the ground before the
+//! first SSO login ever happens, and because `entitlements.mapped_rule`
+//! already refuses revokes in the name of rules that must therefore exist.
+//!
+//! The identity half is the same story one table over: [`IdentityRepository`]
+//! stores who a user is at an IdP and the attribute snapshot their last login
+//! carried. Nothing writes a snapshot yet — the login flow is a later slice —
+//! and `mapping test` says so in as many words rather than pretending an
+//! empty answer is a real one.
+//!
+//! [`evaluate`] is the one piece both halves meet in, and it is deliberately a
+//! pure function: the login re-sync that lands later must apply exactly the
+//! judgement `mapping test` previews, and two implementations would be two
+//! opinions about who gets in.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::str::FromStr;
+
+use anyhow::{Context, Result, anyhow, bail};
+use rusqlite::{OptionalExtension, Transaction};
+use serde::{Deserialize, Serialize};
+use tracing::info;
+
+use super::log::{OPERATOR_ORIGIN, record_in};
+use super::{Role, UserId, uuid_v4};
+use crate::app::AppId;
+use crate::state::{Db, now};
+
+/// The attributes an IdP login asserts, as the store keeps them: attribute
+/// name to the list of values it holds.
+///
+/// Always a list, even for attributes that can only ever have one value — a
+/// login is one string, an org membership is many — so [`evaluate`] needs
+/// exactly one rule: a condition matches when the list contains its value. A
+/// `BTreeMap` rather than a hash map so a snapshot renders in one order
+/// however it was built, which is what lets `mapping test` print it.
+pub type Attributes = BTreeMap<String, Vec<String>>;
+
+/// One `--when` clause: an attribute name and the value it must hold.
+///
+/// The attribute name is IdP vocabulary and deliberately unvalidated beyond
+/// being non-empty — the spec is explicit that a typo silently never matches,
+/// and `mapping test` is the tool that exists to catch it. Serialised as it
+/// is, because the pair travels the wire and sits in the `conditions` column
+/// in the same JSON spelling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Condition {
+    pub attr: String,
+    pub value: String,
+}
+
+impl FromStr for Condition {
+    type Err = anyhow::Error;
+
+    /// The `<attr>=<value>` spelling. Split on the *first* `=` so a value may
+    /// itself carry one — a claim value is the IdP's string, not ours to
+    /// constrain — while an attribute name may not, because nothing could
+    /// ever assert it.
+    fn from_str(s: &str) -> Result<Self> {
+        let Some((attr, value)) = s.split_once('=') else {
+            bail!("`{s}` is not a condition — one looks like `org=acme-corp`");
+        };
+        if attr.is_empty() {
+            bail!("the condition `{s}` names no attribute");
+        }
+        if value.is_empty() {
+            bail!("the condition `{s}` names no value — an empty value can never be asserted");
+        }
+
+        Ok(Self {
+            attr: attr.to_owned(),
+            value: value.to_owned(),
+        })
+    }
+}
+
+impl fmt::Display for Condition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}={}", self.attr, self.value)
+    }
+}
+
+/// One or more roles at one app, as `mapping add` names them:
+/// `<role>[,<role>...]@<app-id>`.
+///
+/// A type of its own rather than a `Vec` beside an [`AppId`], for
+/// [`super::entitlement::RoleAtApp`]'s reason: the spelling is parsed in
+/// exactly one place, and the CLI, the wire and the tests all hold the same
+/// string to the same alphabets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RolesAtApp {
+    pub roles: Vec<Role>,
+    pub app: AppId,
+}
+
+impl FromStr for RolesAtApp {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        // `split_once`, exactly as a single-role grant splits: a second `@`
+        // belongs to nobody.
+        let Some((roles, app)) = s.split_once('@') else {
+            bail!("`{s}` is not a mapping grant — one looks like `reader,writer@blog`");
+        };
+
+        let roles = roles
+            .split(',')
+            .map(|role| {
+                role.parse::<Role>()
+                    .with_context(|| format!("reading the roles in `{s}`"))
+            })
+            .collect::<Result<Vec<Role>>>()?;
+        // Refused rather than silently collapsed: `reader,reader` is a typo,
+        // and a rule that stored one copy would have the listing disagree
+        // with what the operator remembers typing.
+        for (index, role) in roles.iter().enumerate() {
+            if roles[..index].contains(role) {
+                bail!("role `{role}` appears twice in `{s}`");
+            }
+        }
+
+        Ok(Self {
+            roles,
+            app: app
+                .parse::<AppId>()
+                .map_err(|error| anyhow!("{error:#}"))
+                .with_context(|| format!("reading the app id in `{s}`"))?,
+        })
+    }
+}
+
+impl fmt::Display for RolesAtApp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let roles: Vec<&str> = self.roles.iter().map(Role::as_str).collect();
+
+        write!(f, "{}@{}", roles.join(","), self.app)
+    }
+}
+
+/// One mapping rule as the table stores it, stable id included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MappingRecord {
+    /// The rule's name for life, minted at `add` and printed by `list`:
+    /// entitlements are tagged with it, and dropping it must aim at exactly
+    /// one rule.
+    pub rule_id: String,
+    /// The GitHub App slug the spec's `--via` names.
+    pub connection: String,
+    pub app: AppId,
+    pub roles: Vec<Role>,
+    /// ANDed at evaluation; never empty — a rule with no conditions would
+    /// grant to everyone the connection lets in, and `add` refuses to write
+    /// one.
+    pub conditions: Vec<Condition>,
+    pub created_at: String,
+}
+
+impl MappingRecord {
+    /// The `<role>[,<role>...]@<app-id>` half of the rule, as the operator
+    /// spelled it.
+    pub fn grants(&self) -> RolesAtApp {
+        RolesAtApp {
+            roles: self.roles.clone(),
+            app: self.app.clone(),
+        }
+    }
+}
+
+/// What dropping a rule took with it, beside the rule itself: how many mapped
+/// entitlements went, and whose — the users whose cached JWTs the caller's
+/// commit then purges.
+#[derive(Debug)]
+pub struct DroppedRule {
+    pub mapping: MappingRecord,
+    /// The mapped entitlement rows the cascade deleted.
+    pub removed: usize,
+    /// The users those rows belonged to, each purged from the JWT cache after
+    /// the commit.
+    pub users: Vec<UserId>,
+}
+
+/// Why a mapping command did not happen. Kept apart because the operator
+/// interface answers differently: an unknown connection or rule is a name the
+/// operator mistyped, a refused rule is one the spec forbids writing, and a
+/// failure is the host's.
+#[derive(Debug)]
+pub enum MappingError {
+    /// `--via` names no connection this spaceport holds.
+    UnknownConnection(anyhow::Error),
+    /// No rule answers to that id.
+    UnknownRule(anyhow::Error),
+    /// The rule itself is one the spec forbids: `admin` in the roles, or no
+    /// condition at all.
+    Refused(anyhow::Error),
+    /// The store would not do it.
+    Failed(anyhow::Error),
+}
+
+impl fmt::Display for MappingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownConnection(error)
+            | Self::UnknownRule(error)
+            | Self::Refused(error)
+            | Self::Failed(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
+impl std::error::Error for MappingError {}
+
+/// Which of `mappings` an arrival through `connection` carrying `attributes`
+/// satisfies.
+///
+/// A condition matches when the attribute's value list contains its value
+/// exactly; a rule matches when every one of its conditions does — `AND`
+/// across `--when` clauses, which is deliberately all the expressiveness
+/// there is. Pure on purpose: this is the judgement the login re-sync will
+/// apply and `mapping test` previews, and keeping it free of I/O is what
+/// keeps it one judgement.
+pub fn evaluate<'m>(
+    mappings: &'m [MappingRecord],
+    connection: &str,
+    attributes: &Attributes,
+) -> Vec<&'m MappingRecord> {
+    mappings
+        .iter()
+        .filter(|mapping| {
+            mapping.connection == connection
+                && mapping.conditions.iter().all(|condition| {
+                    attributes
+                        .get(&condition.attr)
+                        .is_some_and(|values| values.iter().any(|value| value == &condition.value))
+                })
+        })
+        .collect()
+}
+
+/// The `mappings` table, over the state database.
+///
+/// Same discipline as [`super::entitlement::EntitlementRepository`], whose
+/// closest neighbour this is: every mutation writes its [`super::log`] entry
+/// in the same transaction, and the JWT cache is purged only after a commit
+/// that actually narrowed somebody's access.
+#[derive(Clone)]
+pub struct MappingRepository {
+    db: Db,
+    /// The JWT cache the edge mints into: `drop_rule` deletes entitlements,
+    /// which is a revocation lever like `revoke` is, and a cached JWT must not
+    /// outlive it by more than the spec's four minutes. `add` purges nothing —
+    /// a rule grants only at the next login, and nothing cached got wider.
+    jwt_cache: std::sync::Arc<super::jwt::JwtCache>,
+}
+
+impl MappingRepository {
+    pub fn new(db: Db) -> Self {
+        Self::with_jwt_cache(db, std::sync::Arc::new(super::jwt::JwtCache::new()))
+    }
+
+    /// The constructor the daemon uses: the one process-wide cache, so a rule
+    /// dropped here empties exactly the entries the edge would serve next.
+    pub fn with_jwt_cache(db: Db, jwt_cache: std::sync::Arc<super::jwt::JwtCache>) -> Self {
+        Self { db, jwt_cache }
+    }
+
+    /// Write a new rule: whoever arrives through `via` satisfying every one of
+    /// `conditions` holds `grants`.
+    ///
+    /// `via` must name a connection this spaceport holds — the spec has it
+    /// verified, unlike attribute names, because a connection is spaceport's
+    /// own record and a typo here would be a rule that can never fire with
+    /// nothing to catch it. `admin` is refused by name: the admin is whoever
+    /// reaches the operator socket, and a role an IdP's group list could hand
+    /// out would be an admin nobody on this host appointed. At least one
+    /// condition is required for the same reason turned around — a rule with
+    /// none would grant to every account the IdP lets through the door.
+    ///
+    /// Whether the app declares the roles is deliberately not asked here,
+    /// exactly as `grant` does not ask: the rule is stored either way, and the
+    /// warning belongs to the operator response, where the deployed manifest
+    /// is at hand.
+    pub async fn add(
+        &self,
+        via: &str,
+        grants: &RolesAtApp,
+        conditions: &[Condition],
+    ) -> Result<MappingRecord, MappingError> {
+        if let Some(admin) = grants.roles.iter().find(|role| role.as_str() == "admin") {
+            return Err(MappingError::Refused(anyhow!(
+                "`{admin}` is never a mappable role — the admin is whoever reaches the operator \
+                 socket, and no IdP attribute may appoint one"
+            )));
+        }
+        if conditions.is_empty() {
+            return Err(MappingError::Refused(anyhow!(
+                "a mapping needs at least one `--when <attr>=<value>` condition — one with none \
+                 would grant to everyone the connection lets in"
+            )));
+        }
+        // Held to the same rules the CLI parser enforces, because a condition
+        // can also arrive over the wire as JSON that never met the parser.
+        for condition in conditions {
+            if condition.attr.is_empty() || condition.value.is_empty() {
+                return Err(MappingError::Refused(anyhow!(
+                    "the condition `{condition}` is missing its attribute or its value"
+                )));
+            }
+        }
+
+        // Minted out here for `create`'s reason: randomness has no business
+        // inside a database lock.
+        let record = MappingRecord {
+            rule_id: uuid_v4().map_err(MappingError::Failed)?,
+            connection: via.to_owned(),
+            app: grants.app.clone(),
+            roles: grants.roles.clone(),
+            conditions: conditions.to_vec(),
+            created_at: now(),
+        };
+        let written = record.clone();
+
+        let known = self
+            .db
+            .call(move |connection| {
+                let transaction = connection
+                    .transaction()
+                    .context("beginning to add a mapping")?;
+
+                // The one verification `--via` gets, against the table the
+                // connect command writes: a slug spaceport holds no App under
+                // is a rule aimed at logins that can never arrive.
+                let held: Option<String> = transaction
+                    .query_row(
+                        "SELECT slug FROM github_apps WHERE slug = ?1",
+                        rusqlite::params![written.connection],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .context("looking the mapping's connection up")?;
+                if held.is_none() {
+                    return Ok(false);
+                }
+
+                transaction
+                    .execute(
+                        "INSERT INTO mappings
+                             (rule_id, connection, spaceport_app, roles, conditions, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![
+                            written.rule_id,
+                            written.connection,
+                            written.app.as_str(),
+                            joined(&written.roles),
+                            conditions_json(&written.conditions)?,
+                            written.created_at
+                        ],
+                    )
+                    .context("adding a mapping")?;
+
+                record_in(
+                    &transaction,
+                    &written.created_at,
+                    "mapping.added",
+                    None,
+                    OPERATOR_ORIGIN,
+                    Some(&format!(
+                        "rule `{}`: `{}` via `{}` when {}",
+                        written.rule_id,
+                        written.grants(),
+                        written.connection,
+                        conditions_prose(&written.conditions),
+                    )),
+                )?;
+
+                transaction.commit().context("committing a new mapping")?;
+
+                Ok(true)
+            })
+            .await
+            .map_err(MappingError::Failed)?;
+
+        if !known {
+            return Err(MappingError::UnknownConnection(anyhow!(
+                "no connection answers to `{via}` — `spaceport connect list` says which exist"
+            )));
+        }
+
+        info!(rule = %record.rule_id, grants = %record.grants(), via, "mapping added");
+
+        Ok(record)
+    }
+
+    /// Every rule, in the order they were added, optionally only those about
+    /// `app`.
+    ///
+    /// A row this build cannot read is skipped with a warning rather than
+    /// costing the listing, exactly as a broken user row costs nobody else's.
+    pub async fn list(&self, app: Option<&AppId>) -> Result<Vec<MappingRecord>> {
+        let app = app.cloned();
+
+        let rows: Vec<MappingRow> = self
+            .db
+            .call(move |connection| {
+                let (query, params) = match &app {
+                    None => (
+                        "SELECT rule_id, connection, spaceport_app, roles, conditions, created_at
+                         FROM mappings ORDER BY created_at, rule_id",
+                        Vec::new(),
+                    ),
+                    Some(app) => (
+                        "SELECT rule_id, connection, spaceport_app, roles, conditions, created_at
+                         FROM mappings WHERE spaceport_app = ?1 ORDER BY created_at, rule_id",
+                        vec![app.to_string()],
+                    ),
+                };
+
+                let mut statement = connection
+                    .prepare(query)
+                    .context("preparing the mapping listing query")?;
+                let rows = statement
+                    .query_map(rusqlite::params_from_iter(params.iter()), mapping_row)
+                    .context("listing the mappings")?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .context("listing the mappings")?;
+
+                Ok(rows)
+            })
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| match mapping_record(row) {
+                Ok(record) => Some(record),
+                Err(error) => {
+                    tracing::warn!(%error, "skipping a stored mapping this build cannot read");
+                    None
+                }
+            })
+            .collect())
+    }
+
+    /// One rule by its id, or `None` when nothing answers to it.
+    ///
+    /// Loud where the listing is forgiving: a command aimed at exactly this
+    /// row has nothing useful to do with a row that will not read.
+    pub async fn get(&self, rule_id: &str) -> Result<Option<MappingRecord>> {
+        let asked = rule_id.to_owned();
+
+        let row: Option<MappingRow> = self
+            .db
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT rule_id, connection, spaceport_app, roles, conditions, created_at
+                         FROM mappings WHERE rule_id = ?1",
+                        rusqlite::params![asked],
+                        mapping_row,
+                    )
+                    .optional()
+                    .context("looking a mapping up")
+            })
+            .await?;
+
+        row.map(mapping_record).transpose()
+    }
+
+    /// Delete a rule and everything it produced, as one commit: the mapping
+    /// row, every entitlement tagged with it, and the `mapping.dropped` entry
+    /// that records both.
+    ///
+    /// The entitlements go without per-row log entries, for the reason a
+    /// user's drop gives: the rows went as a cascade of this one command, and
+    /// a fan of `entitlement.revoked` lines nobody typed would read as
+    /// commands that were never given. The affected users' cached JWTs are
+    /// purged after the commit — this is the spec's `mapping drop` purge
+    /// lever, and the discipline of "commit, then purge" keeps the cache a
+    /// strict copy of the tables.
+    pub async fn drop_rule(&self, rule_id: &str) -> Result<DroppedRule, MappingError> {
+        let asked = rule_id.to_owned();
+
+        let found = self
+            .db
+            .call(move |connection| {
+                let transaction = connection
+                    .transaction()
+                    .context("beginning to drop a mapping")?;
+
+                let Some(row) = transaction
+                    .query_row(
+                        "SELECT rule_id, connection, spaceport_app, roles, conditions, created_at
+                         FROM mappings WHERE rule_id = ?1",
+                        rusqlite::params![asked],
+                        mapping_row,
+                    )
+                    .optional()
+                    .context("looking the mapping to drop up")?
+                else {
+                    return Ok(None);
+                };
+                let mapping = mapping_record(row)?;
+
+                // Whose access is about to narrow, read before the delete
+                // takes the only record of it. An id that will not parse is
+                // still deleted below; it just cannot be purged, and a warning
+                // says so rather than the whole drop failing over a row some
+                // other build wrote.
+                let mut statement = transaction
+                    .prepare("SELECT DISTINCT user_id FROM entitlements WHERE mapped_rule = ?1")
+                    .context("preparing the affected-users query")?;
+                let users: Vec<String> = statement
+                    .query_map(rusqlite::params![mapping.rule_id], |row| row.get(0))
+                    .context("reading the users a mapping empowered")?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .context("reading the users a mapping empowered")?;
+                drop(statement);
+                let users: Vec<UserId> = users
+                    .into_iter()
+                    .filter_map(|user| match user.parse() {
+                        Ok(user) => Some(user),
+                        Err(error) => {
+                            tracing::warn!(%error, "cannot purge a user id this build cannot read");
+                            None
+                        }
+                    })
+                    .collect();
+
+                let removed = transaction
+                    .execute(
+                        "DELETE FROM entitlements WHERE mapped_rule = ?1",
+                        rusqlite::params![mapping.rule_id],
+                    )
+                    .context("removing a dropped mapping's entitlements")?;
+                transaction
+                    .execute(
+                        "DELETE FROM mappings WHERE rule_id = ?1",
+                        rusqlite::params![mapping.rule_id],
+                    )
+                    .context("dropping a mapping")?;
+
+                record_in(
+                    &transaction,
+                    &now(),
+                    "mapping.dropped",
+                    None,
+                    OPERATOR_ORIGIN,
+                    Some(&format!(
+                        "rule `{}`: `{}` via `{}`, taking {removed} mapped entitlements with it",
+                        mapping.rule_id,
+                        mapping.grants(),
+                        mapping.connection,
+                    )),
+                )?;
+
+                transaction
+                    .commit()
+                    .context("committing a mapping's drop")?;
+
+                Ok(Some(DroppedRule {
+                    mapping,
+                    removed,
+                    users,
+                }))
+            })
+            .await
+            .map_err(MappingError::Failed)?;
+
+        let dropped: DroppedRule = found.ok_or_else(|| {
+            MappingError::UnknownRule(anyhow!(
+                "no mapping answers to `{rule_id}` — `spaceport auth mapping list` says which exist"
+            ))
+        })?;
+
+        // Something may have actually been taken away, so the cached JWTs
+        // still carrying it go too — after the commit, so the cache is never
+        // emptier than the tables ahead of a rollback.
+        for user in &dropped.users {
+            self.jwt_cache.purge_user(user);
+        }
+
+        info!(
+            rule = %dropped.mapping.rule_id,
+            removed = dropped.removed,
+            "mapping dropped"
+        );
+
+        Ok(dropped)
+    }
+}
+
+/// One identity as the `idp_identities` table stores it, minus the user it
+/// belongs to — a read is always about one user, exactly as an entitlement
+/// read is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityRecord {
+    /// The GitHub App slug the login arrived through.
+    pub connection: String,
+    /// The IdP's stable id for the account — GitHub's numeric user id, as
+    /// text, because it is an opaque key from somebody else's id-space.
+    pub external_id: String,
+    /// The renameable handle beside it, for the human reading an audit.
+    pub external_login: String,
+    /// What the IdP asserted at the last login: the snapshot `mapping test`
+    /// replays.
+    pub attributes: Attributes,
+    pub last_login_at: String,
+}
+
+/// The `idp_identities` table, in the vocabulary of recording a login and
+/// reading it back.
+///
+/// A repository of its own rather than more methods on [`MappingRepository`]:
+/// the two tables meet only in [`evaluate`], which deliberately takes plain
+/// data, and a handler that replays a snapshot has no business seeing the
+/// verbs that rewrite rules.
+#[derive(Debug, Clone)]
+pub struct IdentityRepository {
+    db: Db,
+}
+
+impl IdentityRepository {
+    pub fn new(db: Db) -> Self {
+        Self { db }
+    }
+
+    /// Record that `user` is `external_login` (`external_id`) at `connection`,
+    /// asserting `attributes` — the write the login flow will make, replacing
+    /// whatever the previous login recorded.
+    ///
+    /// The replace is spelled as delete-then-insert rather than an upsert,
+    /// because two uniqueness claims can each be the one that fires: the same
+    /// user through the same connection is a re-login, and the same external
+    /// account now vouching for this user is a re-link — both must land on
+    /// one fresh row, and one `ON CONFLICT` clause can only catch one of them.
+    pub async fn record(
+        &self,
+        user: &UserId,
+        connection: &str,
+        external_id: &str,
+        external_login: &str,
+        attributes: &Attributes,
+    ) -> Result<()> {
+        let user = user.clone();
+        let connection_slug = connection.to_owned();
+        let external_id = external_id.to_owned();
+        let external_login = external_login.to_owned();
+        let attributes =
+            serde_json::to_string(attributes).context("writing an identity's attributes")?;
+
+        self.db
+            .call(move |db| {
+                let transaction = db
+                    .transaction()
+                    .context("beginning to record an idp identity")?;
+
+                transaction
+                    .execute(
+                        "DELETE FROM idp_identities
+                         WHERE (user_id = ?1 AND connection = ?2)
+                            OR (connection = ?2 AND external_id = ?3)",
+                        rusqlite::params![user.as_str(), connection_slug, external_id],
+                    )
+                    .context("replacing an idp identity")?;
+                transaction
+                    .execute(
+                        "INSERT INTO idp_identities
+                             (user_id, connection, external_id, external_login, attributes,
+                              last_login_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![
+                            user.as_str(),
+                            connection_slug,
+                            external_id,
+                            external_login,
+                            attributes,
+                            now()
+                        ],
+                    )
+                    .context("recording an idp identity")?;
+
+                transaction.commit().context("committing an idp identity")
+            })
+            .await
+    }
+
+    /// Every identity `user` holds, one per connection, in connection order —
+    /// what an audit shows and what `mapping test` replays. Empty is the
+    /// ordinary answer until SSO lands, and the callers say so in prose.
+    pub async fn for_user(&self, user: &UserId) -> Result<Vec<IdentityRecord>> {
+        let user = user.clone();
+
+        let rows: Vec<(String, String, String, String, String)> = self
+            .db
+            .call(move |connection| {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT connection, external_id, external_login, attributes, last_login_at
+                         FROM idp_identities WHERE user_id = ?1 ORDER BY connection",
+                    )
+                    .context("preparing the identity query")?;
+
+                let rows = statement
+                    .query_map(rusqlite::params![user.as_str()], |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    })
+                    .context("reading the idp identities")?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .context("reading the idp identities")?;
+
+                Ok(rows)
+            })
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(
+                |(connection, external_id, external_login, attributes, last_login_at)| {
+                    match serde_json::from_str(&attributes) {
+                        Ok(attributes) => Some(IdentityRecord {
+                            connection,
+                            external_id,
+                            external_login,
+                            attributes,
+                            last_login_at,
+                        }),
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "skipping a stored identity this build cannot read"
+                            );
+                            None
+                        }
+                    }
+                },
+            )
+            .collect())
+    }
+}
+
+/// Delete every identity of `user`, inside the caller's transaction.
+///
+/// The drop cascade's tenant, a function over a transaction for the reason
+/// every cascade here is: a user the pool has forgotten must not keep an IdP
+/// link that the unique index would then refuse to the next holder of their
+/// external account. Called from [`super::repository`]'s drop path and
+/// deliberately *not* from suspend — a resumed user's next login must update
+/// the link they had, not recreate it.
+pub(super) fn remove_users_in(transaction: &Transaction<'_>, user: &UserId) -> Result<()> {
+    transaction
+        .execute(
+            "DELETE FROM idp_identities WHERE user_id = ?1",
+            rusqlite::params![user.as_str()],
+        )
+        .context("removing a dropped user's idp identities")?;
+
+    Ok(())
+}
+
+/// The row as SQL hands it over, before the typed fields are parsed out.
+type MappingRow = (String, String, String, String, String, String);
+
+fn mapping_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MappingRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+    ))
+}
+
+/// Read a stored row back into a record, holding the stored halves to the
+/// same alphabets `add` did — a row that will not read was written by
+/// something other than this build, and the caller decides what that costs.
+fn mapping_record(row: MappingRow) -> Result<MappingRecord> {
+    let (rule_id, connection, app, roles, conditions, created_at) = row;
+
+    Ok(MappingRecord {
+        rule_id,
+        connection,
+        app: app
+            .parse()
+            .map_err(|error| anyhow!("{error:#}"))
+            .context("reading a stored mapping's app id")?,
+        roles: roles
+            .split(',')
+            .map(|role| {
+                role.parse::<Role>()
+                    .context("reading a stored mapping's roles")
+            })
+            .collect::<Result<Vec<Role>>>()?,
+        conditions: serde_json::from_str(&conditions)
+            .context("reading a stored mapping's conditions")?,
+        created_at,
+    })
+}
+
+/// The roles as the column stores them: comma-joined, an alphabet with no
+/// comma in it.
+fn joined(roles: &[Role]) -> String {
+    let roles: Vec<&str> = roles.iter().map(Role::as_str).collect();
+
+    roles.join(",")
+}
+
+fn conditions_json(conditions: &[Condition]) -> Result<String> {
+    serde_json::to_string(conditions).context("writing a mapping's conditions")
+}
+
+/// The conditions as a log entry or a listing says them: backticked,
+/// comma-separated — the `AND` is the only semantics there is, so it goes
+/// unsaid.
+pub(crate) fn conditions_prose(conditions: &[Condition]) -> String {
+    let spelled: Vec<String> = conditions
+        .iter()
+        .map(|condition| format!("`{condition}`"))
+        .collect();
+
+    spelled.join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{
+        AuthLogRepository, EntitlementRepository, UserRef, UserRepository, UserSlug,
+    };
+
+    fn repositories() -> (
+        Db,
+        UserRepository,
+        MappingRepository,
+        IdentityRepository,
+        AuthLogRepository,
+    ) {
+        let db = Db::in_memory().unwrap();
+
+        (
+            db.clone(),
+            UserRepository::new(db.clone()),
+            MappingRepository::new(db.clone()),
+            IdentityRepository::new(db.clone()),
+            AuthLogRepository::new(db),
+        )
+    }
+
+    fn slug(slug: &str) -> UserSlug {
+        slug.parse().unwrap()
+    }
+
+    fn grants(s: &str) -> RolesAtApp {
+        s.parse().unwrap()
+    }
+
+    fn condition(s: &str) -> Condition {
+        s.parse().unwrap()
+    }
+
+    fn attributes(pairs: &[(&str, &[&str])]) -> Attributes {
+        pairs
+            .iter()
+            .map(|(attr, values)| {
+                (
+                    (*attr).to_owned(),
+                    values.iter().map(|value| (*value).to_owned()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Plant the connection `--via` is verified against, exactly as `connect`
+    /// records one — the mapping code reads the table, not the API behind it.
+    async fn plant_connection(db: &Db, slug: &str) {
+        let slug = slug.to_owned();
+        db.call(move |connection| {
+            connection
+                .execute(
+                    "INSERT INTO github_apps
+                         (slug, app_id, name, owner, client_id, client_secret, webhook_secret,
+                          private_key, connected_at)
+                     VALUES (?1, 42, 'Spaceport for Acme', 'an-organisation', 'iv1.abc', 'secret',
+                             'hook', 'pem', '2026-01-01T00:00:00Z')",
+                    rusqlite::params![slug],
+                )
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Plant a mapped entitlement as the login re-sync will one day write one:
+    /// tagged with the rule that produced it.
+    async fn plant_mapped(db: &Db, user: &UserId, granted: &str, rule: &str) {
+        let user = user.to_string();
+        let granted: crate::auth::RoleAtApp = granted.parse().unwrap();
+        let rule = rule.to_owned();
+        db.call(move |connection| {
+            connection
+                .execute(
+                    "INSERT INTO entitlements
+                         (user_id, spaceport_app, role, mapped_rule, granted_at)
+                     VALUES (?1, ?2, ?3, ?4, '2026-01-01T00:00:00Z')",
+                    rusqlite::params![user, granted.app.as_str(), granted.role.as_str(), rule],
+                )
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The spec's spelling, parsed both ways round: commas split roles, the
+    /// `@` splits them from the app, and each half is held to its alphabet.
+    #[test]
+    fn parses_the_roles_at_app_spelling() {
+        let parsed = grants("reader,writer@blog");
+        assert_eq!(parsed.roles.len(), 2);
+        assert_eq!(parsed.app.as_str(), "blog");
+        assert_eq!(parsed.to_string(), "reader,writer@blog");
+        assert_eq!(grants("reader@blog").roles.len(), 1);
+
+        for broken in [
+            "reader",
+            "@blog",
+            "reader@",
+            "reader,@blog",
+            "Reader@blog",
+            "reader,writer@Blog",
+        ] {
+            assert!(broken.parse::<RolesAtApp>().is_err(), "accepted `{broken}`");
+        }
+    }
+
+    /// A repeated role is a typo, and refusing it beats a listing that
+    /// disagrees with what the operator remembers typing.
+    #[test]
+    fn refuses_a_role_named_twice() {
+        let err = "reader,reader@blog"
+            .parse::<RolesAtApp>()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("appears twice"), "{err}");
+    }
+
+    /// `<attr>=<value>`, split on the first `=`: the value is the IdP's
+    /// string and may carry one of its own.
+    #[test]
+    fn parses_a_condition() {
+        assert_eq!(condition("org=acme-corp").attr, "org");
+        assert_eq!(condition("org=acme-corp").value, "acme-corp");
+        assert_eq!(condition("claim=a=b").value, "a=b");
+
+        for broken in ["org", "=value", "org="] {
+            assert!(broken.parse::<Condition>().is_err(), "accepted `{broken}`");
+        }
+    }
+
+    #[tokio::test]
+    async fn adds_and_lists_a_mapping() {
+        let (db, _, mappings, _, log) = repositories();
+        plant_connection(&db, "spaceport-acme").await;
+
+        let added = mappings
+            .add(
+                "spaceport-acme",
+                &grants("reader,writer@blog"),
+                &[condition("org=acme-corp")],
+            )
+            .await
+            .unwrap();
+
+        let listed = mappings.list(None).await.unwrap();
+        assert_eq!(listed, std::slice::from_ref(&added));
+        assert_eq!(listed[0].connection, "spaceport-acme");
+        assert_eq!(listed[0].conditions, [condition("org=acme-corp")]);
+        assert!(
+            listed[0].created_at.ends_with('Z'),
+            "{}",
+            listed[0].created_at
+        );
+        // The stable id round-trips through `get`, which is what `drop` aims
+        // by.
+        assert_eq!(
+            mappings.get(&added.rule_id).await.unwrap(),
+            Some(added.clone())
+        );
+        assert_eq!(mappings.get("no-such-rule").await.unwrap(), None);
+        // And the add is in the log, naming the rule.
+        let entries = log.entries(None).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, "mapping.added");
+        assert!(
+            entries[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains(&added.rule_id)
+        );
+    }
+
+    /// `mapping list [<app-id>]`: the filter is the app, and only the app.
+    #[tokio::test]
+    async fn lists_only_the_app_asked_for() {
+        let (db, _, mappings, _, _) = repositories();
+        plant_connection(&db, "spaceport-acme").await;
+        mappings
+            .add(
+                "spaceport-acme",
+                &grants("reader@blog"),
+                &[condition("org=acme-corp")],
+            )
+            .await
+            .unwrap();
+        mappings
+            .add(
+                "spaceport-acme",
+                &grants("reader@wiki"),
+                &[condition("org=acme-corp")],
+            )
+            .await
+            .unwrap();
+
+        let listed = mappings.list(Some(&"wiki".parse().unwrap())).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].app.as_str(), "wiki");
+    }
+
+    /// The spec's one hard rule about roles: `admin` is never mappable,
+    /// because an IdP group must not appoint an admin nobody on this host did.
+    #[tokio::test]
+    async fn refuses_to_map_the_admin_role() {
+        let (db, _, mappings, _, log) = repositories();
+        plant_connection(&db, "spaceport-acme").await;
+
+        let error = mappings
+            .add(
+                "spaceport-acme",
+                &grants("reader,admin@blog"),
+                &[condition("org=acme-corp")],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, MappingError::Refused(_)), "{error}");
+        assert!(
+            error.to_string().contains("never a mappable role"),
+            "{error}"
+        );
+        // And the refusal changed nothing.
+        assert!(mappings.list(None).await.unwrap().is_empty());
+        assert!(log.entries(None).await.unwrap().is_empty());
+    }
+
+    /// `--via` is verified where attribute names are not: a connection is
+    /// spaceport's own record, so a typo has something to catch it.
+    #[tokio::test]
+    async fn refuses_a_connection_nobody_made() {
+        let (_, _, mappings, _, _) = repositories();
+
+        let error = mappings
+            .add(
+                "ghost",
+                &grants("reader@blog"),
+                &[condition("org=acme-corp")],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, MappingError::UnknownConnection(_)),
+            "{error}"
+        );
+        assert!(error.to_string().contains("ghost"), "{error}");
+    }
+
+    /// A rule with no conditions would grant to everyone the connection lets
+    /// in, which no operator can have meant.
+    #[tokio::test]
+    async fn refuses_a_mapping_with_no_conditions() {
+        let (db, _, mappings, _, _) = repositories();
+        plant_connection(&db, "spaceport-acme").await;
+
+        let error = mappings
+            .add("spaceport-acme", &grants("reader@blog"), &[])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, MappingError::Refused(_)), "{error}");
+        assert!(error.to_string().contains("at least one"), "{error}");
+    }
+
+    /// The spec's drop cascade, whole: the rule goes, the entitlements it
+    /// produced go in the same commit, manual grants stand, and the log
+    /// records one drop rather than a fan of revokes nobody typed.
+    #[tokio::test]
+    async fn dropping_a_rule_takes_its_entitlements_and_only_its() {
+        let (db, users, mappings, _, log) = repositories();
+        plant_connection(&db, "spaceport-acme").await;
+        let alice = users.create(&slug("alice"), None).await.unwrap();
+        let bob = users.create(&slug("bob"), None).await.unwrap();
+        let added = mappings
+            .add(
+                "spaceport-acme",
+                &grants("reader@blog"),
+                &[condition("org=acme-corp")],
+            )
+            .await
+            .unwrap();
+        plant_mapped(&db, &alice.id, "reader@blog", &added.rule_id).await;
+        plant_mapped(&db, &bob.id, "reader@blog", &added.rule_id).await;
+        plant_mapped(&db, &bob.id, "reader@wiki", "some-other-rule").await;
+        let entitlements = EntitlementRepository::new(db.clone());
+        entitlements
+            .grant(
+                &UserRef::Slug(slug("alice")),
+                &"writer@blog".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let dropped = mappings.drop_rule(&added.rule_id).await.unwrap();
+
+        assert_eq!(dropped.mapping.rule_id, added.rule_id);
+        assert_eq!(dropped.removed, 2);
+        assert_eq!(dropped.users.len(), 2);
+        assert!(dropped.users.contains(&alice.id));
+        // Alice's manual grant and bob's other-rule row both survived.
+        let (_, hers) = entitlements
+            .audit(&UserRef::Slug(slug("alice")))
+            .await
+            .unwrap();
+        assert_eq!(hers.len(), 1);
+        assert_eq!(hers[0].role.as_str(), "writer");
+        let (_, his) = entitlements
+            .audit(&UserRef::Slug(slug("bob")))
+            .await
+            .unwrap();
+        assert_eq!(his.len(), 1);
+        assert_eq!(his[0].mapped_rule.as_deref(), Some("some-other-rule"));
+        // One `mapping.dropped` entry, no `entitlement.revoked` fan.
+        let kinds: Vec<String> = log
+            .entries(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.kind)
+            .collect();
+        assert!(kinds.contains(&"mapping.dropped".to_owned()), "{kinds:?}");
+        assert!(
+            !kinds.contains(&"entitlement.revoked".to_owned()),
+            "{kinds:?}"
+        );
+        // And the rule is gone.
+        assert_eq!(mappings.get(&added.rule_id).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_rule_nobody_made_says_so() {
+        let (_, _, mappings, _, _) = repositories();
+
+        let error = mappings.drop_rule("no-such-rule").await.unwrap_err();
+
+        assert!(matches!(error, MappingError::UnknownRule(_)), "{error}");
+        assert!(error.to_string().contains("mapping list"), "{error}");
+    }
+
+    /// The whole of the matching rule, in one place: every condition must
+    /// hold, a multi-valued attribute matches by containment, and a mistyped
+    /// attribute never matches anything — which is the documented behaviour,
+    /// not a bug.
+    #[test]
+    fn evaluate_ands_conditions_over_value_lists() {
+        let rule = MappingRecord {
+            rule_id: "rule-1".to_owned(),
+            connection: "spaceport-acme".to_owned(),
+            app: "blog".parse().unwrap(),
+            roles: vec!["reader".parse().unwrap()],
+            conditions: vec![condition("org=acme-corp"), condition("team=authors")],
+            created_at: "2026-08-16T00:00:00Z".to_owned(),
+        };
+        let rules = [rule];
+
+        // Both conditions hold — the team list contains the value.
+        let matching = evaluate(
+            &rules,
+            "spaceport-acme",
+            &attributes(&[("org", &["acme-corp"]), ("team", &["authors", "review"])]),
+        );
+        assert_eq!(matching.len(), 1);
+
+        // One condition failing fails the rule: AND, not OR.
+        assert!(
+            evaluate(
+                &rules,
+                "spaceport-acme",
+                &attributes(&[("org", &["acme-corp"]), ("team", &["review"])]),
+            )
+            .is_empty()
+        );
+        // An attribute the snapshot never asserts silently never matches.
+        assert!(
+            evaluate(
+                &rules,
+                "spaceport-acme",
+                &attributes(&[("org", &["acme-corp"])]),
+            )
+            .is_empty()
+        );
+        // Containment is exact, not substring.
+        assert!(
+            evaluate(
+                &rules,
+                "spaceport-acme",
+                &attributes(&[("org", &["acme-corporation"]), ("team", &["authors"])]),
+            )
+            .is_empty()
+        );
+        // And a rule is scoped to its connection: the same attributes through
+        // another IdP satisfy nothing.
+        assert!(
+            evaluate(
+                &rules,
+                "spaceport-other",
+                &attributes(&[("org", &["acme-corp"]), ("team", &["authors"])]),
+            )
+            .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn records_an_identity_and_reads_it_back() {
+        let (_, users, _, identities, _) = repositories();
+        let alice = users.create(&slug("alice"), None).await.unwrap();
+
+        identities
+            .record(
+                &alice.id,
+                "spaceport-acme",
+                "583231",
+                "octo-alice",
+                &attributes(&[("login", &["octo-alice"]), ("org", &["acme-corp"])]),
+            )
+            .await
+            .unwrap();
+
+        let held = identities.for_user(&alice.id).await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].connection, "spaceport-acme");
+        assert_eq!(held[0].external_id, "583231");
+        assert_eq!(held[0].external_login, "octo-alice");
+        assert_eq!(held[0].attributes["org"], ["acme-corp"]);
+        assert!(
+            held[0].last_login_at.ends_with('Z'),
+            "{}",
+            held[0].last_login_at
+        );
+    }
+
+    /// A re-login replaces the snapshot rather than sitting beside it: one
+    /// row per user per connection is the table's whole claim.
+    #[tokio::test]
+    async fn a_second_login_replaces_the_snapshot() {
+        let (_, users, _, identities, _) = repositories();
+        let alice = users.create(&slug("alice"), None).await.unwrap();
+        identities
+            .record(
+                &alice.id,
+                "spaceport-acme",
+                "583231",
+                "octo-alice",
+                &attributes(&[("org", &["acme-corp"])]),
+            )
+            .await
+            .unwrap();
+
+        identities
+            .record(
+                &alice.id,
+                "spaceport-acme",
+                "583231",
+                "octo-renamed",
+                &attributes(&[("org", &["other-org"])]),
+            )
+            .await
+            .unwrap();
+
+        let held = identities.for_user(&alice.id).await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].external_login, "octo-renamed");
+        assert_eq!(held[0].attributes["org"], ["other-org"]);
+    }
+
+    /// The drop cascade, seen from this table: the identity dies with the
+    /// user, so the external account is free to vouch for a future one —
+    /// while suspend keeps the link, because resume restores, never recreates.
+    #[tokio::test]
+    async fn dropping_a_user_takes_their_identity_and_suspending_does_not() {
+        let (_, users, _, identities, _) = repositories();
+        let alice = users.create(&slug("alice"), None).await.unwrap();
+        identities
+            .record(
+                &alice.id,
+                "spaceport-acme",
+                "583231",
+                "octo-alice",
+                &attributes(&[("org", &["acme-corp"])]),
+            )
+            .await
+            .unwrap();
+
+        users.suspend(&UserRef::Slug(slug("alice"))).await.unwrap();
+        assert_eq!(identities.for_user(&alice.id).await.unwrap().len(), 1);
+
+        users
+            .drop_user(&UserRef::Slug(slug("alice")))
+            .await
+            .unwrap();
+        assert!(identities.for_user(&alice.id).await.unwrap().is_empty());
+    }
+}

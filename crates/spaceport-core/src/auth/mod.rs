@@ -23,6 +23,7 @@ pub mod app_session;
 pub mod entitlement;
 pub mod jwt;
 pub mod log;
+pub mod mapping;
 pub mod repository;
 pub mod session;
 
@@ -34,6 +35,10 @@ pub use entitlement::{
 };
 pub use jwt::{JwtCache, JwtSigner, Rotation, SigningKeyRecord};
 pub use log::{AuthEvent, AuthLogRepository, OPERATOR_ORIGIN, SYSTEM_ORIGIN, WEB_ORIGIN};
+pub use mapping::{
+    Attributes, Condition, DroppedRule, IdentityRecord, IdentityRepository, MappingError,
+    MappingRecord, MappingRepository, RolesAtApp, evaluate,
+};
 pub use repository::UserRepository;
 pub use session::{
     DEFAULT_SESSION_LIFETIME, FreshSession, MintedCode, RedeemError, SessionError, SessionId,

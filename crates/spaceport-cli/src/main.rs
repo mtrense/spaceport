@@ -15,8 +15,9 @@ use spaceport_core::app::{
     reconcile, supervise,
 };
 use spaceport_core::auth::{
-    AuthLogRepository, EntitlementRepository, JwtCache, JwtSigner, RevokeScope, RoleAtApp,
-    SessionId, SessionRepository, UserId, UserRef, UserRepository, UserSlug, jwt,
+    AuthLogRepository, Condition, EntitlementRepository, IdentityRepository, JwtCache, JwtSigner,
+    MappingRepository, RevokeScope, RoleAtApp, RolesAtApp, SessionId, SessionRepository, UserId,
+    UserRef, UserRepository, UserSlug, jwt,
 };
 use spaceport_core::build;
 use spaceport_core::build::dir::BuildDir;
@@ -276,6 +277,15 @@ enum AuthCommand {
     /// Report one user's whole standing: the record, the SSO connection, every
     /// entitlement with its origin, and the apps they actually reach.
     Audit(UserRefArgs),
+    /// Manage the rules that turn SSO logins into entitlements.
+    ///
+    /// A mapping says: whoever arrives through an IdP connection carrying
+    /// attributes that satisfy every `--when` condition holds these roles at
+    /// this app. Rules are written now, ahead of the SSO login flow that will
+    /// apply them, so the ground is prepared before the first login — `test`
+    /// dry-runs them against a user's stored attributes, and `drop` removes a
+    /// rule together with every entitlement it produced.
+    Mapping(MappingArgs),
     /// Manage the Ed25519 key that signs the JWTs handed down to apps.
     ///
     /// The key rotates by itself every ninety days; `rotate` is the manual
@@ -338,6 +348,78 @@ struct UserArgs {
 struct SessionArgs {
     #[command(subcommand)]
     command: SessionCommand,
+}
+
+#[derive(Debug, Args)]
+struct MappingArgs {
+    #[command(subcommand)]
+    command: MappingCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum MappingCommand {
+    /// List the mapping rules, each with its stable rule id.
+    ///
+    /// The id is what `drop` takes and what tags the entitlements a rule
+    /// produces, and this listing is the only place to read it back.
+    List(MappingListArgs),
+    /// Add a rule mapping IdP attributes to roles at an app.
+    ///
+    /// Conditions are `AND`ed across `--when` clauses, and that is all the
+    /// expressiveness there is — `OR` is spelled "add another mapping".
+    /// `--via` is verified against the configured connections; attribute
+    /// names are not verifiable, and a typo silently never matches — which is
+    /// what `test` is for. `admin` is never a mappable role.
+    Add(MappingAddArgs),
+    /// Dry-run every rule against the attributes stored from the user's last
+    /// IdP login, changing nothing.
+    ///
+    /// Prints which rules match and which entitlements would result. Until an
+    /// SSO login has happened for the user, there is no snapshot to replay,
+    /// and the answer says so.
+    Test(UserRefArgs),
+    /// Drop a rule, and with it every entitlement it produced.
+    ///
+    /// This is what removes mapped access: revoking a mapped entitlement by
+    /// hand is refused, because the next IdP login would put it straight back.
+    Drop(MappingDropArgs),
+}
+
+#[derive(Debug, Args)]
+struct MappingListArgs {
+    /// Only the rules about this app.
+    app: Option<AppId>,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
+struct MappingAddArgs {
+    /// What the rule maps, as `<role>[,<role>...]@<app-id>`.
+    grants: RolesAtApp,
+
+    /// The IdP connection the login must arrive through, as `spaceport
+    /// connect list` names it.
+    #[arg(long, value_name = "IDP")]
+    via: String,
+
+    /// A condition the login's attributes must satisfy, as `<attr>=<value>` —
+    /// repeatable, all conditions must hold, and at least one is required.
+    #[arg(long = "when", value_name = "ATTR=VALUE", required = true)]
+    when: Vec<Condition>,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
+struct MappingDropArgs {
+    /// The rule to drop, as `spaceport auth mapping list` prints it.
+    rule: String,
+
+    #[command(flatten)]
+    server: ServerArgs,
 }
 
 #[derive(Debug, Args)]
@@ -907,6 +989,12 @@ async fn main() -> Result<()> {
             AuthCommand::Grant(args) => grant(args).await,
             AuthCommand::Revoke(args) => revoke(args).await,
             AuthCommand::Audit(args) => audit(args).await,
+            AuthCommand::Mapping(args) => match args.command {
+                MappingCommand::List(args) => mapping_list(args).await,
+                MappingCommand::Add(args) => mapping_add(args).await,
+                MappingCommand::Test(args) => mapping_test(args).await,
+                MappingCommand::Drop(args) => mapping_drop(args).await,
+            },
             AuthCommand::Key(args) => match args.command {
                 KeyCommand::Rotate(args) => auth_key_rotate(args).await,
                 KeyCommand::List(args) => auth_key_list(args).await,
@@ -1199,6 +1287,15 @@ async fn run(args: RunArgs) -> Result<()> {
         jwt_cache.clone(),
     ));
     let auth_log = Arc::new(AuthLogRepository::new(db.clone()));
+    // The mapping rules, over the same cache the other revocation levers
+    // purge: dropping a rule deletes entitlements, and the cached JWTs still
+    // carrying them must go in the same breath.
+    let mappings = Arc::new(MappingRepository::with_jwt_cache(
+        db.clone(),
+        jwt_cache.clone(),
+    ));
+    // And the IdP identities the audit names and `mapping test` replays.
+    let identities = Arc::new(IdentityRepository::new(db.clone()));
     // The key the edge signs app JWTs with, and whose JWKS it serves —
     // generated on first need, persisted in the state store.
     let signer = Arc::new(JwtSigner::new(db.clone()));
@@ -1248,6 +1345,8 @@ async fn run(args: RunArgs) -> Result<()> {
             auth_log,
             entitlements,
             sessions,
+            mappings,
+            identities,
             // The very signer the edge signs with, so a rotation over this
             // socket retires the key the next request would have used.
             signer,
@@ -1540,6 +1639,48 @@ async fn audit(args: UserRefArgs) -> Result<()> {
     print!(
         "{}",
         client::auth_audit(&args.server.server, &args.user).await?
+    );
+
+    Ok(())
+}
+
+async fn mapping_list(args: MappingListArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::auth_mapping_list(&args.server.server, args.app.as_ref()).await?
+    );
+
+    Ok(())
+}
+
+async fn mapping_add(args: MappingAddArgs) -> Result<()> {
+    let add = client::MappingAdd {
+        via: args.via,
+        app: args.grants.app,
+        roles: args.grants.roles,
+        conditions: args.when,
+    };
+    print!(
+        "{}",
+        client::auth_mapping_add(&args.server.server, &add).await?
+    );
+
+    Ok(())
+}
+
+async fn mapping_test(args: UserRefArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::auth_mapping_test(&args.server.server, &args.user).await?
+    );
+
+    Ok(())
+}
+
+async fn mapping_drop(args: MappingDropArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::auth_mapping_drop(&args.server.server, &args.rule).await?
     );
 
     Ok(())

@@ -367,6 +367,12 @@ impl UserRepository {
                 // commands that were never given.
                 super::entitlement::remove_all_in(&transaction, &record.id)?;
 
+                // The identity link is drop-only too, and for the same shape
+                // of reason: suspend keeps it so the resumed user's next login
+                // updates the link they had, while a drop must free the
+                // external account to vouch for whoever holds the slug next.
+                super::mapping::remove_users_in(&transaction, &record.id)?;
+
                 offboard(&transaction, &record.id)?;
 
                 transaction.commit().context("committing a user's drop")?;

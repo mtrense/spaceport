@@ -31,9 +31,10 @@ use crate::app::manifest::VarName;
 use crate::app::secrets::Set;
 use crate::app::{App, AppId, AppManifest, AppRecord, AppRepository, DataDir, Pattern, health};
 use crate::auth::{
-    AuthLogRepository, EntitlementError, EntitlementRepository, Granted, JwtSigner, RevokeScope,
-    Revoked, Role, RoleAtApp, SessionError, SessionId, SessionRepository, UserError, UserId,
-    UserRecord, UserRef, UserRepository,
+    AuthLogRepository, Condition, EntitlementError, EntitlementRepository, Granted,
+    IdentityRepository, JwtSigner, MappingError, MappingRepository, RevokeScope, Revoked, Role,
+    RoleAtApp, RolesAtApp, SessionError, SessionId, SessionRepository, UserError, UserId,
+    UserRecord, UserRef, UserRepository, evaluate,
 };
 use crate::build::repository::{Build, BuildRepository, BuildState};
 use crate::connections::github::{
@@ -165,6 +166,9 @@ fn router(instance: Arc<Instance>, events: Arc<EventBus>, shutdown: Cancellation
             "/auth/users/{user}/entitlements/{scope}",
             put(grant_entitlement).delete(revoke_entitlement),
         )
+        .route("/auth/users/{user}/mapping-test", get(mapping_test))
+        .route("/auth/mappings", get(list_mappings).post(add_mapping))
+        .route("/auth/mappings/{rule}", delete(drop_mapping))
         .route("/auth/keys", get(list_signing_keys))
         .route("/auth/keys/rotate", post(rotate_signing_key))
         .route("/auth/log", get(auth_log))
@@ -246,6 +250,21 @@ impl FromRef<Operator> for Arc<AuthLogRepository> {
 impl FromRef<Operator> for Arc<EntitlementRepository> {
     fn from_ref(operator: &Operator) -> Self {
         operator.instance.entitlements.clone()
+    }
+}
+
+/// And for the handlers that add, list, test and drop SSO mapping rules.
+impl FromRef<Operator> for Arc<MappingRepository> {
+    fn from_ref(operator: &Operator) -> Self {
+        operator.instance.mappings.clone()
+    }
+}
+
+/// And for the two readers of IdP identities: the audit that names the SSO
+/// connection, and the mapping test that replays its attribute snapshot.
+impl FromRef<Operator> for Arc<IdentityRepository> {
+    fn from_ref(operator: &Operator) -> Self {
+        operator.instance.identities.clone()
     }
 }
 
@@ -4237,6 +4256,7 @@ async fn revoke_scoped(
 /// silently does nothing is precisely what an audit exists to surface.
 async fn audit_user(
     State(entitlements): State<Arc<EntitlementRepository>>,
+    State(identities): State<Arc<IdentityRepository>>,
     State(instance): State<Arc<Instance>>,
     UrlPath(user): UrlPath<String>,
 ) -> Response {
@@ -4257,10 +4277,35 @@ async fn audit_user(
     if let Some(email) = &user.email {
         out.field("email", email.clone());
     }
-    // Said rather than omitted: an auditor looking for the SSO connection the
-    // spec promises should read that there is none to look for yet, not wonder
-    // whether the report forgot it.
-    out.field("sso", "none — SSO is a later milestone".to_owned());
+    // The SSO connection the spec promises the audit shows. Said rather than
+    // omitted when there is none: an auditor looking for it should read that
+    // no IdP has vouched for this user, not wonder whether the report forgot.
+    let linked = match identities.for_user(&user.id).await {
+        Ok(linked) => linked,
+        Err(error) => {
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not read `{}`'s idp identities: {error:#}", user.slug),
+            );
+        }
+    };
+    match linked.as_slice() {
+        [] => out.field("sso", "none — no IdP login recorded".to_owned()),
+        linked => {
+            for identity in linked {
+                out.field(
+                    "sso",
+                    format!(
+                        "`{}` as `{}` (id {}), last login {}",
+                        identity.connection,
+                        identity.external_login,
+                        identity.external_id,
+                        identity.last_login_at,
+                    ),
+                );
+            }
+        }
+    }
 
     // What each app's manifest declares, asked once per app rather than once
     // per entitlement: an audit of a user with twelve roles at one app is
@@ -4324,6 +4369,277 @@ async fn audit_user(
     ));
 
     (StatusCode::OK, body).into_response()
+}
+
+/// What `POST /auth/mappings` carries: the parts of `spaceport auth mapping
+/// add`, as JSON — typed fields rather than a path, because a rule is several
+/// values deep and two of them (roles, conditions) are lists.
+///
+/// Every field deserialises through the same parsers the CLI uses, so a rule
+/// smuggled past the CLI with `curl` is held to exactly the same alphabets.
+#[derive(Deserialize)]
+struct MappingBody {
+    /// The connection the spec's `--via` names.
+    via: String,
+    app: AppId,
+    roles: Vec<Role>,
+    conditions: Vec<Condition>,
+}
+
+/// `POST /auth/mappings`: add a rule mapping IdP attributes to roles at an
+/// app.
+///
+/// A `POST` where a grant is a `PUT`, because the server mints the identity: a
+/// grant's triple *is* its name, while a rule's name is the stable id this
+/// response is the first to print. The rule is stored whether or not the app
+/// declares the roles — `grant`'s semantics exactly, since writing rules ahead
+/// of the first deploy is the ordinary order — and each undeclared role earns
+/// the same warning a grant would, beside the rule rather than instead of it.
+async fn add_mapping(
+    State(mappings): State<Arc<MappingRepository>>,
+    State(instance): State<Arc<Instance>>,
+    body: String,
+) -> Response {
+    let body: MappingBody = match serde_json::from_str(&body) {
+        Ok(body) => body,
+        Err(error) => {
+            return refuse(
+                StatusCode::BAD_REQUEST,
+                &format!("that is not a mapping: {error}"),
+            );
+        }
+    };
+    let grants = RolesAtApp {
+        roles: body.roles,
+        app: body.app,
+    };
+
+    let added = match mappings.add(&body.via, &grants, &body.conditions).await {
+        Ok(added) => added,
+        Err(error) => return refuse_mapping(error),
+    };
+
+    let mut out = format!(
+        "mapping added: rule `{}`\n  maps `{}` via `{}` when {}\n",
+        added.rule_id,
+        added.grants(),
+        added.connection,
+        crate::auth::mapping::conditions_prose(&added.conditions),
+    );
+    let declared = DeclaredRoles::of(instance.applier.repository(), &added.app).await;
+    for role in &added.roles {
+        let entitlement = RoleAtApp {
+            role: role.clone(),
+            app: added.app.clone(),
+        };
+        if let Some(warning) = declared.warning(&entitlement) {
+            warn!(rule = %added.rule_id, %entitlement, "{warning}");
+            out.push_str(&format!("  warning: {warning}\n"));
+        }
+    }
+
+    (StatusCode::OK, out).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct MappingQuery {
+    app: Option<String>,
+}
+
+/// `GET /auth/mappings?app=…`: every rule, stable id first — the id is what
+/// `mapping drop` takes, and this listing is the only place to read it back.
+async fn list_mappings(
+    State(mappings): State<Arc<MappingRepository>>,
+    Query(query): Query<MappingQuery>,
+) -> Response {
+    let app: Option<AppId> = match query.app.as_deref().map(str::parse).transpose() {
+        Ok(app) => app,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    let listed = match mappings.list(app.as_ref()).await {
+        Ok(listed) => listed,
+        Err(error) => {
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not list the mappings: {error:#}"),
+            );
+        }
+    };
+
+    if listed.is_empty() {
+        let body = match &app {
+            Some(app) => {
+                format!("no mappings exist for `{app}` — `spaceport auth mapping add` writes one\n")
+            }
+            None => {
+                "no mappings exist — `spaceport auth mapping add` writes the first one\n".to_owned()
+            }
+        };
+
+        return (StatusCode::OK, body).into_response();
+    }
+
+    let rows: Vec<Vec<String>> = listed
+        .iter()
+        .map(|mapping| {
+            vec![
+                mapping.rule_id.clone(),
+                mapping.grants().to_string(),
+                mapping.connection.clone(),
+                mapping
+                    .conditions
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                mapping.created_at.clone(),
+            ]
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        columns(&["RULE", "MAPS", "VIA", "WHEN", "CREATED"], &rows),
+    )
+        .into_response()
+}
+
+/// `DELETE /auth/mappings/{rule}`: the spec's cascade — the rule goes, every
+/// entitlement it produced goes in the same commit, and the affected users'
+/// cached JWTs are purged so nothing on the hot path outlives the delete.
+async fn drop_mapping(
+    State(mappings): State<Arc<MappingRepository>>,
+    UrlPath(rule): UrlPath<String>,
+) -> Response {
+    let dropped = match mappings.drop_rule(&rule).await {
+        Ok(dropped) => dropped,
+        Err(error) => return refuse_mapping(error),
+    };
+
+    let mut body = format!(
+        "mapping `{}` dropped\n  it mapped `{}` via `{}`\n",
+        dropped.mapping.rule_id,
+        dropped.mapping.grants(),
+        dropped.mapping.connection,
+    );
+    body.push_str(&match dropped.removed {
+        0 => "  no entitlements had been mapped by it\n".to_owned(),
+        removed => format!(
+            "  removed {removed} mapped entitlements from {} users, cached JWTs included\n",
+            dropped.users.len(),
+        ),
+    });
+
+    (StatusCode::OK, body).into_response()
+}
+
+/// `GET /auth/users/{ref}/mapping-test`: replay every rule against the
+/// attributes the user's last IdP login stored, changing nothing and logging
+/// nothing — a dry run is a *read*.
+///
+/// This is the tool the spec builds for the one thing `mapping add` cannot
+/// check: attribute names are IdP vocabulary, so a typo in a `--when` clause
+/// silently never matches, and the only honest answer is to show the operator
+/// the stored snapshot and the judgement over it side by side. Until SSO
+/// lands nobody has a snapshot, and the response says exactly that rather
+/// than dressing an empty answer up as "no rule matches".
+async fn mapping_test(
+    State(entitlements): State<Arc<EntitlementRepository>>,
+    State(identities): State<Arc<IdentityRepository>>,
+    State(mappings): State<Arc<MappingRepository>>,
+    UrlPath(user): UrlPath<String>,
+) -> Response {
+    let user: UserRef = match user.parse() {
+        Ok(user) => user,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    // Resolved through the audit read rather than a resolver of this route's
+    // own, so an unknown user gets exactly the refusal every other command
+    // gives.
+    let (user, _) = match entitlements.audit(&user).await {
+        Ok(audited) => audited,
+        Err(error) => return refuse_entitlement(error),
+    };
+
+    let held = match identities.for_user(&user.id).await {
+        Ok(held) => held,
+        Err(error) => {
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not read `{}`'s idp identities: {error:#}", user.slug),
+            );
+        }
+    };
+    if held.is_empty() {
+        return (
+            StatusCode::OK,
+            format!(
+                "no IdP login recorded for `{}` — `mapping test` replays the attributes stored \
+                 at the last SSO login, and none has happened yet\n",
+                user.slug
+            ),
+        )
+            .into_response();
+    }
+
+    let rules = match mappings.list(None).await {
+        Ok(rules) => rules,
+        Err(error) => {
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not read the mappings: {error:#}"),
+            );
+        }
+    };
+
+    let mut body = String::new();
+    for identity in &held {
+        body.push_str(&format!(
+            "via `{}` as `{}` (id {}), last login {}\n",
+            identity.connection,
+            identity.external_login,
+            identity.external_id,
+            identity.last_login_at,
+        ));
+        for (attr, values) in &identity.attributes {
+            body.push_str(&format!("  {attr} = {}\n", values.join(", ")));
+        }
+
+        let matching = evaluate(&rules, &identity.connection, &identity.attributes);
+        if matching.is_empty() {
+            body.push_str("  no rule matches — an IdP login would map no entitlements\n");
+            continue;
+        }
+        for rule in matching {
+            body.push_str(&format!(
+                "  rule `{}` matches — would map `{}`\n",
+                rule.rule_id,
+                rule.grants(),
+            ));
+        }
+    }
+    body.push_str("\nnothing was changed — an actual IdP login is what applies these\n");
+
+    (StatusCode::OK, body).into_response()
+}
+
+/// One mapping from what went wrong to whose problem it is, for every verb on
+/// mapping rules, in [`refuse_user`]'s shape: a connection or rule nobody made
+/// is a mistyped name, a rule the spec forbids writing is the request's own
+/// fault, and a store that would not answer is the host's.
+fn refuse_mapping(error: MappingError) -> Response {
+    let status = match &error {
+        MappingError::UnknownConnection(_) | MappingError::UnknownRule(_) => StatusCode::NOT_FOUND,
+        MappingError::Refused(_) => StatusCode::BAD_REQUEST,
+        MappingError::Failed(_) => {
+            warn!(%error, "a mapping command failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+
+    refuse(status, &error.to_string())
 }
 
 /// One mapping from what went wrong to whose problem it is, for every verb on
@@ -4602,6 +4918,8 @@ container:
             auth_log: Arc::new(AuthLogRepository::new(db.clone())),
             entitlements: Arc::new(EntitlementRepository::new(db.clone())),
             sessions: Arc::new(SessionRepository::new(db.clone())),
+            mappings: Arc::new(MappingRepository::new(db.clone())),
+            identities: Arc::new(IdentityRepository::new(db.clone())),
             signer: Arc::new(JwtSigner::new(db.clone())),
             db: db.clone(),
             certificates: None,
@@ -8581,7 +8899,7 @@ container:
         assert!(audit.contains("reader@blog"), "{audit}");
         assert!(audit.contains("manual"), "{audit}");
         assert!(audit.contains("blog"), "{audit}");
-        assert!(audit.contains("SSO is a later milestone"), "{audit}");
+        assert!(audit.contains("no IdP login recorded"), "{audit}");
     }
 
     /// The spec's one sentence about undeclared roles: stored nevertheless,
@@ -8850,5 +9168,323 @@ container:
         assert!(log.contains("entitlement.granted"), "{log}");
         assert!(log.contains("entitlement.revoked"), "{log}");
         assert!(log.contains("role `reader` at app `blog`"), "{log}");
+    }
+
+    /// Plant the connection `--via` is verified against, exactly as `connect`
+    /// records one: the mapping routes read the table, not the API behind it.
+    async fn plant_connection(db: &Db, slug: &str) {
+        let slug = slug.to_owned();
+        db.call(move |connection| {
+            connection
+                .execute(
+                    "INSERT INTO github_apps
+                         (slug, app_id, name, owner, client_id, client_secret, webhook_secret,
+                          private_key, connected_at)
+                     VALUES (?1, 42, 'Spaceport for Acme', 'an-organisation', 'iv1.abc', 'secret',
+                             'hook', 'pem', '2026-01-01T00:00:00Z')",
+                    rusqlite::params![slug],
+                )
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn add_mapping_over_http(router: &Router, body: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/auth/mappings")
+            .body(Body::from(body.to_owned()))
+            .unwrap();
+
+        call(router, request).await
+    }
+
+    /// The rule id out of an add response — the first thing it prints, because
+    /// the id is what every later command aims by.
+    fn rule_in(body: &str) -> String {
+        body.lines()
+            .next()
+            .and_then(|line| line.strip_prefix("mapping added: rule `"))
+            .and_then(|rest| rest.strip_suffix('`'))
+            .expect("the response names the rule id")
+            .to_owned()
+    }
+
+    /// Alice's id, read off the user listing — the id column beside the slug.
+    async fn alice_id(router: &Router) -> String {
+        let (_, listed) = user_command(router, "GET", "/auth/users").await;
+
+        listed
+            .lines()
+            .find(|line| line.starts_with("alice"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .expect("the listing names alice's id")
+            .to_owned()
+    }
+
+    /// The happy path of `mapping add`: declared roles, a stable id in the
+    /// response, the rule in the listing, the add in the log — and no warning
+    /// anywhere near it.
+    #[tokio::test]
+    async fn adds_a_mapping_and_lists_it_under_its_stable_id() {
+        let (router, db) = router_with_alice_and_blog().await;
+        plant_connection(&db, "spaceport-acme").await;
+
+        let (status, body) = add_mapping_over_http(
+            &router,
+            r#"{"via":"spaceport-acme","app":"blog","roles":["reader","writer"],
+                "conditions":[{"attr":"org","value":"acme-corp"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("mapping added: rule `"), "{body}");
+        assert!(
+            body.contains("maps `reader,writer@blog` via `spaceport-acme` when `org=acme-corp`"),
+            "{body}"
+        );
+        assert!(!body.contains("warning"), "{body}");
+        let rule = rule_in(&body);
+
+        let (status, listed) = user_command(&router, "GET", "/auth/mappings").await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert!(listed.contains(&rule), "{listed}");
+        assert!(listed.contains("reader,writer@blog"), "{listed}");
+        assert!(listed.contains("org=acme-corp"), "{listed}");
+
+        // The app filter is a filter: another app's listing is empty prose.
+        let (_, filtered) = user_command(&router, "GET", "/auth/mappings?app=wiki").await;
+        assert!(
+            filtered.contains("no mappings exist for `wiki`"),
+            "{filtered}"
+        );
+
+        let (_, log) = user_command(&router, "GET", "/auth/log").await;
+        assert!(log.contains("mapping.added"), "{log}");
+        assert!(log.contains(&rule), "{log}");
+    }
+
+    /// `grant`'s semantics mirrored onto rules: a role the deployed manifest
+    /// does not declare is stored all the same, with the warning beside the
+    /// rule rather than instead of it.
+    #[tokio::test]
+    async fn a_mapping_for_an_undeclared_role_is_stored_but_warns() {
+        let (router, db) = router_with_alice_and_blog().await;
+        plant_connection(&db, "spaceport-acme").await;
+
+        let (status, body) = add_mapping_over_http(
+            &router,
+            r#"{"via":"spaceport-acme","app":"blog","roles":["editor"],
+                "conditions":[{"attr":"org","value":"acme-corp"}]}"#,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("mapping added"), "{body}");
+        assert!(
+            body.contains("warning: app `blog` does not declare role `editor`"),
+            "{body}"
+        );
+        let (_, listed) = user_command(&router, "GET", "/auth/mappings").await;
+        assert!(listed.contains("editor@blog"), "{listed}");
+    }
+
+    /// The spec's hard rule, held at the socket too: `admin` is never
+    /// mappable, whatever else the rule says.
+    #[tokio::test]
+    async fn refuses_to_map_the_admin_role_over_http() {
+        let (router, db) = router_with_alice_and_blog().await;
+        plant_connection(&db, "spaceport-acme").await;
+
+        let (status, body) = add_mapping_over_http(
+            &router,
+            r#"{"via":"spaceport-acme","app":"blog","roles":["reader","admin"],
+                "conditions":[{"attr":"org","value":"acme-corp"}]}"#,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("never a mappable role"), "{body}");
+    }
+
+    /// `--via` is the one verifiable half of a rule, and a slug nobody
+    /// connected answers like the mistyped name it is.
+    #[tokio::test]
+    async fn refuses_a_mapping_via_a_connection_nobody_made() {
+        let (router, _) = router_with_alice_and_blog().await;
+
+        let (status, body) = add_mapping_over_http(
+            &router,
+            r#"{"via":"ghost","app":"blog","roles":["reader"],
+                "conditions":[{"attr":"org","value":"acme-corp"}]}"#,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("no connection answers to `ghost`"), "{body}");
+    }
+
+    /// The spec's `mapping drop` cascade over HTTP: the rule goes, the
+    /// entitlements it produced go with it in the same commit, manual grants
+    /// stand, and the log records one drop.
+    #[tokio::test]
+    async fn dropping_a_mapping_takes_its_entitlements_with_it() {
+        let (router, db) = router_with_alice_and_blog().await;
+        plant_connection(&db, "spaceport-acme").await;
+        let (_, added) = add_mapping_over_http(
+            &router,
+            r#"{"via":"spaceport-acme","app":"blog","roles":["reader"],
+                "conditions":[{"attr":"org","value":"acme-corp"}]}"#,
+        )
+        .await;
+        let rule = rule_in(&added);
+        let alice = alice_id(&router).await;
+        plant_mapped(&db, &alice, "reader", "blog", &rule).await;
+        user_command(&router, "PUT", "/auth/users/alice/entitlements/writer@blog").await;
+
+        let (status, body) =
+            user_command(&router, "DELETE", &format!("/auth/mappings/{rule}")).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains(&format!("mapping `{rule}` dropped")),
+            "{body}"
+        );
+        assert!(
+            body.contains("removed 1 mapped entitlements from 1 users"),
+            "{body}"
+        );
+        // The mapped row went, the manual grant stands, the rule is gone.
+        let (_, audit) = user_command(&router, "GET", "/auth/users/alice/audit").await;
+        assert!(!audit.contains("reader@blog"), "{audit}");
+        assert!(audit.contains("writer@blog"), "{audit}");
+        let (_, listed) = user_command(&router, "GET", "/auth/mappings").await;
+        assert!(listed.contains("no mappings exist"), "{listed}");
+        let (_, log) = user_command(&router, "GET", "/auth/log").await;
+        assert!(log.contains("mapping.dropped"), "{log}");
+        assert!(!log.contains("entitlement.revoked"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_mapping_nobody_made_is_not_found() {
+        let (router, _) = router_with_alice_and_blog().await;
+
+        let (status, body) = user_command(&router, "DELETE", "/auth/mappings/no-such-rule").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(
+            body.contains("no mapping answers to `no-such-rule`"),
+            "{body}"
+        );
+    }
+
+    /// Until SSO lands nobody has a snapshot to replay, and the dry run must
+    /// say that in as many words rather than dress it up as "no rule matches".
+    #[tokio::test]
+    async fn a_mapping_test_without_an_idp_login_says_so() {
+        let (router, _) = router_with_alice_and_blog().await;
+
+        let (status, body) = user_command(&router, "GET", "/auth/users/alice/mapping-test").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("no IdP login recorded for `alice`"), "{body}");
+
+        // And aimed at nobody, it answers like every other user command.
+        let (status, body) = user_command(&router, "GET", "/auth/users/ghost/mapping-test").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    /// The dry run whole: the stored snapshot is printed, the matching rule
+    /// says what it would map, the failing rule is absent — and nothing was
+    /// changed or logged, because a dry run is a read.
+    #[tokio::test]
+    async fn a_mapping_test_replays_the_stored_snapshot() {
+        let (router, db) = router_with_alice_and_blog().await;
+        plant_connection(&db, "spaceport-acme").await;
+        let (_, added) = add_mapping_over_http(
+            &router,
+            r#"{"via":"spaceport-acme","app":"blog","roles":["reader","writer"],
+                "conditions":[{"attr":"team","value":"authors"}]}"#,
+        )
+        .await;
+        let matching_rule = rule_in(&added);
+        add_mapping_over_http(
+            &router,
+            r#"{"via":"spaceport-acme","app":"wiki","roles":["reader"],
+                "conditions":[{"attr":"team","value":"review"}]}"#,
+        )
+        .await;
+        let alice: crate::auth::UserId = alice_id(&router).await.parse().unwrap();
+        let attributes: crate::auth::Attributes = [
+            ("login".to_owned(), vec!["octo-alice".to_owned()]),
+            (
+                "team".to_owned(),
+                vec!["authors".to_owned(), "design".to_owned()],
+            ),
+        ]
+        .into_iter()
+        .collect();
+        crate::auth::IdentityRepository::new(db.clone())
+            .record(
+                &alice,
+                "spaceport-acme",
+                "583231",
+                "octo-alice",
+                &attributes,
+            )
+            .await
+            .unwrap();
+
+        let (status, body) = user_command(&router, "GET", "/auth/users/alice/mapping-test").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains("via `spaceport-acme` as `octo-alice` (id 583231)"),
+            "{body}"
+        );
+        assert!(body.contains("team = authors, design"), "{body}");
+        assert!(
+            body.contains(&format!(
+                "rule `{matching_rule}` matches — would map `reader,writer@blog`"
+            )),
+            "{body}"
+        );
+        assert!(!body.contains("reader@wiki"), "{body}");
+        assert!(body.contains("nothing was changed"), "{body}");
+        // A read logs nothing: the log knows the two adds and nothing since.
+        let (_, log) = user_command(&router, "GET", "/auth/log").await;
+        assert_eq!(log.matches("mapping.added").count(), 2, "{log}");
+        assert!(!log.contains("mapping-test"), "{log}");
+        // And nothing was mapped: the dry run wrote no entitlement.
+        let (_, audit) = user_command(&router, "GET", "/auth/users/alice/audit").await;
+        assert!(audit.contains("no entitlements"), "{audit}");
+    }
+
+    /// The audit's promise, kept from the moment an identity exists: it shows
+    /// the SSO connection, the login and when it last happened.
+    #[tokio::test]
+    async fn the_audit_names_the_sso_connection_when_one_exists() {
+        let (router, db) = router_with_alice_and_blog().await;
+        let alice: crate::auth::UserId = alice_id(&router).await.parse().unwrap();
+        crate::auth::IdentityRepository::new(db.clone())
+            .record(
+                &alice,
+                "spaceport-acme",
+                "583231",
+                "octo-alice",
+                &crate::auth::Attributes::new(),
+            )
+            .await
+            .unwrap();
+
+        let (status, audit) = user_command(&router, "GET", "/auth/users/alice/audit").await;
+
+        assert_eq!(status, StatusCode::OK, "{audit}");
+        assert!(
+            audit.contains("`spaceport-acme` as `octo-alice` (id 583231)"),
+            "{audit}"
+        );
+        assert!(!audit.contains("no IdP login recorded"), "{audit}");
     }
 }

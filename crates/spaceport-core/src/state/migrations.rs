@@ -608,6 +608,83 @@ const MIGRATIONS: &[&str] = &[
         expires_at    TEXT NOT NULL
     ) STRICT;
     CREATE INDEX api_keys_by_user ON api_keys (user_id);",
+    // 16 — the rules that turn an SSO login into entitlements.
+    //
+    // A mapping says: whoever arrives through `connection` carrying attributes
+    // that satisfy every condition holds these roles at this app. The row is
+    // written now, ahead of the login flow that will read it, because the
+    // operator commands that manage mappings and the `mapped_rule` column that
+    // already tags entitlements both need the rule to exist as a thing with a
+    // stable name — and `rule_id` is that name: a UUID minted at `mapping add`
+    // and printed by `mapping list`, because dropping a rule must delete
+    // exactly the entitlements it produced and nothing an operator could
+    // mistype may widen that.
+    //
+    // `connection` is the GitHub App slug the spec's `--via` names, spelled as
+    // `app_builds.connection` spells it; `spaceport_app` is spaceport's own
+    // `AppId`, spelled apart from GitHub's numeric id for the reason step 5
+    // gives. Neither is a foreign key — forgetting a connection or destroying
+    // an app leaves the rule standing on purpose, because a mapping is intent
+    // like a tracking is, and the honest place for any cascade is the command
+    // that would write it by hand.
+    //
+    // `roles` is the comma-joined list, not a table of its own. A role's
+    // alphabet has no comma in it, the list is read whole and written whole,
+    // and a rule granting three roles is still one decision an operator made
+    // once — rows per role would invite dropping half a rule, which nothing in
+    // the spec can mean. `conditions` is a JSON array of `{attr, value}`
+    // pairs, ANDed at evaluation; JSON rather than another join for the same
+    // reason, and because an attribute name is IdP vocabulary this schema has
+    // no business constraining.
+    "CREATE TABLE mappings (
+        rule_id       TEXT NOT NULL PRIMARY KEY,
+        connection    TEXT NOT NULL,
+        spaceport_app TEXT NOT NULL,
+        roles         TEXT NOT NULL,
+        conditions    TEXT NOT NULL,
+        created_at    TEXT NOT NULL
+    ) STRICT;",
+    // 17 — who a user is at an identity provider, and what that provider said
+    // about them last time they arrived.
+    //
+    // One row per user per connection — the primary key — because an IdP login
+    // is a fact about that pairing: alice-through-github is one identity
+    // however often she signs in, and each login replaces what the last one
+    // recorded. The unique index on `(connection, external_id)` is the other
+    // half of the same claim, read from GitHub's side: one GitHub account may
+    // vouch for one spaceport user, and a login that would link an external id
+    // to a second user must trip a constraint rather than quietly mint a
+    // doppelgänger.
+    //
+    // `external_id` is GitHub's numeric user id kept as TEXT: it is an opaque
+    // key from somebody else's id-space, nothing here does arithmetic on it,
+    // and other IdPs in the same column will not be numbers at all.
+    // `external_login` is the human-readable handle beside it, stored because
+    // an audit reads `octocat`, not `583231` — and stored *as well as* the id
+    // because logins are renameable and the id is what identity hangs on.
+    //
+    // `attributes` is a JSON map of attribute name to a list of values —
+    // single-valued attributes are one-element lists, so `mapping test` can
+    // replay every condition with one containment rule. It is a snapshot of
+    // the last login, not a cache to be reconciled: the spec accepts that a
+    // user removed from the IdP keeps stale attributes until the session
+    // forces the next roundtrip, and these rows are how `mapping test` shows
+    // an operator exactly what that staleness currently says.
+    //
+    // No foreign key to `users`, for the reason step 4 gives everywhere: the
+    // drop cascade deletes these rows by hand in the same transaction, and
+    // suspend deliberately does not — a resumed user's identity link must
+    // still be the one their next login updates rather than recreates.
+    "CREATE TABLE idp_identities (
+        user_id        TEXT NOT NULL,
+        connection     TEXT NOT NULL,
+        external_id    TEXT NOT NULL,
+        external_login TEXT NOT NULL,
+        attributes     TEXT NOT NULL,
+        last_login_at  TEXT NOT NULL,
+        PRIMARY KEY (user_id, connection)
+    ) STRICT;
+    CREATE UNIQUE INDEX idp_identities_by_external ON idp_identities (connection, external_id);",
 ];
 
 /// The schema version this build writes.
@@ -1199,6 +1276,108 @@ mod tests {
                      VALUES ('00000000000000aa', '3f29b1d4-8a6e-4c2b-9e77-1d5f6a2b9c40', 'blog',
                              'reader', 'a-hash', 'spk_…wxyz',
                              '2026-08-16T00:00:00Z', '2026-11-14T00:00:00Z')",
+                    [],
+                )
+                .is_err()
+        );
+    }
+
+    /// A mapping row is one whole rule: the roles ride in one column and the
+    /// conditions in another, so a rule is created and dropped as the single
+    /// decision an operator made.
+    #[test]
+    fn the_sixteenth_migration_creates_the_mappings_table() {
+        let connection = empty();
+        migrate(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO mappings
+                     (rule_id, connection, spaceport_app, roles, conditions, created_at)
+                 VALUES ('019fae2c-cf00-4c40-9e1a-6f2d4b7a9c81', 'spaceport-acme', 'blog',
+                         'reader,writer', '[{\"attr\":\"org\",\"value\":\"acme-corp\"}]',
+                         '2026-08-16T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            columns(&connection, "mappings"),
+            [
+                "rule_id",
+                "connection",
+                "spaceport_app",
+                "roles",
+                "conditions",
+                "created_at"
+            ]
+        );
+        // The rule id is the identity: the same id twice is the constraint
+        // saying no, which is what keeps "drop this rule" unambiguous.
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO mappings
+                         (rule_id, connection, spaceport_app, roles, conditions, created_at)
+                     VALUES ('019fae2c-cf00-4c40-9e1a-6f2d4b7a9c81', 'spaceport-acme', 'wiki',
+                             'reader', '[]', '2026-08-16T00:00:00Z')",
+                    [],
+                )
+                .is_err()
+        );
+    }
+
+    /// Both uniqueness claims the identity table makes, exercised from both
+    /// sides: one row per user per connection, and one spaceport user per
+    /// external account.
+    #[test]
+    fn the_seventeenth_migration_creates_the_identity_table() {
+        let connection = empty();
+        migrate(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO idp_identities
+                     (user_id, connection, external_id, external_login, attributes, last_login_at)
+                 VALUES ('3f29b1d4-8a6e-4c2b-9e77-1d5f6a2b9c40', 'spaceport-acme', '583231',
+                         'octo-alice', '{\"org\":[\"acme-corp\"]}', '2026-08-16T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            columns(&connection, "idp_identities"),
+            [
+                "user_id",
+                "connection",
+                "external_id",
+                "external_login",
+                "attributes",
+                "last_login_at"
+            ]
+        );
+        // The same user arriving through the same connection again is the same
+        // row — a second insert trips the primary key…
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO idp_identities
+                         (user_id, connection, external_id, external_login, attributes,
+                          last_login_at)
+                     VALUES ('3f29b1d4-8a6e-4c2b-9e77-1d5f6a2b9c40', 'spaceport-acme', '999999',
+                             'octo-alice', '{}', '2026-08-16T00:00:00Z')",
+                    [],
+                )
+                .is_err()
+        );
+        // …and the same external account vouching for a second user trips the
+        // unique index.
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO idp_identities
+                         (user_id, connection, external_id, external_login, attributes,
+                          last_login_at)
+                     VALUES ('aaaaaaaa-8a6e-4c2b-9e77-1d5f6a2b9c40', 'spaceport-acme', '583231',
+                             'octo-alice', '{}', '2026-08-16T00:00:00Z')",
                     [],
                 )
                 .is_err()

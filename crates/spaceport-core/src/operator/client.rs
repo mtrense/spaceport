@@ -21,7 +21,7 @@ use tokio::net::{TcpStream, UnixStream};
 use super::{OperatorEndpoint, SecretSet};
 use crate::app::manifest::VarName;
 use crate::app::{AppId, Pattern};
-use crate::auth::{RevokeScope, RoleAtApp, SessionId, UserId, UserRef, UserSlug};
+use crate::auth::{Condition, RevokeScope, Role, RoleAtApp, SessionId, UserId, UserRef, UserSlug};
 use crate::events::{Category, Event, Level};
 use crate::secret::Secret;
 use crate::status::Status;
@@ -487,6 +487,75 @@ pub async fn auth_session_drop(
 /// entitlement with its origin, and the apps they actually reach.
 pub async fn auth_audit(endpoint: &OperatorEndpoint, user: &UserRef) -> Result<String> {
     let request = builder("GET", &format!("/auth/users/{user}/audit")).body(Full::default())?;
+
+    send_to(endpoint, request).await
+}
+
+/// A mapping rule on its way to a spaceport: the parts of `spaceport auth
+/// mapping add`, typed here so the far end deserialises them through the same
+/// parsers the CLI already ran.
+///
+/// JSON in the body rather than a path, because a rule is several values deep
+/// and two of them are lists — the same argument a registration makes.
+#[derive(Debug, Clone, Serialize)]
+pub struct MappingAdd {
+    /// The connection `--via` names.
+    pub via: String,
+    pub app: AppId,
+    pub roles: Vec<Role>,
+    pub conditions: Vec<Condition>,
+}
+
+/// Ask it to add an SSO mapping rule. What comes back names the stable rule
+/// id, which this response is the operator's first sight of.
+pub async fn auth_mapping_add(endpoint: &OperatorEndpoint, add: &MappingAdd) -> Result<String> {
+    let body = serde_json::to_vec(add).context("writing the mapping")?;
+    let request = builder("POST", "/auth/mappings")
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(body)))?;
+
+    send_to(endpoint, request).await
+}
+
+/// Ask for the mapping rules it holds, optionally only those about one app.
+pub async fn auth_mapping_list(endpoint: &OperatorEndpoint, app: Option<&AppId>) -> Result<String> {
+    // An app id is the shared lowercase alphabet, which a query string
+    // carries as it is — the argument [`list`] makes.
+    let uri = match app {
+        Some(app) => format!("/auth/mappings?app={app}"),
+        None => "/auth/mappings".to_owned(),
+    };
+
+    send_to(endpoint, builder("GET", &uri).body(Full::default())?).await
+}
+
+/// Ask it to replay every mapping against the attributes stored from the
+/// user's last IdP login — a dry run that changes nothing at the far end.
+pub async fn auth_mapping_test(endpoint: &OperatorEndpoint, user: &UserRef) -> Result<String> {
+    let request =
+        builder("GET", &format!("/auth/users/{user}/mapping-test")).body(Full::default())?;
+
+    send_to(endpoint, request).await
+}
+
+/// Ask it to drop the mapping rule `rule` names, and with it every
+/// entitlement the rule produced.
+///
+/// The id is held to a rule id's alphabet before it rides the path: a rule id
+/// is hex and hyphens, and anything else could carry a character the URI
+/// would swallow — the far end would then 404 about a string the operator
+/// never typed.
+pub async fn auth_mapping_drop(endpoint: &OperatorEndpoint, rule: &str) -> Result<String> {
+    if rule.is_empty()
+        || !rule
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    {
+        bail!(
+            "`{rule}` is not a rule id — `spaceport auth mapping list` prints them beside each rule"
+        );
+    }
+    let request = builder("DELETE", &format!("/auth/mappings/{rule}")).body(Full::default())?;
 
     send_to(endpoint, request).await
 }
