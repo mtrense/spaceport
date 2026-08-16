@@ -24,7 +24,8 @@
 //! is a spaceport that renders a broken page on exactly the host that is being
 //! set up for the first time.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::extract::{Path, Query, State};
@@ -33,18 +34,19 @@ use axum::routing::{get, post};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use serde::Deserialize;
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use tracing::warn;
 
 use super::gate::query_encode;
 use crate::app::manifest::Host;
 use crate::app::{AppId, AppStore, Auth};
 use crate::auth::{
-    AuthLogRepository, EntitlementRepository, RedeemError, SessionRepository, UserRef, WEB_ORIGIN,
+    AuthLogRepository, EntitlementRepository, RedeemError, SessionRepository, SsoLogin, SsoOutcome,
+    SsoRepository, UserRef, WEB_ORIGIN,
 };
 use crate::connections::github::manifest::{self, Attempts, Manifest};
 use crate::connections::github::{
-    ConnectionRepository, Nudge, TrackingRepository, Transport, register, webhook,
+    Client, ConnectionRepository, Nudge, TrackingRepository, Transport, api, register, webhook,
 };
 use crate::secret::Secret;
 
@@ -110,6 +112,93 @@ pub struct Home {
     /// Named in the callback URLs the exchange builds when it is not 443,
     /// exactly as the plaintext redirect names it.
     pub https_port: u16,
+    /// The SSO logins this spaceport has sent to GitHub and not yet seen come
+    /// back — the state nonce's memory, in-process for the reason `attempts`
+    /// is: a login that does not survive a restart is one more click on the
+    /// login page.
+    pub logins: Arc<LoginAttempts>,
+    /// The transaction a finished GitHub bounce lands in: resolve the user,
+    /// snapshot the identity, re-sync the mapped entitlements, mint the
+    /// session — one commit, over the same tables the operator socket reads.
+    pub sso: Arc<SsoRepository>,
+}
+
+/// How long a login's state nonce is worth remembering.
+///
+/// It spans one trip through GitHub's authorize page — usually non-interactive
+/// and over in a second, occasionally a password and a 2FA prompt. Ten minutes
+/// covers the slow case with room to spare and matches the one-time code's
+/// window, which answers the same question: how long is an invitation to sign
+/// in allowed to sit unused.
+const LOGIN_STATE_LIFETIME: Duration = Duration::minutes(10);
+
+/// One login in flight: which connection it went out through, and where the
+/// finished login should land.
+#[derive(Debug, Clone)]
+struct LoginAttempt {
+    connection: String,
+    /// Already through [`safe_next`] when it was stored, so the value that
+    /// comes back out is a path this host serves and nothing else.
+    next: String,
+    created_at: OffsetDateTime,
+}
+
+/// The SSO logins this spaceport has issued a state for and not yet finished.
+///
+/// The same shape as [`Attempts`] and deliberately so — one lock, an
+/// expiry-on-the-way-past sweep, and a strictly single-use `take`, because the
+/// state's whole job is that an answer arriving at the callback is an answer
+/// to a question this spaceport asked, exactly once. Unlike the setup flow
+/// there is no `peek`: nothing between the redirect and the callback ever
+/// needs to read an attempt without spending it.
+#[derive(Debug, Default)]
+pub struct LoginAttempts {
+    pending: Mutex<HashMap<String, LoginAttempt>>,
+}
+
+impl LoginAttempts {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Remember that a login left through `connection` aiming at `next`, and
+    /// hand back the state that names it.
+    fn begin(
+        &self,
+        connection: String,
+        next: String,
+        now: OffsetDateTime,
+    ) -> anyhow::Result<String> {
+        let state = manifest::nonce()?;
+
+        self.pending
+            .lock()
+            .expect("the pending logins are never held across a panic")
+            .insert(
+                state.clone(),
+                LoginAttempt {
+                    connection,
+                    next,
+                    created_at: now,
+                },
+            );
+
+        Ok(state)
+    }
+
+    /// Consume `state`, if it names a login that has not expired — sweeping
+    /// abandoned attempts on the way past, which is the only sweeping there
+    /// is, for [`Attempts::take`]'s reason.
+    fn take(&self, state: &str, now: OffsetDateTime) -> Option<LoginAttempt> {
+        let mut pending = self
+            .pending
+            .lock()
+            .expect("the pending logins are never held across a panic");
+
+        pending.retain(|_, attempt| now - attempt.created_at < LOGIN_STATE_LIFETIME);
+
+        pending.remove(state)
+    }
 }
 
 /// The session cookie's name. The `__Host-` prefix is a promise the browser
@@ -128,6 +217,12 @@ pub fn router(home: Arc<Home>) -> Router {
         .route("/login", get(login_page).post(login))
         .route("/logout", get(logout_page).post(logout))
         .route("/auth/exchange", get(exchange))
+        // The literal `callback` segment outranks the `{slug}` capture in the
+        // router, which is what lets the two share a prefix — the one slug a
+        // connection can never start a login under is `callback`, and a GitHub
+        // App could only hold that slug by being named it on github.com.
+        .route("/auth/github/{slug}", get(github_start))
+        .route(manifest::LOGIN_CALLBACK_PATH, get(github_callback))
         .route("/.well-known/jwks.json", get(jwks))
         .route(&format!("{}/{{state}}", manifest::SETUP_PATH), get(setup))
         .route(
@@ -145,14 +240,67 @@ async fn index() -> String {
     format!("spaceport {}\n", env!("CARGO_PKG_VERSION"))
 }
 
-/// `GET /login`: the form that turns a one-time code into a session.
+/// `GET /login`: the form that turns a one-time code into a session, and — one
+/// button per GitHub connection — the way in that needs no code at all.
 ///
 /// A `?next=` names where to go after — carried through the form in a hidden
 /// field, and only ever a path this host serves: [`safe_next`] is the gate,
 /// applied on the way out rather than here, so a hostile value ends up as `/`
 /// instead of an error page that teaches nothing.
-async fn login_page(Query(query): Query<LoginQuery>) -> Response {
-    login_form(StatusCode::OK, None, query.next.as_deref())
+async fn login_page(State(home): State<Arc<Home>>, Query(query): Query<LoginQuery>) -> Response {
+    let buttons = sso_buttons(&home, query.next.as_deref()).await;
+
+    login_form(StatusCode::OK, None, query.next.as_deref(), &buttons)
+}
+
+/// The "Sign in with GitHub" buttons, one per connection, already escaped —
+/// or an empty string when there are none, which leaves the page exactly the
+/// page it was before SSO existed.
+///
+/// Each is a `GET` form to the start route with `next` in a hidden field: a
+/// form so the buttons match the code form beside them, `GET` because starting
+/// a login mutates nothing on this host — the state nonce is spaceport's own
+/// bookkeeping, and a prefetch that spends one costs a click, not an account.
+/// A connections read that fails costs the buttons and not the page: the code
+/// form is a working way in, and refusing it because SSO is having trouble
+/// would be the wrong door to close.
+async fn sso_buttons(home: &Home, next: Option<&str>) -> String {
+    let connections = match home.connections.all().await {
+        Ok(connections) => connections,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "the login page could not list connections");
+
+            return String::new();
+        }
+    };
+
+    let next = match safe_next(next) {
+        "/" => String::new(),
+        next => format!(
+            "  <input type=\"hidden\" name=\"next\" value=\"{}\">\n",
+            escape(next)
+        ),
+    };
+    // The connection's display name only when there is a choice to make: one
+    // App is "GitHub" to the person clicking, two are two doors that need
+    // labels.
+    let named = connections.len() > 1;
+
+    connections
+        .iter()
+        .map(|connection| {
+            let label = match named {
+                true => format!("Sign in with GitHub ({})", escape(&connection.name)),
+                false => "Sign in with GitHub".to_owned(),
+            };
+
+            format!(
+                "<form method=\"get\" action=\"/auth/github/{slug}\">\n{next}  \
+                 <button type=\"submit\">{label}</button>\n</form>\n",
+                slug = escape(&connection.slug),
+            )
+        })
+        .collect()
 }
 
 /// `POST /login`: redeem the code, set the cookie, go where `next` says.
@@ -180,45 +328,28 @@ async fn login(State(home): State<Arc<Home>>, headers: HeaderMap, body: String) 
     let next = form_value(&body, "next");
     let next = next.as_deref();
     let Some(code) = form_value(&body, "code").filter(|code| !code.is_empty()) else {
-        return login_form(StatusCode::BAD_REQUEST, Some("Enter the code."), next);
+        let buttons = sso_buttons(&home, next).await;
+
+        return login_form(
+            StatusCode::BAD_REQUEST,
+            Some("Enter the code."),
+            next,
+            &buttons,
+        );
     };
 
     match home.sessions.redeem(&Secret::new(code)).await {
-        Ok(fresh) => {
-            let mut response = Response::new(axum::body::Body::empty());
-            // 303, so the redirect is fetched with GET whatever this was.
-            *response.status_mut() = StatusCode::SEE_OTHER;
-            response.headers_mut().insert(
-                http::header::LOCATION,
-                HeaderValue::from_str(safe_next(next)).expect("a vetted path is a header value"),
-            );
-            match HeaderValue::from_str(&session_cookie(&fresh)) {
-                Ok(cookie) => {
-                    response
-                        .headers_mut()
-                        .insert(http::header::SET_COOKIE, cookie);
+        Ok(fresh) => session_response(&fresh, next),
+        Err(RedeemError::Refused) => {
+            let buttons = sso_buttons(&home, next).await;
 
-                    response
-                }
-                // A token that will not fit in a header was never minted by
-                // this build; refuse rather than redirect to a page that will
-                // only bounce back here.
-                Err(error) => {
-                    warn!(%error, "could not render the session cookie");
-
-                    problem(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Spaceport could not set the session cookie",
-                        "The login itself worked; sign in again with a fresh code.",
-                    )
-                }
-            }
+            login_form(
+                StatusCode::UNAUTHORIZED,
+                Some("That code did not work. Check it, or ask for a new one."),
+                next,
+                &buttons,
+            )
         }
-        Err(RedeemError::Refused) => login_form(
-            StatusCode::UNAUTHORIZED,
-            Some("That code did not work. Check it, or ask for a new one."),
-            next,
-        ),
         Err(RedeemError::Failed(error)) => {
             warn!(error = %format!("{error:#}"), "a login could not be answered");
 
@@ -226,6 +357,41 @@ async fn login(State(home): State<Arc<Home>>, headers: HeaderMap, body: String) 
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Spaceport could not check the code",
                 "Nothing about the code was decided. Try again.",
+            )
+        }
+    }
+}
+
+/// The response every successful login travels out as, whichever door it came
+/// through: the cookie set with every attribute the spec asks for, and a 303
+/// to wherever `next` safely says. One function for the code redemption and
+/// the SSO callback, so the two ways in cannot drift into two cookies.
+fn session_response(fresh: &crate::auth::FreshSession, next: Option<&str>) -> Response {
+    let mut response = Response::new(axum::body::Body::empty());
+    // 303, so the redirect is fetched with GET whatever this was.
+    *response.status_mut() = StatusCode::SEE_OTHER;
+    response.headers_mut().insert(
+        http::header::LOCATION,
+        HeaderValue::from_str(safe_next(next)).expect("a vetted path is a header value"),
+    );
+    match HeaderValue::from_str(&session_cookie(fresh)) {
+        Ok(cookie) => {
+            response
+                .headers_mut()
+                .insert(http::header::SET_COOKIE, cookie);
+
+            response
+        }
+        // A token that will not fit in a header was never minted by this
+        // build; refuse rather than redirect to a page that will only bounce
+        // back here.
+        Err(error) => {
+            warn!(%error, "could not render the session cookie");
+
+            problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Spaceport could not set the session cookie",
+                "The login itself worked; sign in again.",
             )
         }
     }
@@ -515,6 +681,278 @@ async fn jwks(State(home): State<Arc<Home>>) -> Response {
     }
 }
 
+/// `GET /auth/github/{slug}?next=…`: start a login through the connection
+/// `slug` names.
+///
+/// All this does on spaceport's side is remember: a state nonce binding the
+/// connection and the sanitized `next`, so the callback can trust both without
+/// reading either off GitHub's redirect. The browser then goes to GitHub's
+/// authorize page — the written-out [`api::AUTHORIZE_ENDPOINT`], never a value
+/// anything could steer — with the App's client id and the callback url the
+/// manifest declared. When GitHub's own session is live the whole round trip
+/// is non-interactive, which is what makes an expired spaceport session slide:
+/// the bounce lands back here, mints a fresh 12h session, and the user never
+/// saw a page.
+async fn github_start(
+    State(home): State<Arc<Home>>,
+    Path(slug): Path<String>,
+    Query(query): Query<LoginQuery>,
+) -> Response {
+    let Some(hostname) = home.hostname.clone() else {
+        return problem(
+            StatusCode::NOT_FOUND,
+            "This spaceport has no hostname",
+            "Set `edge.hostname` in its config and restart it — without one, GitHub has no address to send a login back to.",
+        );
+    };
+
+    let connection = match home.connections.by_slug(&slug).await {
+        Ok(Some(connection)) => connection,
+        Ok(None) => {
+            return problem(
+                StatusCode::NOT_FOUND,
+                "This sign-in button leads nowhere",
+                "No GitHub connection answers to it — it may have been disconnected. Go back to the login page and try again.",
+            );
+        }
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "a login start could not read its connection");
+
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Spaceport could not start the sign-in",
+                "Nothing was started. Try again.",
+            );
+        }
+    };
+
+    let state = match home.logins.begin(
+        connection.slug.clone(),
+        safe_next(query.next.as_deref()).to_owned(),
+        OffsetDateTime::now_utc(),
+    ) {
+        Ok(state) => state,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "a login start could not mint a state");
+
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Spaceport could not start the sign-in",
+                "Nothing was started. Try again.",
+            );
+        }
+    };
+
+    // The redirect_uri repeats what the manifest declared as the App's
+    // callback — hostname, no port — because GitHub matches the two strings,
+    // and a spaceport on an odd https port registered the portless spelling.
+    see_other(&format!(
+        "{}?client_id={}&redirect_uri={}&state={}",
+        api::AUTHORIZE_ENDPOINT,
+        query_encode(&connection.client_id),
+        query_encode(&format!(
+            "https://{hostname}{}",
+            manifest::LOGIN_CALLBACK_PATH
+        )),
+        query_encode(&state),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubCallback {
+    /// GitHub's one-time authorization code. Optional for [`Callback`]'s
+    /// reason: a browser can arrive with anything, and a missing code should
+    /// be a sentence.
+    code: Option<String>,
+    /// The nonce this spaceport issued at the start route.
+    state: Option<String>,
+    /// What GitHub sends instead of a code when the person said no.
+    error: Option<String>,
+}
+
+/// `GET /auth/github/callback?code=…&state=…`: GitHub has sent the person
+/// back.
+///
+/// The state is spent before anything else is believed: it is the one proof
+/// this answer belongs to a question this spaceport asked, and it carries the
+/// connection and the `next` so neither is ever read off the request. Then the
+/// connection's own client turns the code into a token and the token into who
+/// the person is — and everything from there is [`SsoRepository::login`]'s one
+/// transaction. Every refusal on the way is a sentence with the login page a
+/// click away, because the person standing here is a user mid-sign-in, not an
+/// operator reading a terminal.
+async fn github_callback(
+    State(home): State<Arc<Home>>,
+    Query(query): Query<GithubCallback>,
+) -> Response {
+    // The state is consumed whatever else the query says — a denied login's
+    // nonce is as spent as a finished one's.
+    let attempt = query
+        .state
+        .as_deref()
+        .and_then(|state| home.logins.take(state, OffsetDateTime::now_utc()));
+
+    // The person told GitHub no. Their decision, delivered as prose rather
+    // than a 500 — nothing failed, somebody declined.
+    if let Some(error) = query.error.as_deref() {
+        warn!(error, "a github login came back declined");
+
+        return page(
+            StatusCode::OK,
+            "Sign-in cancelled",
+            r#"<h1>Sign-in cancelled</h1>
+<p>GitHub did not authorize the sign-in — usually because you declined it.</p>
+<p><a href="/login">Back to the login page</a></p>"#,
+        );
+    }
+
+    let Some(attempt) = attempt else {
+        // Unknown, expired and replayed states get one answer, for
+        // [`expired`]'s reason: telling them apart would be telling whoever
+        // asked which states this spaceport issued.
+        return problem(
+            StatusCode::NOT_FOUND,
+            "This sign-in attempt has expired",
+            "It was never started here, has already finished, or sat for more than ten minutes. Start again from the login page at /login.",
+        );
+    };
+    let Some(code) = query.code.filter(|code| !code.is_empty()) else {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "GitHub sent no code",
+            "Only GitHub can finish a sign-in, and it did not. Start again from the login page at /login.",
+        );
+    };
+
+    let connection = match home.connections.by_slug(&attempt.connection).await {
+        Ok(Some(connection)) => connection,
+        Ok(None) => {
+            return problem(
+                StatusCode::NOT_FOUND,
+                "This connection is gone",
+                "The GitHub App this sign-in went out through has been disconnected. Start again from the login page at /login.",
+            );
+        }
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "a login callback could not read its connection");
+
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Spaceport could not finish the sign-in",
+                "Nothing was decided. Start again from the login page at /login.",
+            );
+        }
+    };
+    let client = match Client::new(&connection, home.github.clone()) {
+        Ok(client) => client,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "a login callback could not build its client");
+
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Spaceport could not finish the sign-in",
+                "The connection's credentials would not load. An operator can check `spaceport connect list`.",
+            );
+        }
+    };
+
+    // The whole conversation with GitHub, as one fallible piece: the code
+    // becomes a token, the token becomes who the person is and what they
+    // belong to. One failure sentence for all of it, because to the person
+    // standing here every variant means the same thing — start again.
+    let asked = async {
+        let token = client.exchange_user_code(&code).await?;
+        let user = client.user(&token).await?;
+        let emails = client.user_emails(&token).await?;
+        let orgs = client.user_orgs(&token).await?;
+        let teams = client.user_teams(&token).await?;
+
+        anyhow::Ok((user, emails, orgs, teams))
+    }
+    .await;
+    let (user, emails, orgs, teams) = match asked {
+        Ok(answers) => answers,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "a github login could not be read back");
+
+            return problem(
+                StatusCode::BAD_GATEWAY,
+                "GitHub would not finish the sign-in",
+                "The code may have expired or already been used. Start again from the login page at /login.",
+            );
+        }
+    };
+
+    // The snapshot the mapping rules are judged against. Teams land twice on
+    // purpose: bare (`authors`) because that is the spelling the spec's
+    // `team=authors` example writes, and qualified (`acme-corp/authors`) so an
+    // operator whose organisations reuse a slug can disambiguate — containment
+    // matching means both rules find their value in the same list.
+    let mut attributes = crate::auth::Attributes::new();
+    attributes.insert("login".to_owned(), vec![user.login.clone()]);
+    if !orgs.is_empty() {
+        attributes.insert("org".to_owned(), orgs);
+    }
+    if !teams.is_empty() {
+        let mut values: Vec<String> = teams
+            .iter()
+            .map(|team| format!("{}/{}", team.org, team.slug))
+            .collect();
+        for team in &teams {
+            if !values.contains(&team.slug) {
+                values.push(team.slug.clone());
+            }
+        }
+        attributes.insert("team".to_owned(), values);
+    }
+
+    // The verified addresses, primary first, so linking prefers — and a fresh
+    // record stores — the address the person actually reads.
+    let mut verified: Vec<String> = emails
+        .iter()
+        .filter(|email| email.verified && email.primary)
+        .chain(
+            emails
+                .iter()
+                .filter(|email| email.verified && !email.primary),
+        )
+        .map(|email| email.email.clone())
+        .collect();
+    verified.dedup();
+
+    let outcome = home
+        .sso
+        .login(SsoLogin {
+            connection: connection.slug,
+            external_id: user.id.to_string(),
+            external_login: user.login,
+            verified_emails: verified,
+            attributes,
+        })
+        .await;
+
+    match outcome {
+        Ok(SsoOutcome::SignedIn(fresh)) => session_response(&fresh, Some(&attempt.next)),
+        Ok(SsoOutcome::Suspended(user)) => problem(
+            StatusCode::FORBIDDEN,
+            "This account is suspended",
+            &format!(
+                "GitHub signed you in, and the spaceport account `{}` it belongs to is suspended. An operator can resume it.",
+                user.slug
+            ),
+        ),
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "an sso login could not be recorded");
+
+            problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Spaceport could not finish the sign-in",
+                "GitHub answered and this spaceport could not record the login. Nothing was decided; start again from the login page at /login.",
+            )
+        }
+    }
+}
+
 /// A 303 to `location`: fetched with GET whatever this was.
 fn see_other(location: &str) -> Response {
     let mut response = Response::new(axum::body::Body::empty());
@@ -532,11 +970,17 @@ struct LoginQuery {
     next: Option<String>,
 }
 
-/// The login form, with `error` above it when the last attempt failed and
-/// `next` carried through a hidden field. The code input turns autocomplete
-/// and its relatives off because a one-time code is the one value a browser
-/// must not helpfully remember.
-fn login_form(status: StatusCode, error: Option<&str>, next: Option<&str>) -> Response {
+/// The login form, with `error` above it when the last attempt failed, `next`
+/// carried through a hidden field, and `buttons` — the pre-rendered, already
+/// escaped SSO forms from [`sso_buttons`], or nothing — below it. The code
+/// input turns autocomplete and its relatives off because a one-time code is
+/// the one value a browser must not helpfully remember.
+fn login_form(
+    status: StatusCode,
+    error: Option<&str>,
+    next: Option<&str>,
+    buttons: &str,
+) -> Response {
     let error = match error {
         Some(error) => format!("<p class=\"error\">{}</p>\n", escape(error)),
         None => String::new(),
@@ -558,7 +1002,8 @@ fn login_form(status: StatusCode, error: Option<&str>, next: Option<&str>) -> Re
 {error}<form method="post" action="/login">
 {next}  <input name="code" autofocus autocomplete="off" autocapitalize="off" spellcheck="false">
   <button type="submit">Sign in</button>
-</form>"#
+</form>
+{buttons}"#
         ),
     )
 }
@@ -965,9 +1410,11 @@ mod tests {
             entitlements: Arc::new(EntitlementRepository::new(db.clone())),
             auth_log: Arc::new(AuthLogRepository::new(db.clone())),
             apps: Arc::new(AppStore::new()),
-            signer: Arc::new(crate::auth::JwtSigner::new(db)),
+            signer: Arc::new(crate::auth::JwtSigner::new(db.clone())),
             jwt_cache: Arc::new(crate::auth::JwtCache::new()),
             https_port: 443,
+            logins: Arc::new(LoginAttempts::new()),
+            sso: Arc::new(SsoRepository::new(db)),
         });
 
         (home, github)
@@ -1709,6 +2156,8 @@ mod tests {
             signer: Arc::new(crate::auth::JwtSigner::new(db.clone())),
             jwt_cache: Arc::new(crate::auth::JwtCache::new()),
             https_port: 443,
+            logins: Arc::new(LoginAttempts::new()),
+            sso: Arc::new(SsoRepository::new(db.clone())),
         });
 
         (home, crate::auth::UserRepository::new(db), entitlements)
@@ -2229,5 +2678,467 @@ mod tests {
         assert_eq!(form_value("a=1", "code"), None);
         // A stray percent is carried as it came rather than panicking.
         assert_eq!(form_value("code=1%GG", "code").as_deref(), Some("1%GG"));
+    }
+
+    /// A home whose GitHub can sign the scripted person in, with every
+    /// repository the SSO assertions read handed back over the same database.
+    fn sso_home() -> (Arc<Home>, Arc<FakeGitHub>, Db) {
+        let github = FakeGitHub::new();
+        let db = Db::in_memory().unwrap();
+        let home = Arc::new(Home {
+            attempts: Arc::new(Attempts::new()),
+            connections: Arc::new(ConnectionRepository::new(db.clone())),
+            tracking: Arc::new(TrackingRepository::new(db.clone())),
+            github: github.clone(),
+            nudge: Nudge::new(),
+            builds: Nudge::new(),
+            hostname: Some(HOSTNAME.to_owned()),
+            sessions: Arc::new(SessionRepository::new(db.clone())),
+            entitlements: Arc::new(EntitlementRepository::new(db.clone())),
+            auth_log: Arc::new(AuthLogRepository::new(db.clone())),
+            apps: Arc::new(AppStore::new()),
+            signer: Arc::new(crate::auth::JwtSigner::new(db.clone())),
+            jwt_cache: Arc::new(crate::auth::JwtCache::new()),
+            https_port: 443,
+            logins: Arc::new(LoginAttempts::new()),
+            sso: Arc::new(SsoRepository::new(db.clone())),
+        });
+
+        (home, github, db)
+    }
+
+    /// A connection whose key can actually sign, unlike [`connect`]'s fixture
+    /// PEM: the login callback builds a real [`Client`] out of the row, and a
+    /// key that will not parse would fail the flow before GitHub was asked
+    /// anything.
+    async fn connect_for_login(home: &Home) {
+        home.connections
+            .record(&Connection {
+                slug: "spaceport-for-acme".to_owned(),
+                app_id: 42,
+                name: "Spaceport for Acme".to_owned(),
+                owner: "an-organisation".to_owned(),
+                // The OAuth client the fake's code exchange verifies against.
+                client_id: "Iv1.0123456789abcdef".to_owned(),
+                client_secret: Secret::new("a-client-secret"),
+                webhook_secret: Secret::new("a-webhook-secret"),
+                private_key: Secret::new(crate::connections::github::key::testing::PKCS1),
+                connected_at: String::new(),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Walk the start route and hand back the state GitHub would echo, read
+    /// out of the authorize redirect the way GitHub reads it.
+    async fn started(home: Arc<Home>, path: &str) -> String {
+        let response = router(home)
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers()[http::header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        location
+            .rsplit_once("state=")
+            .expect("the authorize url carries a state")
+            .1
+            .to_owned()
+    }
+
+    /// One callback fetch, as GitHub's redirect would make it.
+    async fn callback_with(home: Arc<Home>, query: &str) -> http::Response<Body> {
+        router(home)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{}?{query}", manifest::LOGIN_CALLBACK_PATH))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Zero connections leave the login page exactly the page it was — no
+    /// button, no mention of GitHub at all.
+    #[tokio::test]
+    async fn the_login_page_offers_no_github_without_a_connection() {
+        let (status, body) = get_path(auth_home().0, "/login").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.to_lowercase().contains("github"), "{body}");
+    }
+
+    /// One connection is one button, posting nowhere but the start route —
+    /// with the code form still beside it, untouched.
+    #[tokio::test]
+    async fn the_login_page_offers_github_per_connection() {
+        let (home, _, _) = sso_home();
+        connect_for_login(&home).await;
+
+        let (status, body) = get_path(home, "/login?next=%2Fwiki").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains(r#"action="/auth/github/spaceport-for-acme""#),
+            "{body}"
+        );
+        assert!(body.contains("Sign in with GitHub"), "{body}");
+        // The `next` rides along in the button's form too.
+        assert!(
+            body.contains(r#"<input type="hidden" name="next" value="/wiki">"#),
+            "{body}"
+        );
+        // And the code form is exactly as it was.
+        assert!(body.contains(r#"<input name="code""#), "{body}");
+    }
+
+    /// The start route's whole job: remember, then hand the browser to the
+    /// written-out authorize endpoint with the App's client id, the callback
+    /// the manifest declared, and a state — never anything read off the
+    /// request.
+    #[tokio::test]
+    async fn starting_a_login_redirects_to_githubs_authorize_page() {
+        let (home, _, _) = sso_home();
+        connect_for_login(&home).await;
+
+        let response = router(home)
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/github/spaceport-for-acme?next=%2Fwiki")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers()[http::header::LOCATION].to_str().unwrap();
+        assert!(
+            location.starts_with(
+                "https://github.com/login/oauth/authorize?client_id=Iv1.0123456789abcdef"
+            ),
+            "{location}"
+        );
+        assert!(
+            location.contains(&format!(
+                "redirect_uri=https%3A%2F%2F{HOSTNAME}%2Fauth%2Fgithub%2Fcallback"
+            )),
+            "{location}"
+        );
+        assert!(location.contains("&state="), "{location}");
+    }
+
+    /// A start aimed at no connection is a sentence, not a bounce to GitHub
+    /// with credentials that belong to nobody.
+    #[tokio::test]
+    async fn starting_a_login_through_an_unknown_connection_is_refused() {
+        let (home, _, _) = sso_home();
+
+        let (status, body) = get_path(home, "/auth/github/ghost").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("No GitHub connection"), "{body}");
+    }
+
+    /// The happy path, end to end through the real router: the button leads to
+    /// GitHub, the callback links by verified email to the operator-made user,
+    /// records the snapshot, re-syncs the mapped entitlement, sets the session
+    /// cookie exactly as the code form does, and lands on `next`.
+    #[tokio::test]
+    async fn a_github_login_links_by_verified_email_and_lands_signed_in() {
+        let (home, github, db) = sso_home();
+        connect_for_login(&home).await;
+        github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
+        github.user_emails_in_pages(&[&[("octocat@acme.example", true, true)]]);
+        github.user_belongs_to_orgs(&["acme-corp"]);
+        github.user_belongs_to_teams(&[("acme-corp", "authors")]);
+        let users = crate::auth::UserRepository::new(db.clone());
+        let alice = users
+            .create(&"alice".parse().unwrap(), Some("octocat@acme.example"))
+            .await
+            .unwrap();
+        // A rule matched through the *bare* team spelling, which is the spec's
+        // own `team=authors` example.
+        let mappings = crate::auth::MappingRepository::new(db.clone());
+        let rule = mappings
+            .add(
+                "spaceport-for-acme",
+                &"reader@blog".parse().unwrap(),
+                &["team=authors".parse().unwrap()],
+            )
+            .await
+            .unwrap();
+
+        let state = started(
+            home.clone(),
+            "/auth/github/spaceport-for-acme?next=%2Fwiki%3Fq%3D1",
+        )
+        .await;
+        let response =
+            callback_with(home.clone(), &format!("code=a-login-code&state={state}")).await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[http::header::LOCATION], "/wiki?q=1");
+        let cookie = response.headers()[http::header::SET_COOKIE]
+            .to_str()
+            .unwrap();
+        assert!(cookie.starts_with("__Host-spaceport-session="), "{cookie}");
+        for attribute in ["Secure", "HttpOnly", "SameSite=Lax", "Path=/", "Max-Age="] {
+            assert!(cookie.contains(attribute), "{cookie}");
+        }
+        // No second user was made: the verified email linked to alice, whose
+        // snapshot now carries the login, the org, and the team both ways.
+        assert_eq!(users.list(None).await.unwrap().len(), 1);
+        let identities = crate::auth::IdentityRepository::new(db.clone());
+        let held = identities.for_user(&alice.id).await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].external_id, "1001");
+        assert_eq!(held[0].attributes["login"], ["octocat"]);
+        assert_eq!(held[0].attributes["org"], ["acme-corp"]);
+        assert_eq!(held[0].attributes["team"], ["acme-corp/authors", "authors"]);
+        // The mapped entitlement arrived, tagged with its rule.
+        let (_, entitled) = home
+            .entitlements
+            .audit(&UserRef::Id(alice.id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(entitled.len(), 1);
+        assert_eq!(entitled[0].role.as_str(), "reader");
+        assert_eq!(
+            entitled[0].mapped_rule.as_deref(),
+            Some(rule.rule_id.as_str())
+        );
+        // And the login is in the log with the connection as its origin.
+        let entries = home.auth_log.entries(None).await.unwrap();
+        assert!(
+            entries.iter().any(
+                |entry| entry.kind == "login.succeeded" && entry.origin == "spaceport-for-acme"
+            ),
+            "{entries:?}"
+        );
+    }
+
+    /// An unverified email is a string anybody can type into their GitHub
+    /// settings, so it links nothing: the login makes a fresh `github:` user
+    /// instead of handing over the account the address spells.
+    #[tokio::test]
+    async fn an_unverified_email_creates_a_user_rather_than_linking() {
+        let (home, github, db) = sso_home();
+        connect_for_login(&home).await;
+        github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
+        github.user_emails_in_pages(&[&[("octocat@acme.example", false, true)]]);
+        let users = crate::auth::UserRepository::new(db.clone());
+        let alice = users
+            .create(&"alice".parse().unwrap(), Some("octocat@acme.example"))
+            .await
+            .unwrap();
+
+        let state = started(home.clone(), "/auth/github/spaceport-for-acme").await;
+        let response =
+            callback_with(home.clone(), &format!("code=a-login-code&state={state}")).await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let listed = users.list(None).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        let minted = listed.iter().find(|user| user.id != alice.id).unwrap();
+        assert_eq!(minted.slug.as_str(), "github:octocat");
+        // The unverified address was not stored either: a record that carried
+        // it would link the next email flow through a string nobody checked.
+        assert_eq!(minted.email, None);
+    }
+
+    /// The returning-identity rule through the router: a recorded identity
+    /// names its user even when somebody else now holds the matching email.
+    #[tokio::test]
+    async fn a_returning_identity_wins_over_a_matching_email() {
+        let (home, github, db) = sso_home();
+        connect_for_login(&home).await;
+        github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
+        github.user_emails_in_pages(&[&[("octocat@acme.example", true, true)]]);
+        let users = crate::auth::UserRepository::new(db.clone());
+        let carol = users.create(&"carol".parse().unwrap(), None).await.unwrap();
+        crate::auth::IdentityRepository::new(db.clone())
+            .record(
+                &carol.id,
+                "spaceport-for-acme",
+                "1001",
+                "octocat",
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        users
+            .create(&"eve".parse().unwrap(), Some("octocat@acme.example"))
+            .await
+            .unwrap();
+
+        let state = started(home.clone(), "/auth/github/spaceport-for-acme").await;
+        callback_with(home.clone(), &format!("code=a-login-code&state={state}")).await;
+
+        // Carol holds the fresh session; eve holds nothing.
+        let (_, carols, _) = home
+            .sessions
+            .list(&UserRef::Id(carol.id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(carols.len(), 1);
+        let (_, eves, _) = home
+            .sessions
+            .list(&UserRef::Slug("eve".parse().unwrap()))
+            .await
+            .unwrap();
+        assert!(eves.is_empty());
+    }
+
+    /// A suspended user's bounce comes back as refusal prose and a logged
+    /// denial — no session, no cookie, no snapshot movement.
+    #[tokio::test]
+    async fn a_suspended_users_github_login_is_refused_and_logged() {
+        let (home, github, db) = sso_home();
+        connect_for_login(&home).await;
+        github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
+        github.user_emails_in_pages(&[&[("octocat@acme.example", true, true)]]);
+        let users = crate::auth::UserRepository::new(db.clone());
+        users
+            .create(&"alice".parse().unwrap(), Some("octocat@acme.example"))
+            .await
+            .unwrap();
+        users
+            .suspend(&UserRef::Slug("alice".parse().unwrap()))
+            .await
+            .unwrap();
+
+        let state = started(home.clone(), "/auth/github/spaceport-for-acme").await;
+        let response =
+            callback_with(home.clone(), &format!("code=a-login-code&state={state}")).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(response.headers().get(http::header::SET_COOKIE).is_none());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("suspended")
+        );
+        let entries = home.auth_log.entries(None).await.unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.kind == "login.failed" && entry.origin == "spaceport-for-acme"),
+            "{entries:?}"
+        );
+    }
+
+    /// The state is single-use and must be spaceport's own: garbage is
+    /// refused, and the same state answered twice signs in once.
+    #[tokio::test]
+    async fn a_bad_or_replayed_state_is_refused() {
+        let (home, github, _) = sso_home();
+        connect_for_login(&home).await;
+        github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
+
+        let (status, body) = get_path(
+            home.clone(),
+            &format!(
+                "{}?code=a-login-code&state=nobody-issued-this",
+                manifest::LOGIN_CALLBACK_PATH
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("expired"), "{body}");
+        assert!(body.contains("/login"), "{body}");
+
+        let state = started(home.clone(), "/auth/github/spaceport-for-acme").await;
+        let first = callback_with(home.clone(), &format!("code=a-login-code&state={state}")).await;
+        let replay = callback_with(home.clone(), &format!("code=a-login-code&state={state}")).await;
+        assert_eq!(first.status(), StatusCode::SEE_OTHER);
+        assert_eq!(replay.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Somebody pressing "cancel" on github.com is not an error in anything:
+    /// prose, a way back to the login page, and no 500.
+    #[tokio::test]
+    async fn a_declined_authorization_is_prose_rather_than_a_failure() {
+        let (home, _, _) = sso_home();
+        connect_for_login(&home).await;
+        let state = started(home.clone(), "/auth/github/spaceport-for-acme").await;
+
+        let response =
+            callback_with(home.clone(), &format!("error=access_denied&state={state}")).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("cancelled"), "{body}");
+        assert!(body.contains("/login"), "{body}");
+        // And the decline spent the state: it cannot be replayed with a code.
+        let retry = callback_with(home, &format!("code=a-login-code&state={state}")).await;
+        assert_eq!(retry.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The spec's re-sync, driven twice through the router: membership that
+    /// went away takes its mapped entitlement along on the next login, and the
+    /// manual grant beside it never moves.
+    #[tokio::test]
+    async fn a_second_login_drops_a_stale_mapped_entitlement_and_keeps_the_manual_grant() {
+        let (home, github, db) = sso_home();
+        connect_for_login(&home).await;
+        github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
+        github.user_emails_in_pages(&[&[("octocat@acme.example", true, true)]]);
+        github.user_belongs_to_orgs(&["acme-corp"]);
+        crate::auth::MappingRepository::new(db.clone())
+            .add(
+                "spaceport-for-acme",
+                &"reader@blog".parse().unwrap(),
+                &["org=acme-corp".parse().unwrap()],
+            )
+            .await
+            .unwrap();
+
+        // First login: the rule matches and maps.
+        let state = started(home.clone(), "/auth/github/spaceport-for-acme").await;
+        callback_with(home.clone(), &format!("code=a-login-code&state={state}")).await;
+        let minted = crate::auth::UserRepository::new(db.clone())
+            .list(None)
+            .await
+            .unwrap()
+            .remove(0);
+        home.entitlements
+            .grant(
+                &UserRef::Id(minted.id.clone()),
+                &"editor@blog".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            home.entitlements
+                .audit(&UserRef::Id(minted.id.clone()))
+                .await
+                .unwrap()
+                .1
+                .len(),
+            2
+        );
+
+        // Thrown out of the organisation, GitHub answers the next login bare.
+        github.user_belongs_to_orgs(&[]);
+        github.signs_in("another-code", "ghu_a-user-token", 1001, "octocat");
+        github.user_emails_in_pages(&[&[("octocat@acme.example", true, true)]]);
+        let state = started(home.clone(), "/auth/github/spaceport-for-acme").await;
+        callback_with(home.clone(), &format!("code=another-code&state={state}")).await;
+
+        let (_, held) = home
+            .entitlements
+            .audit(&UserRef::Id(minted.id))
+            .await
+            .unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].role.as_str(), "editor");
+        assert_eq!(held[0].mapped_rule, None);
     }
 }

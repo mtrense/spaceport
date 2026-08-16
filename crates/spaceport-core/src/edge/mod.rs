@@ -13,7 +13,7 @@ mod service;
 pub mod tls;
 mod websocket;
 
-pub use home::Home;
+pub use home::{Home, LoginAttempts};
 pub use service::{ConnInfo, Scheme};
 
 use std::sync::Arc;

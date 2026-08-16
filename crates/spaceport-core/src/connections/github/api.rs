@@ -63,6 +63,18 @@ pub(super) const API: &str = "https://api.github.com";
 /// editing a config file.
 const USER_TOKEN_ENDPOINT: &str = "https://github.com/login/oauth/access_token";
 
+/// Where a browser is sent to authorize as themselves, before GitHub bounces
+/// them back to the login callback with a code.
+///
+/// Written out whole for the family's reason, and here it matters most of all:
+/// this is a url a *user's browser* is redirected to, and a base that could be
+/// bent by a config edit or a request value would be a login page whoever bent
+/// it controls. `pub` rather than module-private because the redirect is
+/// issued by the edge's login flow, while the exchange the code comes back to
+/// lives here — one constant, so the two ends of the trip cannot disagree
+/// about the host.
+pub const AUTHORIZE_ENDPOINT: &str = "https://github.com/login/oauth/authorize";
+
 /// The media type that selects GitHub's current REST responses.
 ///
 /// GitHub's rule, not a choice: `application/json` still works but is

@@ -345,7 +345,12 @@ impl Attempts {
 
 /// A state nonce: [`STATE_BYTES`] of randomness, in an alphabet a url path
 /// carries as it is.
-fn nonce() -> Result<String> {
+///
+/// `pub(crate)` because the login flow's state nonces are the same shape with
+/// the same job — an answer arriving at a callback must answer a question this
+/// spaceport asked — and a second generator would be a second opinion about
+/// how much randomness that takes.
+pub(crate) fn nonce() -> Result<String> {
     let mut bytes = [0_u8; STATE_BYTES];
 
     SystemRandom::new()

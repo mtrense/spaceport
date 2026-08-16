@@ -771,9 +771,13 @@ pub(super) fn remove_users_in(transaction: &Transaction<'_>, user: &UserId) -> R
 }
 
 /// The row as SQL hands it over, before the typed fields are parsed out.
-type MappingRow = (String, String, String, String, String, String);
+///
+/// `pub(super)` because [`super::sso`] reads the same table inside its login
+/// transaction, and a second row-reader there would be a second opinion about
+/// what a stored rule looks like.
+pub(super) type MappingRow = (String, String, String, String, String, String);
 
-fn mapping_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MappingRow> {
+pub(super) fn mapping_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MappingRow> {
     Ok((
         row.get(0)?,
         row.get(1)?,
@@ -787,7 +791,7 @@ fn mapping_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MappingRow> {
 /// Read a stored row back into a record, holding the stored halves to the
 /// same alphabets `add` did — a row that will not read was written by
 /// something other than this build, and the caller decides what that costs.
-fn mapping_record(row: MappingRow) -> Result<MappingRecord> {
+pub(super) fn mapping_record(row: MappingRow) -> Result<MappingRecord> {
     let (rule_id, connection, app, roles, conditions, created_at) = row;
 
     Ok(MappingRecord {

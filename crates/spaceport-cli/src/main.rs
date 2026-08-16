@@ -16,8 +16,8 @@ use spaceport_core::app::{
 };
 use spaceport_core::auth::{
     AuthLogRepository, Condition, EntitlementRepository, IdentityRepository, JwtCache, JwtSigner,
-    MappingRepository, RevokeScope, RoleAtApp, RolesAtApp, SessionId, SessionRepository, UserId,
-    UserRef, UserRepository, UserSlug, jwt,
+    MappingRepository, RevokeScope, RoleAtApp, RolesAtApp, SessionId, SessionRepository,
+    SsoRepository, UserId, UserRef, UserRepository, UserSlug, jwt,
 };
 use spaceport_core::build;
 use spaceport_core::build::dir::BuildDir;
@@ -1299,6 +1299,10 @@ async fn run(args: RunArgs) -> Result<()> {
     // The key the edge signs app JWTs with, and whose JWKS it serves —
     // generated on first need, persisted in the state store.
     let signer = Arc::new(JwtSigner::new(db.clone()));
+    // The SSO login transaction, over the same cache the other levers purge:
+    // a login's re-sync can narrow a user's slate, and the cached JWTs still
+    // carrying the old one must go in the same breath.
+    let sso = Arc::new(SsoRepository::with_jwt_cache(db.clone(), jwt_cache.clone()));
 
     let home = Arc::new(edge::Home {
         attempts: attempts.clone(),
@@ -1315,6 +1319,10 @@ async fn run(args: RunArgs) -> Result<()> {
         signer: signer.clone(),
         jwt_cache: jwt_cache.clone(),
         https_port: config.edge.listen.https.port(),
+        // In-memory like `attempts`, and per-process for the same reason: a
+        // login that does not survive a restart is one more click.
+        logins: Arc::new(edge::LoginAttempts::new()),
+        sso,
     });
 
     let operator = args.operator.map(|endpoint| {

@@ -26,6 +26,7 @@ pub mod log;
 pub mod mapping;
 pub mod repository;
 pub mod session;
+pub mod sso;
 
 pub use api_key::{ApiKeyId, ApiKeyRecord, DEFAULT_API_KEY_LIFETIME, MintedApiKey};
 pub use app_session::{AppSessionRecord, FreshAppSession};
@@ -44,6 +45,7 @@ pub use session::{
     DEFAULT_SESSION_LIFETIME, FreshSession, MintedCode, RedeemError, SessionError, SessionId,
     SessionRecord, SessionRepository,
 };
+pub use sso::{SsoLogin, SsoOutcome, SsoRepository};
 
 use std::fmt;
 use std::str::FromStr;
@@ -237,6 +239,16 @@ impl<'de> Deserialize<'de> for Role {
 /// diverge. One more rule on top: a slug must not itself parse as a UUID.
 /// Every command that takes `<slug|user-id>` resolves a UUID as an id first,
 /// so a slug that read as one would name a user nobody could ever address.
+///
+/// A slug may also carry a single `provider:` prefix — lowercase letters, one
+/// colon — which is how the SSO login flow names the users it auto-creates
+/// (`github:octocat`). The prefix keeps those out of the plain namespace an
+/// operator types into: `spaceport auth user create` can never collide with a
+/// login that arrived overnight unless the operator spelled the prefix out on
+/// purpose. Behind the colon the leading character may also be a digit,
+/// because the name is the *provider's* and GitHub hands out logins like
+/// `8bit`; a plain slug still has to start with a letter, so nothing an
+/// operator could always type has changed meaning.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct UserSlug(String);
 
@@ -256,10 +268,31 @@ impl FromStr for UserSlug {
         if s.len() > MAX_SLUG_LEN {
             bail!("user slug `{s}` is longer than {MAX_SLUG_LEN} characters");
         }
-        if !s.as_bytes()[0].is_ascii_lowercase() {
+        // The optional provider prefix, split on the *first* colon; a second
+        // one lands in the name and fails the alphabet check below, which is
+        // what makes "single colon" a rule rather than a hope.
+        let (provider, name) = match s.split_once(':') {
+            Some((provider, name)) => (Some(provider), name),
+            None => (None, s),
+        };
+        if let Some(provider) = provider
+            && (provider.is_empty() || !provider.bytes().all(|b| b.is_ascii_lowercase()))
+        {
+            bail!(
+                "user slug `{s}` has a malformed provider prefix — one is lowercase letters \
+                 and a single colon, as in `github:octocat`"
+            );
+        }
+        if name.is_empty() {
+            bail!("user slug `{s}` names nobody after its provider prefix");
+        }
+        // A digit may lead only behind a prefix: the name there is the
+        // provider's to hand out, and GitHub hands out logins like `8bit`.
+        let first = name.as_bytes()[0];
+        if !(first.is_ascii_lowercase() || (provider.is_some() && first.is_ascii_digit())) {
             bail!("user slug `{s}` must start with a lowercase letter");
         }
-        if !s
+        if !name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         {
@@ -461,6 +494,50 @@ mod tests {
         for slug in ["", "Alice", "2fast", "-lead", "my user", "my_user"] {
             assert!(slug.parse::<UserSlug>().is_err(), "accepted `{slug}`");
         }
+    }
+
+    /// The provider-prefixed form the SSO login flow mints: lowercase
+    /// provider, one colon, and — only there — a name that may lead with a
+    /// digit, because GitHub hands out logins like `8bit`.
+    #[test]
+    fn accepts_a_provider_prefixed_slug() {
+        assert_eq!(
+            "github:octocat".parse::<UserSlug>().unwrap().as_str(),
+            "github:octocat"
+        );
+        assert_eq!(
+            "github:8bit".parse::<UserSlug>().unwrap().as_str(),
+            "github:8bit"
+        );
+        assert_eq!(
+            "github:octo-cat-2".parse::<UserSlug>().unwrap().as_str(),
+            "github:octo-cat-2"
+        );
+    }
+
+    /// The widening is exactly one prefix wide: a malformed provider, a second
+    /// colon, an empty half or a digit leading a *plain* slug are all still
+    /// refused — and a UUID is refused however it is spelled.
+    #[test]
+    fn rejects_a_prefixed_slug_that_breaks_the_grammar() {
+        for slug in [
+            "github:",
+            ":octocat",
+            "Github:octocat",
+            "gith_ub:octocat",
+            "github:octo:cat",
+            "github:Octocat",
+            "github:-lead",
+            "2fast", // a digit still may not lead a plain slug
+        ] {
+            assert!(slug.parse::<UserSlug>().is_err(), "accepted `{slug}`");
+        }
+        assert!(
+            "abcdefab-abcd-4abc-8abc-abcdefabcdef"
+                .parse::<UserSlug>()
+                .is_err(),
+            "a UUID-shaped slug slipped through"
+        );
     }
 
     #[test]

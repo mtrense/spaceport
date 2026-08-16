@@ -86,8 +86,9 @@ const TOKEN_BYTES: usize = 32;
 pub struct SessionId(String);
 
 impl SessionId {
-    /// Mint a fresh id from the host's randomness.
-    fn generate() -> Result<Self> {
+    /// Mint a fresh id from the host's randomness. `pub(super)` because the
+    /// SSO login mints sessions of the same shape in [`super::sso`].
+    pub(super) fn generate() -> Result<Self> {
         short_handle().map(Self)
     }
 
