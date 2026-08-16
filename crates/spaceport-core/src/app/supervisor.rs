@@ -144,13 +144,25 @@ impl Drop for Watcher {
 
 /// Keep the apps in `applier`'s store running until `shutdown` is cancelled.
 ///
-/// Wakes on four things: the engine reporting a container of spaceport's is no
-/// longer one, a liveness check giving up on an app, the deadline of the next
-/// attempt to start something again, and the sweep.
+/// Wakes on five things: the engine reporting a container of spaceport's is no
+/// longer one, a liveness check giving up on an app, the store saying the apps
+/// are not the ones it was watching, the deadline of the next attempt to start
+/// something again, and the sweep.
+///
+/// The store is in there because a deployment is not something the engine
+/// announces in a form this loop acts on — the old container's death arrives
+/// while the applier is settling, and the new container starting is not an
+/// event at all. Without it the watchers are re-synced at the next pass, so a
+/// liveness check would go on asking the address of the container the deploy
+/// replaced for up to [`Policy::sweep`]: a minute of checks that cannot fail
+/// usefully and cannot succeed, and of log lines about an app that is fine.
 pub async fn supervise(applier: Arc<Applier>, shutdown: CancellationToken) {
     let mut supervisor = Supervisor::new(applier, Policy::default());
     let mut events = supervisor.applier.runtime().watch();
+    let mut store_changed = supervisor.applier.store().changed();
     let (broken, mut is_broken) = mpsc::channel(WATCHER_BUFFER);
+    // Whether the store's signal is still worth selecting on. See the arm.
+    let mut store_speaks = true;
 
     info!("supervising apps");
 
@@ -161,6 +173,13 @@ pub async fn supervise(applier: Arc<Applier>, shutdown: CancellationToken) {
     supervisor.sweep().await;
 
     loop {
+        // Whatever the store has done up to here is what the two calls below are
+        // about to read for themselves, so it is not also a reason to come round
+        // again. A change from here on is — including the ones this pass makes,
+        // which cost one more pass over a handful of apps and nothing else,
+        // because a pass that changes nothing is the last one.
+        store_changed.mark_unchanged();
+
         supervisor.retry_what_is_due().await;
         supervisor.watch_the_live_ones(&broken);
 
@@ -182,6 +201,19 @@ pub async fn supervise(applier: Arc<Applier>, shutdown: CancellationToken) {
                 Some((app, reason)) => supervisor.found_broken(&app, &reason).await,
                 None => break,
             },
+            // An app was applied, deployed, resumed, suspended or taken down,
+            // so the watchers are about somebody else's containers. The sender
+            // is the store this loop holds through the applier, so the error
+            // arm cannot happen; disabling the arm rather than stopping is
+            // still the right answer if it somehow does, because a supervisor
+            // that gave up over a lost signal would leave the host unsupervised
+            // over the one thing the sweep already covers.
+            result = store_changed.changed(), if store_speaks => {
+                if result.is_err() {
+                    warn!("the app store stopped saying when it changes, so the sweep is the only thing left that notices");
+                    store_speaks = false;
+                }
+            }
         }
     }
 
@@ -527,6 +559,10 @@ mod tests {
         refuse: Mutex<bool>,
         /// Refuse to say what is running, as an engine that has gone away.
         refuse_listing: bool,
+        /// Where to say the next container is listening, for the one test that
+        /// needs something real to answer a check. Otherwise a port per launch,
+        /// which nothing is behind.
+        upstream: Mutex<Option<SocketAddr>>,
     }
 
     impl FakeRuntime {
@@ -549,6 +585,11 @@ mod tests {
 
         fn refuse_to_launch(&self) {
             *self.refuse.lock().unwrap() = true;
+        }
+
+        /// Put everything it starts from now on at `addr`.
+        fn launches_at(&self, addr: SocketAddr) {
+            *self.upstream.lock().unwrap() = Some(addr);
         }
     }
 
@@ -573,10 +614,13 @@ mod tests {
                 running: true,
             });
 
-            Ok(Container {
-                id,
-                upstream: SocketAddr::from(([127, 0, 0, 1], port)),
-            })
+            let upstream = self
+                .upstream
+                .lock()
+                .unwrap()
+                .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], port)));
+
+            Ok(Container { id, upstream })
         }
 
         async fn stop(&self, id: &ContainerId) -> Result<()> {
@@ -1010,6 +1054,59 @@ container:
         // However many times it has failed, and whatever that does to the
         // arithmetic, it never comes back round to a short wait.
         assert_eq!(policy.backoff(u32::MAX), Duration::from_secs(60));
+    }
+
+    /// A deployment replaces an app's container, and nothing the engine says
+    /// about that reaches this loop: the old container's death arrives while
+    /// the applier is settling, and a container starting is not an event at
+    /// all. So the store is what says so, and the watcher has to move at once —
+    /// otherwise the check goes on asking the replaced container's address for
+    /// the rest of the sweep, which is a minute of failures about an app that
+    /// is running perfectly well.
+    ///
+    /// Run against the loop rather than [`Supervisor::watch_the_live_ones`],
+    /// which is where the retention rule already has its test: what is at stake
+    /// here is *when* that runs. The real [`Policy`] and its sixty-second sweep
+    /// are what make the assertion mean anything — a connection inside five
+    /// seconds cannot have come from a sweep.
+    #[tokio::test]
+    async fn watches_a_replaced_container_without_waiting_for_the_sweep() {
+        // Two real addresses, so that a connection is evidence of which
+        // container is being checked and of nothing else.
+        let before = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let after = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (supervisor, _, runtime) = supervising(manifest(LIVENESS)).await;
+        let applier = supervisor.applier.clone();
+        let shutdown = CancellationToken::new();
+
+        runtime.launches_at(before.local_addr().unwrap());
+        applier
+            .apply(id("hello"), manifest(LIVENESS), false)
+            .await
+            .unwrap();
+        let running = tokio::spawn(supervise(applier.clone(), shutdown.clone()));
+        // The first pass has watched the container the app is on, which is what
+        // makes the next connection a decision rather than a coincidence: the
+        // loop is now asleep with nothing due until the sweep.
+        tokio::time::timeout(Duration::from_secs(5), before.accept())
+            .await
+            .expect("the app that was applied should be being checked")
+            .expect("the check should have connected");
+
+        runtime.launches_at(after.local_addr().unwrap());
+        applier
+            .apply(id("hello"), manifest(LIVENESS), false)
+            .await
+            .unwrap();
+
+        let checked = tokio::time::timeout(Duration::from_secs(5), after.accept()).await;
+
+        shutdown.cancel();
+        running.await.unwrap();
+        assert!(
+            checked.is_ok(),
+            "the check should have followed the app to its new container"
+        );
     }
 
     #[tokio::test]
