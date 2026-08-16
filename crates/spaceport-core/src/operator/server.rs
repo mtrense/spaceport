@@ -15,7 +15,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{FromRef, Path as UrlPath, Query, State};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http::StatusCode;
@@ -30,7 +30,10 @@ use crate::app::apply::{Applied, Applier, ApplyError, DestroyError, ResumeError,
 use crate::app::manifest::VarName;
 use crate::app::secrets::Set;
 use crate::app::{App, AppId, AppManifest, AppRecord, AppRepository, DataDir, Pattern, health};
-use crate::auth::{AuthLogRepository, UserError, UserId, UserRecord, UserRef, UserRepository};
+use crate::auth::{
+    AuthLogRepository, EntitlementError, EntitlementRepository, Granted, RevokeScope, Revoked,
+    Role, RoleAtApp, UserError, UserId, UserRecord, UserRef, UserRepository,
+};
 use crate::build::repository::{Build, BuildRepository, BuildState};
 use crate::connections::github::{
     Client, ConnectionRepository, Installation, Nudge, Registration, Tracking, TrackingRepository,
@@ -141,6 +144,15 @@ fn router(instance: Arc<Instance>, events: Arc<EventBus>, shutdown: Cancellation
         .route("/auth/users/{user}", put(create_user).delete(drop_user))
         .route("/auth/users/{user}/suspend", post(suspend_user))
         .route("/auth/users/{user}/resume", post(resume_user))
+        .route("/auth/users/{user}/audit", get(audit_user))
+        .route(
+            "/auth/users/{user}/entitlements",
+            delete(revoke_all_entitlements),
+        )
+        .route(
+            "/auth/users/{user}/entitlements/{scope}",
+            put(grant_entitlement).delete(revoke_entitlement),
+        )
         .route("/auth/log", get(auth_log))
         .route("/connections", get(connections))
         .route("/connections/github", post(connect_github))
@@ -213,6 +225,13 @@ impl FromRef<Operator> for Arc<UserRepository> {
 impl FromRef<Operator> for Arc<AuthLogRepository> {
     fn from_ref(operator: &Operator) -> Self {
         operator.instance.auth_log.clone()
+    }
+}
+
+/// And for the handlers that grant, revoke and audit entitlements.
+impl FromRef<Operator> for Arc<EntitlementRepository> {
+    fn from_ref(operator: &Operator) -> Self {
+        operator.instance.entitlements.clone()
     }
 }
 
@@ -3625,6 +3644,320 @@ struct AuthLogQuery {
     user: Option<String>,
 }
 
+/// What the deployed manifest says about an app's roles, for the one question
+/// grant and audit both ask: does this entitlement open a door?
+///
+/// Read from [`AppRepository`] — the record of what was applied — rather than
+/// from the store of what is running, because a suspended app's roles are
+/// still its roles: an operator granting ahead of a resume is doing the
+/// ordinary thing, and warning them would be crying wolf.
+enum DeclaredRoles {
+    /// Spaceport runs no app under that id.
+    Unknown,
+    /// The app is recorded, but its stored manifest would not read — written
+    /// by a newer build, most likely. Carries why, because "could not check"
+    /// with no reason is the least useful warning there is.
+    Unreadable(String),
+    /// `gating: open` — the app declares no roles, and no entitlement can
+    /// open a door that is not closed.
+    Open,
+    /// `gating: edge`, with these roles.
+    Declares(Vec<Role>),
+}
+
+impl DeclaredRoles {
+    async fn of(apps: &AppRepository, app: &AppId) -> Self {
+        let record = match apps.recorded(app).await {
+            Ok(Some(record)) => record,
+            Ok(None) => return Self::Unknown,
+            Err(error) => return Self::Unreadable(format!("{error:#}")),
+        };
+
+        match AppManifest::parse(&record.manifest) {
+            Ok(manifest) => match manifest.auth {
+                crate::app::Auth::Edge { roles, .. } => Self::Declares(roles),
+                crate::app::Auth::Open {} => Self::Open,
+            },
+            Err(error) => Self::Unreadable(format!("{error:#}")),
+        }
+    }
+
+    /// Whether an entitlement for `role` grants access, as far as the
+    /// deployed manifest is concerned. `Unreadable` answers `false`: a warning
+    /// that turns out unnecessary costs a shrug, access claimed on a manifest
+    /// nobody could read costs trust.
+    fn declares(&self, role: &Role) -> bool {
+        match self {
+            Self::Declares(roles) => roles.contains(role),
+            Self::Unknown | Self::Unreadable(_) | Self::Open => false,
+        }
+    }
+
+    /// The warning a grant for `role` deserves, or `None` for a grant that
+    /// opens a door today.
+    fn warning(&self, entitlement: &RoleAtApp) -> Option<String> {
+        let RoleAtApp { role, app } = entitlement;
+
+        match self {
+            Self::Unknown => Some(format!(
+                "spaceport runs no app `{app}` — the entitlement is stored, and takes effect \
+                 if an app by that id declares role `{role}`"
+            )),
+            Self::Unreadable(reason) => Some(format!(
+                "whether `{app}` declares role `{role}` could not be checked: {reason}"
+            )),
+            Self::Open => Some(format!(
+                "app `{app}` is `gating: open` and declares no roles — the entitlement is \
+                 stored but gates nothing"
+            )),
+            Self::Declares(_) if !self.declares(role) => Some(format!(
+                "app `{app}` does not declare role `{role}` in its manifest — the entitlement \
+                 is stored but grants no access until it does"
+            )),
+            Self::Declares(_) => None,
+        }
+    }
+}
+
+/// `PUT /auth/users/{ref}/entitlements/{role}@{app}`: let this user hold this
+/// role at this app.
+///
+/// A `PUT` because the triple is the identity, exactly as an apply's id is:
+/// granting what is already granted lands on the row that exists and says so,
+/// rather than erroring or duplicating. The grant succeeds even when the app
+/// does not declare the role — the spec stores it with a warning, because
+/// granting ahead of a deploy is the ordinary order of operations — and the
+/// warning goes to both the operator and the log stream, since the operator
+/// reading it now and the one grepping later are usually different people.
+async fn grant_entitlement(
+    State(entitlements): State<Arc<EntitlementRepository>>,
+    State(instance): State<Arc<Instance>>,
+    UrlPath((user, scope)): UrlPath<(String, String)>,
+) -> Response {
+    let user: UserRef = match user.parse() {
+        Ok(user) => user,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+    let entitlement: RoleAtApp = match scope.parse() {
+        Ok(entitlement) => entitlement,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    let granted = match entitlements.grant(&user, &entitlement).await {
+        Ok(granted) => granted,
+        Err(error) => return refuse_entitlement(error),
+    };
+
+    let mut body = match &granted {
+        Granted::Fresh(user) => format!("granted `{entitlement}` to `{}`\n", user.slug),
+        Granted::Already(user, None) => format!(
+            "`{entitlement}` was already granted to `{}` — nothing changed\n",
+            user.slug
+        ),
+        Granted::Already(user, Some(rule)) => format!(
+            "`{entitlement}` is already mapped to `{}` from SSO by rule `{rule}` — nothing \
+             changed, and dropping that rule would take it away again\n",
+            user.slug
+        ),
+    };
+
+    if let Some(warning) = DeclaredRoles::of(instance.applier.repository(), &entitlement.app)
+        .await
+        .warning(&entitlement)
+    {
+        warn!(%entitlement, "{warning}");
+        body.push_str(&format!("  warning: {warning}\n"));
+    }
+
+    (StatusCode::OK, body).into_response()
+}
+
+/// `DELETE /auth/users/{ref}/entitlements/{[role@]app}`: take one role away,
+/// or every role at one app.
+async fn revoke_entitlement(
+    State(entitlements): State<Arc<EntitlementRepository>>,
+    UrlPath((user, scope)): UrlPath<(String, String)>,
+) -> Response {
+    let scope: RevokeScope = match scope.parse() {
+        Ok(scope) => scope,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    revoke_scoped(&entitlements, &user, Some(&scope)).await
+}
+
+/// `DELETE /auth/users/{ref}/entitlements`: the whole slate, across apps —
+/// what the CLI spells `--all`, and deliberately a different route from naming
+/// an app, so nothing ambiguous can ever mean "everything".
+async fn revoke_all_entitlements(
+    State(entitlements): State<Arc<EntitlementRepository>>,
+    UrlPath(user): UrlPath<String>,
+) -> Response {
+    revoke_scoped(&entitlements, &user, None).await
+}
+
+/// The shared tail of the two revoke routes: resolve, revoke, and say what
+/// went and what a mapping held on to.
+async fn revoke_scoped(
+    entitlements: &EntitlementRepository,
+    user: &str,
+    scope: Option<&RevokeScope>,
+) -> Response {
+    let user: UserRef = match user.parse() {
+        Ok(user) => user,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    let Revoked {
+        user,
+        removed,
+        kept,
+    } = match entitlements.revoke(&user, scope).await {
+        Ok(revoked) => revoked,
+        Err(error) => return refuse_entitlement(error),
+    };
+
+    let mut body = match removed.as_slice() {
+        [one] => format!("revoked `{one}` from `{}`\n", user.slug),
+        many => {
+            let mut lines = format!("revoked {} entitlements from `{}`\n", many.len(), user.slug);
+            for entitlement in many {
+                lines.push_str(&format!("  {entitlement}\n"));
+            }
+
+            lines
+        }
+    };
+    // The rows a mapping holds are named rather than silently skipped: an
+    // operator who asked for "everything at blog" should leave knowing what
+    // is still standing and which command actually removes it.
+    for (entitlement, rule) in &kept {
+        body.push_str(&format!(
+            "  kept `{entitlement}` — mapped from SSO by rule `{rule}`, which is what removes it\n"
+        ));
+    }
+
+    (StatusCode::OK, body).into_response()
+}
+
+/// `GET /auth/users/{ref}/audit`: one user's whole standing — who they are,
+/// how they sign in, what they hold, and where that actually gets them.
+///
+/// The last two are deliberately different sections. An entitlement is stored
+/// whether or not the app declares its role, so "what they hold" is the table
+/// as it is; "access" is the spec's judgement over it — the apps where at
+/// least one entitled role is declared — and an entitlement that grants
+/// nothing is flagged in place rather than hidden, because a grant that
+/// silently does nothing is precisely what an audit exists to surface.
+async fn audit_user(
+    State(entitlements): State<Arc<EntitlementRepository>>,
+    State(instance): State<Arc<Instance>>,
+    UrlPath(user): UrlPath<String>,
+) -> Response {
+    let user: UserRef = match user.parse() {
+        Ok(user) => user,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    let (user, held) = match entitlements.audit(&user).await {
+        Ok(audited) => audited,
+        Err(error) => return refuse_entitlement(error),
+    };
+
+    let mut out = Report::default();
+    out.field("user", user.slug.to_string());
+    out.field("id", user.id.to_string());
+    out.field("status", user_status(&user).to_owned());
+    if let Some(email) = &user.email {
+        out.field("email", email.clone());
+    }
+    // Said rather than omitted: an auditor looking for the SSO connection the
+    // spec promises should read that there is none to look for yet, not wonder
+    // whether the report forgot it.
+    out.field("sso", "none — SSO is a later milestone".to_owned());
+
+    // What each app's manifest declares, asked once per app rather than once
+    // per entitlement: an audit of a user with twelve roles at one app is
+    // still one read of that app's record.
+    let mut declared: std::collections::BTreeMap<AppId, DeclaredRoles> = Default::default();
+    for entitlement in &held {
+        if !declared.contains_key(&entitlement.app) {
+            declared.insert(
+                entitlement.app.clone(),
+                DeclaredRoles::of(instance.applier.repository(), &entitlement.app).await,
+            );
+        }
+    }
+
+    let access: Vec<String> = declared
+        .iter()
+        .filter(|(app, roles)| {
+            held.iter()
+                .any(|entitlement| &&entitlement.app == app && roles.declares(&entitlement.role))
+        })
+        .map(|(app, _)| app.to_string())
+        .collect();
+    out.field(
+        "access",
+        match access.is_empty() {
+            true => "no app — no entitled role is declared by a deployed manifest".to_owned(),
+            false => access.join(", "),
+        },
+    );
+
+    let mut body = out.render();
+    if held.is_empty() {
+        body.push_str(
+            "\nno entitlements — `spaceport auth grant` is what hands out the first one\n",
+        );
+
+        return (StatusCode::OK, body).into_response();
+    }
+
+    let rows: Vec<Vec<String>> = held
+        .iter()
+        .map(|entitlement| {
+            vec![
+                format!("{}@{}", entitlement.role, entitlement.app),
+                match &entitlement.mapped_rule {
+                    Some(rule) => format!("mapped by rule `{rule}`"),
+                    None => "manual".to_owned(),
+                },
+                match declared[&entitlement.app].declares(&entitlement.role) {
+                    true => "yes".to_owned(),
+                    false => "no — role not declared by the app".to_owned(),
+                },
+                entitlement.granted_at.clone(),
+            ]
+        })
+        .collect();
+    body.push('\n');
+    body.push_str(&columns(
+        &["ENTITLEMENT", "ORIGIN", "ACCESS", "GRANTED"],
+        &rows,
+    ));
+
+    (StatusCode::OK, body).into_response()
+}
+
+/// One mapping from what went wrong to whose problem it is, for every verb on
+/// entitlements — the shape [`refuse_user`] sets: a mistyped user or a revoke
+/// that matched nothing is a 404, a revoke that only mapped rows answered is a
+/// 409 (a conflict only a mapping command resolves), and a store that would
+/// not answer is a 500.
+fn refuse_entitlement(error: EntitlementError) -> Response {
+    let status = match &error {
+        EntitlementError::UnknownUser(_) | EntitlementError::Nothing(_) => StatusCode::NOT_FOUND,
+        EntitlementError::Mapped(_) => StatusCode::CONFLICT,
+        EntitlementError::Failed(_) => {
+            warn!(%error, "an entitlement command failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+
+    refuse(status, &error.to_string())
+}
+
 fn refuse(status: StatusCode, message: &str) -> Response {
     (status, format!("{message}\n")).into_response()
 }
@@ -3881,6 +4214,7 @@ container:
             deploying: deploying.clone(),
             users: Arc::new(UserRepository::new(db.clone())),
             auth_log: Arc::new(AuthLogRepository::new(db.clone())),
+            entitlements: Arc::new(EntitlementRepository::new(db.clone())),
             db: db.clone(),
             certificates: None,
             reconciled: crate::app::reconcile::Report::default(),
@@ -7436,5 +7770,347 @@ container:
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("not a user id"), "{body}");
+    }
+
+    /// An app whose edge declares roles, for the entitlement tests: `blog`
+    /// understands `reader` and `writer`, and nothing else.
+    const GATED: &str = "schema_version: 1
+source:
+  type: image
+  image: strm/helloworld-http:latest
+routing:
+  hosts: [blog.test]
+auth:
+  gating: edge
+  roles: [reader, writer]
+container:
+  health:
+    readiness:
+      type: none
+";
+
+    /// A router with a user `alice` and the gated `blog` app already in place,
+    /// which is the stage every entitlement test opens on.
+    async fn router_with_alice_and_blog() -> (Router, Db) {
+        let ((_, router, ..), db, _) = parts_with_state(OneContainer::default(), CONFIG);
+        create_user_named(&router, "alice", "").await;
+        let (status, body) = put_app(&router, "blog", GATED).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        (router, db)
+    }
+
+    /// Plant a row as an IdP login will one day write it: tagged with the rule
+    /// that produced it. Nothing can create one over HTTP yet — mappings are a
+    /// later milestone — which is exactly why the refusal has to be tested
+    /// through the back door.
+    async fn plant_mapped(db: &Db, user: &str, role: &str, app: &str, rule: &str) {
+        let (user, role, app, rule) = (
+            user.to_owned(),
+            role.to_owned(),
+            app.to_owned(),
+            rule.to_owned(),
+        );
+        db.call(move |connection| {
+            connection
+                .execute(
+                    "INSERT INTO entitlements
+                         (user_id, spaceport_app, role, mapped_rule, granted_at)
+                     VALUES (?1, ?2, ?3, ?4, '2026-01-01T00:00:00Z')",
+                    rusqlite::params![user, app, role, rule],
+                )
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The happy path the spec is for: a declared role, granted, audited,
+    /// opening the app — and no warning anywhere near it.
+    #[tokio::test]
+    async fn grants_a_declared_role_and_the_audit_shows_the_access() {
+        let (router, _) = router_with_alice_and_blog().await;
+
+        let (status, body) =
+            user_command(&router, "PUT", "/auth/users/alice/entitlements/reader@blog").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("granted `reader@blog` to `alice`"), "{body}");
+        assert!(!body.contains("warning"), "{body}");
+
+        let (status, audit) = user_command(&router, "GET", "/auth/users/alice/audit").await;
+        assert_eq!(status, StatusCode::OK, "{audit}");
+        assert!(audit.contains("reader@blog"), "{audit}");
+        assert!(audit.contains("manual"), "{audit}");
+        assert!(audit.contains("blog"), "{audit}");
+        assert!(audit.contains("SSO is a later milestone"), "{audit}");
+    }
+
+    /// The spec's one sentence about undeclared roles: stored nevertheless,
+    /// with a warning — in the response an operator reads and on the stream
+    /// one greps.
+    #[tokio::test]
+    async fn a_grant_for_an_undeclared_role_is_stored_but_warns() {
+        let (router, _) = router_with_alice_and_blog().await;
+
+        let (status, body) =
+            user_command(&router, "PUT", "/auth/users/alice/entitlements/editor@blog").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("granted `editor@blog` to `alice`"), "{body}");
+        assert!(
+            body.contains("warning: app `blog` does not declare role `editor`"),
+            "{body}"
+        );
+
+        // Stored: the audit lists it, flagged as opening nothing.
+        let (_, audit) = user_command(&router, "GET", "/auth/users/alice/audit").await;
+        assert!(audit.contains("editor@blog"), "{audit}");
+        assert!(audit.contains("role not declared"), "{audit}");
+        assert!(audit.contains("no app"), "{audit}");
+    }
+
+    /// Granting for an app spaceport has never heard of is the same story one
+    /// step earlier — the ordinary case being an operator granting ahead of
+    /// the first deploy.
+    #[tokio::test]
+    async fn a_grant_for_an_unknown_app_is_stored_but_warns() {
+        let (router, _) = router_with_alice_and_blog().await;
+
+        let (status, body) = user_command(
+            &router,
+            "PUT",
+            "/auth/users/alice/entitlements/reader@ghost",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("granted `reader@ghost`"), "{body}");
+        assert!(
+            body.contains("warning: spaceport runs no app `ghost`"),
+            "{body}"
+        );
+    }
+
+    /// An app with `gating: open` declares no roles, so any grant for it can
+    /// only ever gate nothing — worth its own wording.
+    #[tokio::test]
+    async fn a_grant_for_an_open_app_warns_that_it_gates_nothing() {
+        let (router, _) = router_with_alice_and_blog().await;
+        put_app(&router, "open-app", MANIFEST).await;
+
+        let (status, body) = user_command(
+            &router,
+            "PUT",
+            "/auth/users/alice/entitlements/reader@open-app",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("`gating: open`"), "{body}");
+    }
+
+    /// The idempotence the primary key buys, seen from the socket: the second
+    /// grant succeeds, says nothing changed, and the log counts one grant.
+    #[tokio::test]
+    async fn granting_twice_over_http_says_already_granted() {
+        let (router, _) = router_with_alice_and_blog().await;
+        user_command(&router, "PUT", "/auth/users/alice/entitlements/reader@blog").await;
+
+        let (status, body) =
+            user_command(&router, "PUT", "/auth/users/alice/entitlements/reader@blog").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("already granted"), "{body}");
+        assert!(body.contains("nothing changed"), "{body}");
+
+        let (_, log) = user_command(&router, "GET", "/auth/log").await;
+        assert_eq!(log.matches("entitlement.granted").count(), 1, "{log}");
+    }
+
+    /// The three widths of a revoke: one role, one app, everything — each
+    /// taking exactly what it names and nothing beside it.
+    #[tokio::test]
+    async fn revokes_one_role_a_whole_app_or_everything() {
+        let (router, _) = router_with_alice_and_blog().await;
+        for entitlement in ["reader@blog", "writer@blog", "reader@wiki", "reader@docs"] {
+            user_command(
+                &router,
+                "PUT",
+                &format!("/auth/users/alice/entitlements/{entitlement}"),
+            )
+            .await;
+        }
+
+        // One role: `writer@blog` stays.
+        let (status, body) = user_command(
+            &router,
+            "DELETE",
+            "/auth/users/alice/entitlements/reader@blog",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains("revoked `reader@blog` from `alice`"),
+            "{body}"
+        );
+        let (_, audit) = user_command(&router, "GET", "/auth/users/alice/audit").await;
+        assert!(audit.contains("writer@blog"), "{audit}");
+
+        // One app: only `blog`'s remaining role goes.
+        let (status, body) =
+            user_command(&router, "DELETE", "/auth/users/alice/entitlements/blog").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains("revoked `writer@blog` from `alice`"),
+            "{body}"
+        );
+
+        // Everything: the slate is wiped across apps.
+        let (status, body) =
+            user_command(&router, "DELETE", "/auth/users/alice/entitlements").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains("revoked 2 entitlements from `alice`"),
+            "{body}"
+        );
+        assert!(body.contains("reader@wiki"), "{body}");
+        assert!(body.contains("reader@docs"), "{body}");
+        let (_, audit) = user_command(&router, "GET", "/auth/users/alice/audit").await;
+        assert!(audit.contains("no entitlements"), "{audit}");
+    }
+
+    /// The refusal built ahead of its trigger: a mapped entitlement is not the
+    /// operator's to revoke, and the conflict names the rule that is.
+    #[tokio::test]
+    async fn refuses_to_revoke_a_mapped_entitlement_and_names_the_rule() {
+        let (router, db) = router_with_alice_and_blog().await;
+        let (_, listed) = user_command(&router, "GET", "/auth/users").await;
+        let alice = listed
+            .lines()
+            .find(|line| line.starts_with("alice"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .expect("the listing names alice's id")
+            .to_owned();
+        plant_mapped(&db, &alice, "reader", "blog", "rule-7").await;
+
+        let (status, body) = user_command(
+            &router,
+            "DELETE",
+            "/auth/users/alice/entitlements/reader@blog",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("nothing was revoked"), "{body}");
+        assert!(body.contains("rule-7"), "{body}");
+        // Still standing, and the audit says where it came from.
+        let (_, audit) = user_command(&router, "GET", "/auth/users/alice/audit").await;
+        assert!(audit.contains("mapped by rule `rule-7`"), "{audit}");
+    }
+
+    /// A sweep that meets both kinds takes the manual rows and names what the
+    /// mapping held on to, rather than failing over rows it may not touch.
+    #[tokio::test]
+    async fn a_broad_revoke_names_the_mapped_rows_it_kept() {
+        let (router, db) = router_with_alice_and_blog().await;
+        let (_, listed) = user_command(&router, "GET", "/auth/users").await;
+        let alice = listed
+            .lines()
+            .find(|line| line.starts_with("alice"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap()
+            .to_owned();
+        user_command(&router, "PUT", "/auth/users/alice/entitlements/writer@blog").await;
+        plant_mapped(&db, &alice, "reader", "blog", "rule-7").await;
+
+        let (status, body) =
+            user_command(&router, "DELETE", "/auth/users/alice/entitlements/blog").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("revoked `writer@blog`"), "{body}");
+        assert!(body.contains("kept `reader@blog`"), "{body}");
+        assert!(body.contains("rule `rule-7`"), "{body}");
+    }
+
+    /// A revoke that matches nothing is a mistyped name, and answers like one.
+    #[tokio::test]
+    async fn a_revoke_that_matches_nothing_is_not_found() {
+        let (router, _) = router_with_alice_and_blog().await;
+
+        let (status, body) = user_command(
+            &router,
+            "DELETE",
+            "/auth/users/alice/entitlements/reader@blog",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("no such entitlement"), "{body}");
+        assert!(body.contains("spaceport auth audit"), "{body}");
+    }
+
+    /// Entitlement commands aimed at nobody get the user pool's refusal, not a
+    /// new one.
+    #[tokio::test]
+    async fn an_entitlement_command_aimed_at_no_user_is_not_found() {
+        let (router, _) = router_with_alice_and_blog().await;
+
+        for (method, uri) in [
+            ("PUT", "/auth/users/ghost/entitlements/reader@blog"),
+            ("DELETE", "/auth/users/ghost/entitlements/reader@blog"),
+            ("DELETE", "/auth/users/ghost/entitlements"),
+            ("GET", "/auth/users/ghost/audit"),
+        ] {
+            let (status, body) = user_command(&router, method, uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}: {body}");
+            assert!(body.contains("no user answers to `ghost`"), "{body}");
+        }
+    }
+
+    /// The spec's drop cascade over HTTP: the user goes, their entitlements go
+    /// with them in the same commit, and the recreated slug starts clean.
+    #[tokio::test]
+    async fn dropping_a_user_takes_their_entitlements_with_them() {
+        let (router, db) = router_with_alice_and_blog().await;
+        user_command(&router, "PUT", "/auth/users/alice/entitlements/reader@blog").await;
+
+        user_command(&router, "DELETE", "/auth/users/alice").await;
+
+        let rows: i64 = db
+            .call(|connection| {
+                connection
+                    .query_row("SELECT count(*) FROM entitlements", [], |row| row.get(0))
+                    .map_err(anyhow::Error::from)
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+
+        // And the drop is in the log while per-row revokes are not: the rows
+        // went as a cascade of the drop, not as commands somebody gave.
+        let (_, log) = user_command(&router, "GET", "/auth/log").await;
+        assert!(log.contains("user.dropped"), "{log}");
+        assert!(!log.contains("entitlement.revoked"), "{log}");
+    }
+
+    /// What the log gains from this milestone: grants and revokes land beside
+    /// the user events, each naming the role and the app it was about.
+    #[tokio::test]
+    async fn the_log_records_grants_and_revokes() {
+        let (router, _) = router_with_alice_and_blog().await;
+        user_command(&router, "PUT", "/auth/users/alice/entitlements/reader@blog").await;
+        user_command(
+            &router,
+            "DELETE",
+            "/auth/users/alice/entitlements/reader@blog",
+        )
+        .await;
+
+        let (status, log) = user_command(&router, "GET", "/auth/log").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(log.contains("entitlement.granted"), "{log}");
+        assert!(log.contains("entitlement.revoked"), "{log}");
+        assert!(log.contains("role `reader` at app `blog`"), "{log}");
     }
 }

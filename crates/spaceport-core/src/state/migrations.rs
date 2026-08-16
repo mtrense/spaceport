@@ -410,6 +410,45 @@ const MIGRATIONS: &[&str] = &[
         detail  TEXT
     ) STRICT;
     CREATE INDEX auth_events_by_user ON auth_events (user_id, at);",
+    // 11 — what a user may do: one row per user, app and role.
+    //
+    // The primary key is the triple itself, because the triple *is* the
+    // entitlement: granting `reader` on `blog` to alice a second time must land
+    // on the row that exists rather than pile a duplicate beside it, and with
+    // this key the insert is the check — the same argument `app_builds` makes
+    // for `(spaceport_app, revision)`. A synthetic id would make every grant a
+    // new row and push "is this already granted?" into a query somebody has to
+    // remember to write.
+    //
+    // `spaceport_app` is spaceport's own `AppId`, spelled as step 5 spells it
+    // so nothing here can be confused with GitHub's numeric app id. It is
+    // deliberately *not* constrained to an app spaceport currently runs: the
+    // spec stores an entitlement for a role the app does not understand (with a
+    // warning), and granting ahead of the first deploy is the ordinary way an
+    // operator sets an app up. `role` is text in the manifest's role alphabet;
+    // what the app actually declares is the manifest's business, checked when a
+    // JWT is minted, never enforced here.
+    //
+    // `mapped_rule` is where an entitlement came from: NULL for a manual grant
+    // through the operator CLI, and — when SSO mappings land — the stable id of
+    // the mapping rule that produced it. It is in the schema now rather than
+    // bolted on later because `revoke` already has to branch on it: a mapped
+    // entitlement is refused with the rule named, since revoking it by hand
+    // would only last until the next IdP login re-syncs it back.
+    //
+    // No foreign key to `users`, for the reason step 4 gives and because the
+    // drop cascade is written by hand where the knowledge belongs: dropping a
+    // user deletes their entitlements in the same transaction, and suspending
+    // deliberately does not — the spec keeps a suspended user's entitlements so
+    // that resume restores access.
+    "CREATE TABLE entitlements (
+        user_id       TEXT NOT NULL,
+        spaceport_app TEXT NOT NULL,
+        role          TEXT NOT NULL,
+        mapped_rule   TEXT,
+        granted_at    TEXT NOT NULL,
+        PRIMARY KEY (user_id, spaceport_app, role)
+    ) STRICT;",
 ];
 
 /// The schema version this build writes.
@@ -761,6 +800,56 @@ mod tests {
                 )
                 .unwrap(),
             (0, None)
+        );
+    }
+
+    /// A manual grant is the row with everything defaulted that can be: no
+    /// mapping rule produced it, and NULL is what says so — the column exists
+    /// now precisely so mapped rows need no schema change later.
+    #[test]
+    fn the_eleventh_migration_creates_the_entitlements_table() {
+        let connection = empty();
+        migrate(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO entitlements (user_id, spaceport_app, role, granted_at)
+                 VALUES ('3f29b1d4-8a6e-4c2b-9e77-1d5f6a2b9c40', 'blog', 'reader',
+                         '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            columns(&connection, "entitlements"),
+            [
+                "user_id",
+                "spaceport_app",
+                "role",
+                "mapped_rule",
+                "granted_at"
+            ]
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT mapped_rule FROM entitlements WHERE spaceport_app = 'blog'",
+                    [],
+                    |row| row.get::<_, Option<String>>(0)
+                )
+                .unwrap(),
+            None
+        );
+        // The triple is the identity: the same grant again is a constraint
+        // violation for SQL, which the repository turns into idempotence.
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO entitlements (user_id, spaceport_app, role, granted_at)
+                     VALUES ('3f29b1d4-8a6e-4c2b-9e77-1d5f6a2b9c40', 'blog', 'reader',
+                             '2026-01-02T00:00:00Z')",
+                    [],
+                )
+                .is_err()
         );
     }
 

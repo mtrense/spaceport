@@ -21,7 +21,7 @@ use crate::app::Pattern;
 use crate::state::{Db, now};
 
 /// The row as SQL hands it over, before the typed fields are parsed out.
-type Row = (String, String, Option<String>, bool, String);
+pub(super) type Row = (String, String, Option<String>, bool, String);
 
 /// Read a stored row back into a record.
 ///
@@ -30,7 +30,7 @@ type Row = (String, String, Option<String>, bool, String);
 /// it, a lookup fails loudly — one bad row must not cost an operator the
 /// listing of everyone else, but a command aimed at exactly that row has
 /// nothing useful to do instead.
-fn record(row: Row) -> Result<UserRecord> {
+pub(super) fn record(row: Row) -> Result<UserRecord> {
     let (id, slug, email, suspended, created_at) = row;
 
     Ok(UserRecord {
@@ -50,7 +50,11 @@ fn record(row: Row) -> Result<UserRecord> {
 
 /// One user's row, inside the caller's transaction, by whichever name the
 /// operator used.
-fn find(transaction: &Transaction<'_>, user: &UserRef) -> Result<Option<Row>> {
+///
+/// `pub(super)` because [`crate::auth::entitlement`] resolves the same
+/// `<slug|user-id>` inside its own transactions, and two resolvers would be
+/// two answers about which user a command meant.
+pub(super) fn find(transaction: &Transaction<'_>, user: &UserRef) -> Result<Option<Row>> {
     let (query, key) = match user {
         UserRef::Id(id) => (
             "SELECT user_id, user_slug, email, suspended, created_at
@@ -78,11 +82,10 @@ fn find(transaction: &Transaction<'_>, user: &UserRef) -> Result<Option<Row>> {
         .context("looking a user up")
 }
 
-/// The refusal every command aimed at a user that is not there gets.
-fn unknown(user: &UserRef) -> UserError {
-    UserError::Unknown(anyhow!(
-        "no user answers to `{user}` — `spaceport auth user list` says who exists"
-    ))
+/// The refusal every command aimed at a user that is not there gets, worded
+/// once for every module that can meet one.
+pub(super) fn unknown(user: &UserRef) -> anyhow::Error {
+    anyhow!("no user answers to `{user}` — `spaceport auth user list` says who exists")
 }
 
 /// The global user pool, over the state database.
@@ -287,7 +290,7 @@ impl UserRepository {
             .await
             .map_err(UserError::Failed)?;
 
-        found.ok_or_else(|| unknown(user))
+        found.ok_or_else(|| UserError::Unknown(unknown(user)))
     }
 
     /// Delete a user, keeping only the log's memory of them.
@@ -332,6 +335,15 @@ impl UserRepository {
                     Some(&format!("slug `{}`", record.slug)),
                 )?;
 
+                // The drop-only half of the cascade, beside `offboard` rather
+                // than inside it: suspend runs `offboard` too, and the spec
+                // keeps a suspended user's entitlements so resume restores
+                // exactly the access that was there. Deleted, not logged row
+                // by row — the `user.dropped` entry above is the record, and a
+                // dozen `entitlement.revoked` lines nobody typed would read as
+                // commands that were never given.
+                super::entitlement::remove_all_in(&transaction, &record.id)?;
+
                 offboard(&transaction, &record.id)?;
 
                 transaction.commit().context("committing a user's drop")?;
@@ -341,7 +353,7 @@ impl UserRepository {
             .await
             .map_err(UserError::Failed)?;
 
-        found.ok_or_else(|| unknown(user))
+        found.ok_or_else(|| UserError::Unknown(unknown(user)))
     }
 }
 
@@ -364,13 +376,14 @@ fn slug_collision(error: &anyhow::Error) -> bool {
 
 /// Where suspending or dropping a user grows its teeth.
 ///
-/// HOOK POINT — deliberately empty for now. The spec has both verbs cascade:
-/// sessions (global and per-app, WebSocket connections included), API keys,
-/// entitlements (drop only) and cached JWTs all die with the user, in this
-/// transaction, so that a user the pool says is gone can never be one a
-/// session table still lets in. None of those stores exist yet. When they do,
-/// their deletes go here and nowhere else — every caller that offboards a
-/// user already runs through this one function.
+/// HOOK POINT — still empty. The spec has both verbs cascade the same way:
+/// sessions (global and per-app, WebSocket connections included), API keys
+/// and cached JWTs all die with the user, in this transaction, so that a user
+/// the pool says is gone can never be one a session table still lets in. None
+/// of those stores exist yet; when they do, their deletes go here and nowhere
+/// else. Entitlements deliberately do *not*: they cascade on drop only —
+/// suspend keeps them so resume restores access — so their delete lives at
+/// [`UserRepository::drop_user`]'s call site rather than in this shared path.
 fn offboard(_transaction: &Transaction<'_>, _user: &UserId) -> Result<()> {
     Ok(())
 }

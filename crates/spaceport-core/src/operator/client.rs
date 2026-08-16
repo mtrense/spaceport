@@ -21,7 +21,7 @@ use tokio::net::{TcpStream, UnixStream};
 use super::{OperatorEndpoint, SecretSet};
 use crate::app::manifest::VarName;
 use crate::app::{AppId, Pattern};
-use crate::auth::{UserId, UserRef, UserSlug};
+use crate::auth::{RevokeScope, RoleAtApp, UserId, UserRef, UserSlug};
 use crate::events::{Category, Event, Level};
 use crate::secret::Secret;
 use crate::status::Status;
@@ -371,6 +371,53 @@ pub async fn auth_user_resume(endpoint: &OperatorEndpoint, user: &UserRef) -> Re
 /// Ask it to drop the user `user` names, keeping only the auth log's memory.
 pub async fn auth_user_drop(endpoint: &OperatorEndpoint, user: &UserRef) -> Result<String> {
     let request = builder("DELETE", &format!("/auth/users/{user}")).body(Full::default())?;
+
+    send_to(endpoint, request).await
+}
+
+/// Ask it to grant `entitlement` to the user `user` names.
+///
+/// Both halves are safe in a path as they are: a slug, a role and an app id
+/// share one alphabet with nothing a url reserves, a UUID is hex and hyphens,
+/// and the `@` between role and app is an ordinary path character.
+pub async fn auth_grant(
+    endpoint: &OperatorEndpoint,
+    user: &UserRef,
+    entitlement: &RoleAtApp,
+) -> Result<String> {
+    let request = builder(
+        "PUT",
+        &format!("/auth/users/{user}/entitlements/{entitlement}"),
+    )
+    .body(Full::default())?;
+
+    send_to(endpoint, request).await
+}
+
+/// Ask it to revoke what `scope` names of the user's entitlements — one role
+/// at an app, every role at an app, or (`None`, the CLI's `--all`) everything
+/// across apps.
+///
+/// The absence of a scope is spelled as the absence of a path segment rather
+/// than a magic value, so nothing an operator could type can accidentally mean
+/// "everything".
+pub async fn auth_revoke(
+    endpoint: &OperatorEndpoint,
+    user: &UserRef,
+    scope: Option<&RevokeScope>,
+) -> Result<String> {
+    let uri = match scope {
+        Some(scope) => format!("/auth/users/{user}/entitlements/{scope}"),
+        None => format!("/auth/users/{user}/entitlements"),
+    };
+
+    send_to(endpoint, builder("DELETE", &uri).body(Full::default())?).await
+}
+
+/// Ask for one user's whole standing: the record, the SSO connection, every
+/// entitlement with its origin, and the apps they actually reach.
+pub async fn auth_audit(endpoint: &OperatorEndpoint, user: &UserRef) -> Result<String> {
+    let request = builder("GET", &format!("/auth/users/{user}/audit")).body(Full::default())?;
 
     send_to(endpoint, request).await
 }

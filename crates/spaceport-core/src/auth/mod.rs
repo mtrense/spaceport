@@ -9,14 +9,22 @@
 //! append-only event log ship together: the log is the only place a dropped
 //! user's history survives.
 //!
-//! Nothing here knows about sessions or SSO yet. What it does know is where
-//! they will attach: suspending or dropping a user is the immediate-offboarding
-//! lever, and the repository marks the single place the invalidation cascade
-//! will run from when there is anything to invalidate.
+//! Entitlements are the first thing to hang off that identity: one row per
+//! user, app and role, granted by hand over the operator socket and — in a
+//! later milestone — mapped from SSO logins. Sessions and SSO themselves are
+//! still to come. What this module does know is where they will attach:
+//! suspending or dropping a user is the immediate-offboarding lever, and the
+//! repository marks the single place the invalidation cascade will run from
+//! when there is anything to invalidate.
 
+pub mod entitlement;
 pub mod log;
 pub mod repository;
 
+pub use entitlement::{
+    EntitlementError, EntitlementRecord, EntitlementRepository, Granted, RevokeScope, Revoked,
+    RoleAtApp,
+};
 pub use log::{AuthEvent, AuthLogRepository, OPERATOR_ORIGIN};
 pub use repository::UserRepository;
 

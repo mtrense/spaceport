@@ -14,7 +14,10 @@ use spaceport_core::app::{
     self, AppId, AppRepository, AppStore, Applier, DataDir, Pattern, SecretRepository, VarName,
     reconcile, supervise,
 };
-use spaceport_core::auth::{AuthLogRepository, UserId, UserRef, UserRepository, UserSlug};
+use spaceport_core::auth::{
+    AuthLogRepository, EntitlementRepository, RevokeScope, RoleAtApp, UserId, UserRef,
+    UserRepository, UserSlug,
+};
 use spaceport_core::build;
 use spaceport_core::build::dir::BuildDir;
 use spaceport_core::build::repository::BuildRepository;
@@ -247,12 +250,66 @@ enum AuthCommand {
     /// minted here are the ones they will name. Whoever can reach the operator
     /// socket is the admin — there is no separate in-band admin role.
     User(UserArgs),
+    /// Grant a user a role at an app.
+    ///
+    /// An entitlement connects a user, an app and a role; only a user holding
+    /// one for a role the app's manifest declares gets through the edge. A
+    /// grant for a role the app does not declare — or an app spaceport does
+    /// not run — is stored all the same, with a warning: granting ahead of the
+    /// deploy is the ordinary order of operations.
+    Grant(GrantArgs),
+    /// Take entitlements away again: one role, one whole app, or everything.
+    ///
+    /// Only manual grants are the operator's to revoke. An entitlement mapped
+    /// from SSO is refused with the rule that produced it — the next IdP login
+    /// would put it straight back, and dropping the mapping is what removes it.
+    Revoke(RevokeArgs),
+    /// Report one user's whole standing: the record, the SSO connection, every
+    /// entitlement with its origin, and the apps they actually reach.
+    Audit(UserRefArgs),
     /// Print the append-only auth event log.
     ///
     /// Every mutating auth command lands in it with a timestamp and where it
     /// came from, and it outlives the users it is about: after a drop, the log
     /// is the only record the user ever existed.
     Log(AuthLogArgs),
+}
+
+#[derive(Debug, Args)]
+struct GrantArgs {
+    /// The user, as a slug or a user id.
+    ///
+    /// The spec writes `<user-id>`; a slug is taken too, because every other
+    /// command that names a user resolves both and a grant that insisted on
+    /// the UUID would have operators copy-pasting what they already typed.
+    user: UserRef,
+
+    /// What to grant, as `<role>@<app-id>`.
+    entitlement: RoleAtApp,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
+// Exactly one of the two shapes, and clap holds the line: a scope names what
+// goes, `--all` says everything does, and a revoke that said both — or
+// neither — would be one nobody can be sure they meant.
+#[command(group = clap::ArgGroup::new("what").args(["scope", "all"]).required(true))]
+struct RevokeArgs {
+    /// The user, as a slug or a user id.
+    user: UserRef,
+
+    /// What to revoke: one entitlement as `<role>@<app-id>`, or a bare
+    /// `<app-id>` for every role the user holds there.
+    scope: Option<RevokeScope>,
+
+    /// Revoke every entitlement the user holds, across all apps.
+    #[arg(long)]
+    all: bool,
+
+    #[command(flatten)]
+    server: ServerArgs,
 }
 
 #[derive(Debug, Args)]
@@ -723,6 +780,9 @@ async fn main() -> Result<()> {
                 UserCommand::Resume(args) => user_resume(args).await,
                 UserCommand::Drop(args) => user_drop(args).await,
             },
+            AuthCommand::Grant(args) => grant(args).await,
+            AuthCommand::Revoke(args) => revoke(args).await,
+            AuthCommand::Audit(args) => audit(args).await,
             AuthCommand::Log(args) => auth_log(args).await,
         },
         Command::Connect { command } => match command {
@@ -1013,6 +1073,7 @@ async fn run(args: RunArgs) -> Result<()> {
             deploying,
             users: Arc::new(UserRepository::new(db.clone())),
             auth_log: Arc::new(AuthLogRepository::new(db.clone())),
+            entitlements: Arc::new(EntitlementRepository::new(db.clone())),
             db,
             certificates: certificates.clone(),
             reconciled: report,
@@ -1217,6 +1278,35 @@ async fn user_drop(args: UserRefArgs) -> Result<()> {
     print!(
         "{}",
         client::auth_user_drop(&args.server.server, &args.user).await?
+    );
+
+    Ok(())
+}
+
+async fn grant(args: GrantArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::auth_grant(&args.server.server, &args.user, &args.entitlement).await?
+    );
+
+    Ok(())
+}
+
+/// Clap has already enforced that exactly one of `scope` and `--all` was
+/// given, so an absent scope *is* `--all` by the time it gets here.
+async fn revoke(args: RevokeArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::auth_revoke(&args.server.server, &args.user, args.scope.as_ref()).await?
+    );
+
+    Ok(())
+}
+
+async fn audit(args: UserRefArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::auth_audit(&args.server.server, &args.user).await?
     );
 
     Ok(())

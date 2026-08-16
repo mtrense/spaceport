@@ -23,7 +23,7 @@ use time::OffsetDateTime;
 use crate::acme::{CertificateRepository, Certificates};
 use crate::app::reconcile::Report;
 use crate::app::{AppId, Applier, health};
-use crate::auth::{AuthLogRepository, UserRepository};
+use crate::auth::{AuthLogRepository, EntitlementRepository, UserRepository};
 use crate::build::repository::BuildRepository;
 use crate::config::{Config, TlsProvider};
 use crate::connections::github::{self, ConnectionRepository, TrackingRepository};
@@ -103,6 +103,10 @@ pub struct Instance {
     /// the other half of the same story — the pool says who exists, the log
     /// says what happened to them — and the two answer over the same database.
     pub auth_log: Arc<AuthLogRepository>,
+    /// What those users may do: the entitlements granted over this socket.
+    /// Beside the other two for the same reason — a grant resolves the same
+    /// `<slug|user-id>` the pool does, and must be looking at the same rows.
+    pub entitlements: Arc<EntitlementRepository>,
     /// Absent when tls is self-signed: then nothing ever orders a certificate.
     pub certificates: Option<Arc<Certificates>>,
     /// What the reconciliation at startup did. Kept because it is the only
@@ -576,6 +580,7 @@ container:
             deploying: github::Nudge::new(),
             users: Arc::new(UserRepository::new(db.clone())),
             auth_log: Arc::new(AuthLogRepository::new(db.clone())),
+            entitlements: Arc::new(EntitlementRepository::new(db.clone())),
             db,
             certificates: None,
             reconciled,
