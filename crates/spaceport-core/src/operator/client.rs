@@ -21,7 +21,7 @@ use tokio::net::{TcpStream, UnixStream};
 use super::{OperatorEndpoint, SecretSet};
 use crate::app::manifest::VarName;
 use crate::app::{AppId, Pattern};
-use crate::auth::{RevokeScope, RoleAtApp, UserId, UserRef, UserSlug};
+use crate::auth::{RevokeScope, RoleAtApp, SessionId, UserId, UserRef, UserSlug};
 use crate::events::{Category, Event, Level};
 use crate::secret::Secret;
 use crate::status::Status;
@@ -409,6 +409,54 @@ pub async fn auth_revoke(
     let uri = match scope {
         Some(scope) => format!("/auth/users/{user}/entitlements/{scope}"),
         None => format!("/auth/users/{user}/entitlements"),
+    };
+
+    send_to(endpoint, builder("DELETE", &uri).body(Full::default())?).await
+}
+
+/// Ask for the sessions of the user `user` names. API keys will join the same
+/// listing when they exist, which is why the answer already carries a KIND
+/// column.
+pub async fn auth_session_list(endpoint: &OperatorEndpoint, user: &UserRef) -> Result<String> {
+    let request = builder("GET", &format!("/auth/users/{user}/sessions")).body(Full::default())?;
+
+    send_to(endpoint, request).await
+}
+
+/// Ask it to mint a one-time code for the user `user` names, redeeming into a
+/// session that lives `expires` (a duration like `12h`, the far end's default
+/// when absent).
+///
+/// The duration travels as the operator spelled it and is parsed at the far
+/// end, where the refusal can come from the same parser every manifest goes
+/// through — two parsers would be two opinions about what `90m` means. Its
+/// alphabet is digits and letters, which a query string carries as they are.
+pub async fn auth_session_mint(
+    endpoint: &OperatorEndpoint,
+    user: &UserRef,
+    expires: Option<&str>,
+) -> Result<String> {
+    let uri = match expires {
+        Some(expires) => format!("/auth/users/{user}/sessions?expires={expires}"),
+        None => format!("/auth/users/{user}/sessions"),
+    };
+
+    send_to(endpoint, builder("POST", &uri).body(Full::default())?).await
+}
+
+/// Ask it to drop one session of the user's, or (`None`) every one they hold.
+///
+/// Absence is the absence of a path segment, exactly as [`auth_revoke`]
+/// spells it, so nothing an operator could type can accidentally mean
+/// "everything".
+pub async fn auth_session_drop(
+    endpoint: &OperatorEndpoint,
+    user: &UserRef,
+    session: Option<&SessionId>,
+) -> Result<String> {
+    let uri = match session {
+        Some(session) => format!("/auth/users/{user}/sessions/{session}"),
+        None => format!("/auth/users/{user}/sessions"),
     };
 
     send_to(endpoint, builder("DELETE", &uri).body(Full::default())?).await

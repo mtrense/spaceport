@@ -376,16 +376,18 @@ fn slug_collision(error: &anyhow::Error) -> bool {
 
 /// Where suspending or dropping a user grows its teeth.
 ///
-/// HOOK POINT — still empty. The spec has both verbs cascade the same way:
-/// sessions (global and per-app, WebSocket connections included), API keys
-/// and cached JWTs all die with the user, in this transaction, so that a user
-/// the pool says is gone can never be one a session table still lets in. None
-/// of those stores exist yet; when they do, their deletes go here and nowhere
-/// else. Entitlements deliberately do *not*: they cascade on drop only —
-/// suspend keeps them so resume restores access — so their delete lives at
-/// [`UserRepository::drop_user`]'s call site rather than in this shared path.
-fn offboard(_transaction: &Transaction<'_>, _user: &UserId) -> Result<()> {
-    Ok(())
+/// HOOK POINT — first tenant in place. The spec has both verbs cascade the
+/// same way: sessions (global and per-app, WebSocket connections included),
+/// API keys and cached JWTs all die with the user, in this transaction, so
+/// that a user the pool says is gone can never be one a session table still
+/// lets in. Global sessions and their pending one-time codes now do; API
+/// keys, derived app sessions and cached JWTs join here — and nowhere else —
+/// as their milestones land. Entitlements deliberately do *not*: they cascade
+/// on drop only — suspend keeps them so resume restores access — so their
+/// delete lives at [`UserRepository::drop_user`]'s call site rather than in
+/// this shared path.
+fn offboard(transaction: &Transaction<'_>, user: &UserId) -> Result<()> {
+    super::session::remove_all_in(transaction, user)
 }
 
 #[cfg(test)]

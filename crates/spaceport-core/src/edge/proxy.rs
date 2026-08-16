@@ -404,6 +404,9 @@ mod tests {
                 nudge: crate::connections::github::Nudge::new(),
                 builds: crate::connections::github::Nudge::new(),
                 hostname: None,
+                sessions: Arc::new(crate::auth::SessionRepository::new(
+                    crate::state::Db::in_memory().unwrap(),
+                )),
             })),
             apps,
             upstreams: Upstreams::new(),

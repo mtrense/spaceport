@@ -31,15 +31,17 @@ use axum::extract::{Path, Query, State};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use bytes::Bytes;
-use http::{HeaderMap, StatusCode};
+use http::{HeaderMap, HeaderValue, StatusCode};
 use serde::Deserialize;
 use time::OffsetDateTime;
 use tracing::warn;
 
+use crate::auth::{RedeemError, SessionRepository};
 use crate::connections::github::manifest::{self, Attempts, Manifest};
 use crate::connections::github::{
     ConnectionRepository, Nudge, TrackingRepository, Transport, register, webhook,
 };
+use crate::secret::Secret;
 
 /// What the pages on spaceport's own host are served out of.
 ///
@@ -72,11 +74,28 @@ pub struct Home {
     /// that was reached anyway says so rather than building a url from a
     /// hostname it does not have.
     pub hostname: Option<String>,
+    /// The sessions and one-time codes the login page reads and writes. Held
+    /// here because `/login` and `/logout` live on this host and nowhere else:
+    /// the cookie they manage is scoped to spaceport's own name, which is what
+    /// keeps it out of every app's cookie jar.
+    pub sessions: Arc<SessionRepository>,
 }
+
+/// The session cookie's name. The `__Host-` prefix is a promise the browser
+/// enforces — `Secure`, `Path=/`, no `Domain` — so a cookie under this name
+/// cannot be planted by a subdomain or ride to one. Spaceport can afford the
+/// prefix unconditionally because the edge terminates TLS even in development
+/// (`tls.provider: self-signed` is the floor, not an option to skip) and the
+/// plaintext listener never serves this page — it answers everything but ACME
+/// challenges with a redirect to https, so the login form is only ever
+/// submitted over a connection the `Secure` attribute is satisfied by.
+pub(crate) const SESSION_COOKIE: &str = "__Host-spaceport-session";
 
 pub fn router(home: Arc<Home>) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/login", get(login_page).post(login))
+        .route("/logout", get(logout_page).post(logout))
         .route(&format!("{}/{{state}}", manifest::SETUP_PATH), get(setup))
         .route(
             &format!("{}/{{state}}/callback", manifest::SETUP_PATH),
@@ -91,6 +110,272 @@ pub fn router(home: Arc<Home>) -> Router {
 /// the first time a new hostname is pointed at a host.
 async fn index() -> String {
     format!("spaceport {}\n", env!("CARGO_PKG_VERSION"))
+}
+
+/// `GET /login`: the form that turns a one-time code into a session.
+///
+/// A `?next=` names where to go after — carried through the form in a hidden
+/// field, and only ever a path this host serves: [`safe_next`] is the gate,
+/// applied on the way out rather than here, so a hostile value ends up as `/`
+/// instead of an error page that teaches nothing.
+async fn login_page(Query(query): Query<LoginQuery>) -> Response {
+    login_form(StatusCode::OK, None, query.next.as_deref())
+}
+
+/// `POST /login`: redeem the code, set the cookie, go where `next` says.
+///
+/// Every refusal renders the same sentence, whatever went wrong underneath —
+/// an unknown code, a spent one, an expired one, a suspended user. The
+/// repository already collapses them into one error precisely so this handler
+/// *cannot* tell them apart; anything more specific would be an oracle for
+/// whoever is guessing codes.
+async fn login(State(home): State<Arc<Home>>, body: String) -> Response {
+    let next = form_value(&body, "next");
+    let next = next.as_deref();
+    let Some(code) = form_value(&body, "code").filter(|code| !code.is_empty()) else {
+        return login_form(StatusCode::BAD_REQUEST, Some("Enter the code."), next);
+    };
+
+    match home.sessions.redeem(&Secret::new(code)).await {
+        Ok(fresh) => {
+            let mut response = Response::new(axum::body::Body::empty());
+            // 303, so the redirect is fetched with GET whatever this was.
+            *response.status_mut() = StatusCode::SEE_OTHER;
+            response.headers_mut().insert(
+                http::header::LOCATION,
+                HeaderValue::from_str(safe_next(next)).expect("a vetted path is a header value"),
+            );
+            match HeaderValue::from_str(&session_cookie(&fresh)) {
+                Ok(cookie) => {
+                    response
+                        .headers_mut()
+                        .insert(http::header::SET_COOKIE, cookie);
+
+                    response
+                }
+                // A token that will not fit in a header was never minted by
+                // this build; refuse rather than redirect to a page that will
+                // only bounce back here.
+                Err(error) => {
+                    warn!(%error, "could not render the session cookie");
+
+                    problem(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Spaceport could not set the session cookie",
+                        "The login itself worked; sign in again with a fresh code.",
+                    )
+                }
+            }
+        }
+        Err(RedeemError::Refused) => login_form(
+            StatusCode::UNAUTHORIZED,
+            Some("That code did not work. Check it, or ask for a new one."),
+            next,
+        ),
+        Err(RedeemError::Failed(error)) => {
+            warn!(error = %format!("{error:#}"), "a login could not be answered");
+
+            problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Spaceport could not check the code",
+                "Nothing about the code was decided. Try again.",
+            )
+        }
+    }
+}
+
+/// `GET /logout`: a confirm form, and deliberately not a logout.
+///
+/// A `GET` that dropped the session would let any page log a user out with an
+/// `<img src>` — the small cousin of every CSRF. The form is the whole page:
+/// the browser only ever sends the `POST` because somebody pressed the button.
+async fn logout_page() -> Response {
+    page(
+        StatusCode::OK,
+        "Sign out",
+        r#"<h1>Sign out</h1>
+<form method="post" action="/logout">
+  <button type="submit">Sign out</button>
+</form>"#,
+    )
+}
+
+/// `POST /logout`: drop the session and clear the cookie.
+///
+/// The answer is the same page whether the cookie named a live session, a dead
+/// one or nothing at all: the user asked to be signed out, and after this they
+/// are. Derived app sessions are dropped inside
+/// [`SessionRepository::logout`]'s transaction when that milestone lands — see
+/// the hook there — so this handler will not change shape for it.
+async fn logout(State(home): State<Arc<Home>>, headers: HeaderMap) -> Response {
+    if let Some(token) = cookie_value(&headers, SESSION_COOKIE)
+        && let Err(error) = home.sessions.logout(&Secret::new(token)).await
+    {
+        warn!(error = %format!("{error:#}"), "a logout could not be answered");
+
+        return problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Spaceport could not sign the session out",
+            "The session may still be live. Try again.",
+        );
+    }
+
+    let mut response = page(
+        StatusCode::OK,
+        "Signed out",
+        r#"<h1>Signed out</h1>
+<p><a href="/login">Sign in again</a></p>"#,
+    );
+    // Max-Age=0 is the deletion; the attributes must match the ones the cookie
+    // was set with, or the browser treats it as a different cookie and keeps
+    // the original.
+    response.headers_mut().insert(
+        http::header::SET_COOKIE,
+        HeaderValue::from_str(&format!(
+            "{SESSION_COOKIE}=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Lax"
+        ))
+        .expect("a literal cookie is a header value"),
+    );
+
+    response
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginQuery {
+    /// Where to land after the login, when the request that bounced here says.
+    next: Option<String>,
+}
+
+/// The login form, with `error` above it when the last attempt failed and
+/// `next` carried through a hidden field. The code input turns autocomplete
+/// and its relatives off because a one-time code is the one value a browser
+/// must not helpfully remember.
+fn login_form(status: StatusCode, error: Option<&str>, next: Option<&str>) -> Response {
+    let error = match error {
+        Some(error) => format!("<p class=\"error\">{}</p>\n", escape(error)),
+        None => String::new(),
+    };
+    let next = match safe_next(next) {
+        "/" => String::new(),
+        next => format!(
+            "  <input type=\"hidden\" name=\"next\" value=\"{}\">\n",
+            escape(next)
+        ),
+    };
+
+    page(
+        status,
+        "Sign in",
+        &format!(
+            r#"<h1>Sign in</h1>
+<p>Enter the one-time code you were given.</p>
+{error}<form method="post" action="/login">
+{next}  <input name="code" autofocus autocomplete="off" autocapitalize="off" spellcheck="false">
+  <button type="submit">Sign in</button>
+</form>"#
+        ),
+    )
+}
+
+/// Where a finished login may be sent: `next` when it is a plain absolute path
+/// on this host, `/` otherwise.
+///
+/// The rules are deny-by-shape rather than a parse: it must start with `/`,
+/// must not start with `//` (which a browser reads as scheme-relative and
+/// sends to another host), and must not contain `\` (which some browsers
+/// normalise into `/` and turn `/\evil.example` back into the previous case).
+/// Anything with a scheme fails the leading-`/` test already. The fallback is
+/// `/` and never an error, because the value arrives on urls users share and
+/// a broken link should still land them somewhere signed in.
+fn safe_next(next: Option<&str>) -> &str {
+    match next {
+        Some(next) if next.starts_with('/') && !next.starts_with("//") && !next.contains('\\') => {
+            next
+        }
+        _ => "/",
+    }
+}
+
+/// The `Set-Cookie` value a fresh session travels out as.
+///
+/// `HttpOnly` keeps scripts out of it, `SameSite=Lax` keeps cross-site `POST`s
+/// from riding it, and `Secure` plus the [`SESSION_COOKIE`] `__Host-` prefix
+/// pin it to this exact https host. `Max-Age` mirrors the row's expiry so the
+/// browser forgets the token about when the database stops honouring it — the
+/// database stays the authority either way, so a clock two machines disagree
+/// on costs a re-login, never access.
+fn session_cookie(fresh: &crate::auth::FreshSession) -> String {
+    let max_age = time::OffsetDateTime::parse(
+        &fresh.expires_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map(|expires| {
+        (expires - time::OffsetDateTime::now_utc())
+            .whole_seconds()
+            .max(0)
+    });
+
+    let mut cookie = format!(
+        "{SESSION_COOKIE}={}; Path=/; Secure; HttpOnly; SameSite=Lax",
+        fresh.token.expose()
+    );
+    if let Ok(max_age) = max_age {
+        cookie.push_str(&format!("; Max-Age={max_age}"));
+    }
+
+    cookie
+}
+
+/// The value of the cookie `name`, out of however many `Cookie` headers the
+/// request carries.
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get_all(http::header::COOKIE)
+        .iter()
+        .filter_map(|header| header.to_str().ok())
+        .flat_map(|header| header.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .find(|(cookie, _)| *cookie == name)
+        .map(|(_, value)| value.to_owned())
+}
+
+/// The value of `name` in an `application/x-www-form-urlencoded` body.
+///
+/// Parsed by hand because it is ten lines and the alternative is a dependency:
+/// split on `&`, split on `=`, undo `+` and `%XX`. A `%` that is not an escape
+/// is kept as it came — the value it garbles is one the form never produces,
+/// and a code mangled either way simply fails to redeem.
+fn form_value(body: &str, name: &str) -> Option<String> {
+    body.split('&')
+        .filter_map(|pair| pair.split_once('=').or(Some((pair, ""))))
+        .find(|(key, _)| form_decode(key) == name)
+        .map(|(_, value)| form_decode(value))
+}
+
+/// Undo form encoding: `+` is a space, `%XX` is the byte it spells.
+fn form_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => decoded.push(b' '),
+            b'%' if index + 2 < bytes.len()
+                && bytes[index + 1].is_ascii_hexdigit()
+                && bytes[index + 2].is_ascii_hexdigit() =>
+            {
+                let hex = std::str::from_utf8(&bytes[index + 1..=index + 2])
+                    .expect("two ascii hex digits are utf-8");
+                decoded.push(u8::from_str_radix(hex, 16).expect("two hex digits are a byte"));
+                index += 2;
+            }
+            byte => decoded.push(byte),
+        }
+        index += 1;
+    }
+
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 /// `GET /connections/github/setup/{state}`: the form that creates the App.
@@ -385,11 +670,12 @@ mod tests {
         let home = Arc::new(Home {
             attempts: Arc::new(Attempts::new()),
             connections: Arc::new(ConnectionRepository::new(db.clone())),
-            tracking: Arc::new(TrackingRepository::new(db)),
+            tracking: Arc::new(TrackingRepository::new(db.clone())),
             github: github.clone(),
             nudge: Nudge::new(),
             builds: Nudge::new(),
             hostname: Some(HOSTNAME.to_owned()),
+            sessions: Arc::new(SessionRepository::new(db)),
         });
 
         (home, github)
@@ -1063,5 +1349,240 @@ mod tests {
             "&lt;a href=&quot;x&quot;&gt;&amp;&#39;"
         );
         assert_eq!(escape("nothing to do"), "nothing to do");
+    }
+
+    /// A home whose database the test can also reach, for planting the user
+    /// and the code a login needs.
+    fn auth_home() -> (Arc<Home>, crate::auth::UserRepository) {
+        let db = Db::in_memory().unwrap();
+        let home = Arc::new(Home {
+            attempts: Arc::new(Attempts::new()),
+            connections: Arc::new(ConnectionRepository::new(db.clone())),
+            tracking: Arc::new(TrackingRepository::new(db.clone())),
+            github: FakeGitHub::new(),
+            nudge: Nudge::new(),
+            builds: Nudge::new(),
+            hostname: Some(HOSTNAME.to_owned()),
+            sessions: Arc::new(SessionRepository::new(db.clone())),
+        });
+
+        (home, crate::auth::UserRepository::new(db))
+    }
+
+    /// A code as the operator socket would have minted one, exposed for the
+    /// form to type.
+    async fn minted_code(home: &Home, users: &crate::auth::UserRepository, slug: &str) -> String {
+        users.create(&slug.parse().unwrap(), None).await.unwrap();
+
+        home.sessions
+            .mint_code(
+                &crate::auth::UserRef::Slug(slug.parse().unwrap()),
+                crate::auth::DEFAULT_SESSION_LIFETIME,
+            )
+            .await
+            .unwrap()
+            .code
+            .expose()
+            .to_owned()
+    }
+
+    /// One form submission at `path`, as a browser would send it.
+    async fn post_form(home: Arc<Home>, path: &str, body: &str) -> http::Response<Body> {
+        router(home)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(
+                        http::header::CONTENT_TYPE,
+                        "application/x-www-form-urlencoded",
+                    )
+                    .body(Body::from(body.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_login_page_renders_the_code_form() {
+        let (status, body) = get_path(auth_home().0, "/login").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#"<input name="code""#), "{body}");
+        assert!(body.contains(r#"action="/login""#), "{body}");
+    }
+
+    /// The whole point of the page: a good code becomes a cookie with every
+    /// attribute the spec asks for, and a bounce to `/`.
+    #[tokio::test]
+    async fn a_good_code_sets_the_session_cookie_and_redirects_home() {
+        let (home, users) = auth_home();
+        let code = minted_code(&home, &users, "alice").await;
+
+        let response = post_form(home, "/login", &format!("code={code}")).await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[http::header::LOCATION], "/");
+        let cookie = response.headers()[http::header::SET_COOKIE]
+            .to_str()
+            .unwrap();
+        assert!(cookie.starts_with("__Host-spaceport-session="), "{cookie}");
+        for attribute in ["Secure", "HttpOnly", "SameSite=Lax", "Path=/", "Max-Age="] {
+            assert!(cookie.contains(attribute), "{cookie}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_safe_next_path_is_honoured() {
+        let (home, users) = auth_home();
+        let code = minted_code(&home, &users, "alice").await;
+
+        let response =
+            post_form(home, "/login", &format!("code={code}&next=%2Fwiki%3Fq%3D1")).await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[http::header::LOCATION], "/wiki?q=1");
+    }
+
+    /// The open-redirect gate: anything that is not a plain absolute path on
+    /// this host lands at `/`, never on somebody else's origin.
+    #[tokio::test]
+    async fn a_hostile_next_falls_back_to_the_root() {
+        for hostile in [
+            "https://evil.example/",
+            "//evil.example/",
+            "/%5Cevil.example",
+            "javascript:alert(1)",
+            "wiki",
+        ] {
+            let (home, users) = auth_home();
+            let code = minted_code(&home, &users, "alice").await;
+
+            let response = post_form(home, "/login", &format!("code={code}&next={hostile}")).await;
+
+            assert_eq!(response.status(), StatusCode::SEE_OTHER, "{hostile}");
+            assert_eq!(response.headers()[http::header::LOCATION], "/", "{hostile}");
+        }
+    }
+
+    /// One sentence for every kind of bad code — and no cookie, which is the
+    /// half a test can prove.
+    #[tokio::test]
+    async fn a_bad_code_rerenders_the_form_with_a_neutral_error() {
+        let (home, _) = auth_home();
+
+        let response = post_form(home, "/login", "code=wrongcod").await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().get(http::header::SET_COOKIE).is_none());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("did not work"), "{body}");
+        assert!(body.contains(r#"<input name="code""#), "{body}");
+    }
+
+    /// A suspended user's code is exactly as refused as one that never
+    /// existed: same status, same sentence.
+    #[tokio::test]
+    async fn a_suspended_users_code_is_refused_like_an_unknown_one() {
+        let (home, users) = auth_home();
+        let code = minted_code(&home, &users, "alice").await;
+        users
+            .suspend(&crate::auth::UserRef::Slug("alice".parse().unwrap()))
+            .await
+            .unwrap();
+
+        let response = post_form(home, "/login", &format!("code={code}")).await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("did not work")
+        );
+    }
+
+    /// CSRF hygiene: fetching `/logout` must not log anybody out — it renders
+    /// the form whose `POST` does.
+    #[tokio::test]
+    async fn get_logout_confirms_rather_than_logging_out() {
+        let (home, users) = auth_home();
+        let code = minted_code(&home, &users, "alice").await;
+        post_form(home.clone(), "/login", &format!("code={code}")).await;
+
+        let (status, body) = get_path(home.clone(), "/logout").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#"method="post""#), "{body}");
+        // And the session is still there.
+        let (_, listed) = home
+            .sessions
+            .list(&crate::auth::UserRef::Slug("alice".parse().unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn post_logout_drops_the_session_and_clears_the_cookie() {
+        let (home, users) = auth_home();
+        let code = minted_code(&home, &users, "alice").await;
+        let login = post_form(home.clone(), "/login", &format!("code={code}")).await;
+        let cookie = login.headers()[http::header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let response = router(home.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/logout")
+                    .header(http::header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let cleared = response.headers()[http::header::SET_COOKIE]
+            .to_str()
+            .unwrap();
+        assert!(cleared.contains("Max-Age=0"), "{cleared}");
+        let (_, listed) = home
+            .sessions
+            .list(&crate::auth::UserRef::Slug("alice".parse().unwrap()))
+            .await
+            .unwrap();
+        assert!(listed.is_empty());
+    }
+
+    /// Signing out while holding no session is a success too: the user asked
+    /// to be signed out, and they are.
+    #[tokio::test]
+    async fn post_logout_without_a_session_still_answers_signed_out() {
+        let (home, _) = auth_home();
+
+        let response = post_form(home, "/logout", "").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn form_values_decode_the_way_a_browser_encodes() {
+        assert_eq!(
+            form_value("code=abc23456&next=%2Fa%20b", "next").as_deref(),
+            Some("/a b")
+        );
+        assert_eq!(form_value("a=1&code=x+y", "code").as_deref(), Some("x y"));
+        assert_eq!(form_value("a=1", "code"), None);
+        // A stray percent is carried as it came rather than panicking.
+        assert_eq!(form_value("code=1%GG", "code").as_deref(), Some("1%GG"));
     }
 }

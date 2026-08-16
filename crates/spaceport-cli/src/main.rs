@@ -15,8 +15,8 @@ use spaceport_core::app::{
     reconcile, supervise,
 };
 use spaceport_core::auth::{
-    AuthLogRepository, EntitlementRepository, RevokeScope, RoleAtApp, UserId, UserRef,
-    UserRepository, UserSlug,
+    AuthLogRepository, EntitlementRepository, RevokeScope, RoleAtApp, SessionId, SessionRepository,
+    UserId, UserRef, UserRepository, UserSlug,
 };
 use spaceport_core::build;
 use spaceport_core::build::dir::BuildDir;
@@ -264,6 +264,13 @@ enum AuthCommand {
     /// from SSO is refused with the rule that produced it — the next IdP login
     /// would put it straight back, and dropping the mapping is what removes it.
     Revoke(RevokeArgs),
+    /// Manage the sessions that sign a user in on the web.
+    ///
+    /// A session starts from a one-time code minted here and typed into the
+    /// login page on the edge hostname; it ends when it expires, when the user
+    /// signs out, or when an operator drops it. API keys are a later milestone
+    /// and will live under this same command.
+    Session(SessionArgs),
     /// Report one user's whole standing: the record, the SSO connection, every
     /// entitlement with its origin, and the apps they actually reach.
     Audit(UserRefArgs),
@@ -316,6 +323,54 @@ struct RevokeArgs {
 struct UserArgs {
     #[command(subcommand)]
     command: UserCommand,
+}
+
+#[derive(Debug, Args)]
+struct SessionArgs {
+    #[command(subcommand)]
+    command: SessionCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    /// List a user's live sessions.
+    List(UserRefArgs),
+    /// Mint a one-time code that signs the user in on the login page.
+    ///
+    /// The code is printed once and stored only as a hash: there is no way to
+    /// read it back, and losing it means minting another. It is good for ten
+    /// minutes, a single use, and five failed attempts.
+    Mint(SessionMintArgs),
+    /// Drop one session by id, or every session the user holds.
+    Drop(SessionDropArgs),
+}
+
+#[derive(Debug, Args)]
+struct SessionMintArgs {
+    /// The user, as a slug or a user id.
+    user: UserRef,
+
+    /// How long the session the code redeems into lives, as a duration like
+    /// `12h`. Fixed now, at mint — redeeming the code later does not stretch
+    /// it. Twelve hours when left out.
+    #[arg(long, value_name = "DURATION")]
+    expires: Option<String>,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
+struct SessionDropArgs {
+    /// The user, as a slug or a user id.
+    user: UserRef,
+
+    /// The session to drop, as `spaceport auth session list` prints it.
+    /// Leaving it out drops every session the user holds.
+    session: Option<SessionId>,
+
+    #[command(flatten)]
+    server: ServerArgs,
 }
 
 #[derive(Debug, Subcommand)]
@@ -780,6 +835,11 @@ async fn main() -> Result<()> {
                 UserCommand::Resume(args) => user_resume(args).await,
                 UserCommand::Drop(args) => user_drop(args).await,
             },
+            AuthCommand::Session(args) => match args.command {
+                SessionCommand::List(args) => session_list(args).await,
+                SessionCommand::Mint(args) => session_mint(args).await,
+                SessionCommand::Drop(args) => session_drop(args).await,
+            },
             AuthCommand::Grant(args) => grant(args).await,
             AuthCommand::Revoke(args) => revoke(args).await,
             AuthCommand::Audit(args) => audit(args).await,
@@ -1037,6 +1097,12 @@ async fn run(args: RunArgs) -> Result<()> {
     // The pages spaceport serves as itself. Built whether or not a hostname was
     // configured — which host reaches them is the routing table's business, and
     // a page that is never reached costs nothing to have made.
+    // One repository for the two listeners that touch sessions: the login page
+    // on the edge writes the rows this socket lists and drops, and two
+    // repositories would only be two handles to the same table pretending
+    // otherwise.
+    let sessions = Arc::new(SessionRepository::new(db.clone()));
+
     let home = Arc::new(edge::Home {
         attempts: attempts.clone(),
         connections: connections.clone(),
@@ -1045,6 +1111,7 @@ async fn run(args: RunArgs) -> Result<()> {
         nudge: nudge.clone(),
         builds: building.clone(),
         hostname: config.edge.hostname.as_ref().map(ToString::to_string),
+        sessions: sessions.clone(),
     });
 
     let operator = args.operator.map(|endpoint| {
@@ -1074,6 +1141,7 @@ async fn run(args: RunArgs) -> Result<()> {
             users: Arc::new(UserRepository::new(db.clone())),
             auth_log: Arc::new(AuthLogRepository::new(db.clone())),
             entitlements: Arc::new(EntitlementRepository::new(db.clone())),
+            sessions,
             db,
             certificates: certificates.clone(),
             reconciled: report,
@@ -1278,6 +1346,40 @@ async fn user_drop(args: UserRefArgs) -> Result<()> {
     print!(
         "{}",
         client::auth_user_drop(&args.server.server, &args.user).await?
+    );
+
+    Ok(())
+}
+
+async fn session_list(args: UserRefArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::auth_session_list(&args.server.server, &args.user).await?
+    );
+
+    Ok(())
+}
+
+/// The duration is validated here as well as at the far end, so a typo is a
+/// refusal before anything crosses the socket — but what travels is the
+/// operator's own spelling, and the server's parser stays the authority.
+async fn session_mint(args: SessionMintArgs) -> Result<()> {
+    if let Some(expires) = args.expires.as_deref() {
+        spaceport_core::duration::parse(expires)?;
+    }
+
+    print!(
+        "{}",
+        client::auth_session_mint(&args.server.server, &args.user, args.expires.as_deref()).await?
+    );
+
+    Ok(())
+}
+
+async fn session_drop(args: SessionDropArgs) -> Result<()> {
+    print!(
+        "{}",
+        client::auth_session_drop(&args.server.server, &args.user, args.session.as_ref()).await?
     );
 
     Ok(())

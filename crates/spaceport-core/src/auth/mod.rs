@@ -11,22 +11,28 @@
 //!
 //! Entitlements are the first thing to hang off that identity: one row per
 //! user, app and role, granted by hand over the operator socket and — in a
-//! later milestone — mapped from SSO logins. Sessions and SSO themselves are
-//! still to come. What this module does know is where they will attach:
-//! suspending or dropping a user is the immediate-offboarding lever, and the
-//! repository marks the single place the invalidation cascade will run from
-//! when there is anything to invalidate.
+//! later milestone — mapped from SSO logins. Sessions are the second: an
+//! opaque token in a cookie on the edge hostname, backed by a database row,
+//! reached today through a one-time code an operator mints and — when SSO and
+//! SMTP land — through logins that arrive from outside. Suspending or dropping
+//! a user is the immediate-offboarding lever, and the repository's `offboard`
+//! cascade is where sessions and pending codes already die with the user.
 
 pub mod entitlement;
 pub mod log;
 pub mod repository;
+pub mod session;
 
 pub use entitlement::{
     EntitlementError, EntitlementRecord, EntitlementRepository, Granted, RevokeScope, Revoked,
     RoleAtApp,
 };
-pub use log::{AuthEvent, AuthLogRepository, OPERATOR_ORIGIN};
+pub use log::{AuthEvent, AuthLogRepository, OPERATOR_ORIGIN, WEB_ORIGIN};
 pub use repository::UserRepository;
+pub use session::{
+    DEFAULT_SESSION_LIFETIME, FreshSession, MintedCode, RedeemError, SessionError, SessionId,
+    SessionRecord, SessionRepository,
+};
 
 use std::fmt;
 use std::str::FromStr;

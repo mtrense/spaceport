@@ -24,6 +24,13 @@ use crate::state::Db;
 /// having heard of the IdP.
 pub const OPERATOR_ORIGIN: &str = "operator";
 
+/// What an entry the login page writes names as its origin: a login, a failed
+/// code attempt, a logout. Distinct from [`OPERATOR_ORIGIN`] because the two
+/// answer the auditor's first question — was this a command somebody gave over
+/// the socket, or something that arrived from the internet — and one word for
+/// both would erase exactly that.
+pub const WEB_ORIGIN: &str = "web";
+
 /// One thing that happened, as the log stores it.
 ///
 /// `kind` and `origin` stay text all the way out: a row written by a newer

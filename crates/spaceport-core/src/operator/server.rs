@@ -32,7 +32,8 @@ use crate::app::secrets::Set;
 use crate::app::{App, AppId, AppManifest, AppRecord, AppRepository, DataDir, Pattern, health};
 use crate::auth::{
     AuthLogRepository, EntitlementError, EntitlementRepository, Granted, RevokeScope, Revoked,
-    Role, RoleAtApp, UserError, UserId, UserRecord, UserRef, UserRepository,
+    Role, RoleAtApp, SessionError, SessionId, SessionRepository, UserError, UserId, UserRecord,
+    UserRef, UserRepository,
 };
 use crate::build::repository::{Build, BuildRepository, BuildState};
 use crate::connections::github::{
@@ -146,6 +147,16 @@ fn router(instance: Arc<Instance>, events: Arc<EventBus>, shutdown: Cancellation
         .route("/auth/users/{user}/resume", post(resume_user))
         .route("/auth/users/{user}/audit", get(audit_user))
         .route(
+            "/auth/users/{user}/sessions",
+            get(list_sessions)
+                .post(mint_session)
+                .delete(drop_all_sessions),
+        )
+        .route(
+            "/auth/users/{user}/sessions/{session}",
+            delete(drop_session),
+        )
+        .route(
             "/auth/users/{user}/entitlements",
             delete(revoke_all_entitlements),
         )
@@ -232,6 +243,13 @@ impl FromRef<Operator> for Arc<AuthLogRepository> {
 impl FromRef<Operator> for Arc<EntitlementRepository> {
     fn from_ref(operator: &Operator) -> Self {
         operator.instance.entitlements.clone()
+    }
+}
+
+/// And for the handlers that mint, list and drop sessions.
+impl FromRef<Operator> for Arc<SessionRepository> {
+    fn from_ref(operator: &Operator) -> Self {
+        operator.instance.sessions.clone()
     }
 }
 
@@ -3582,6 +3600,170 @@ fn refuse_user(error: UserError) -> Response {
     refuse(status, &error.to_string())
 }
 
+/// `GET /auth/users/{ref}/sessions`: what is signed in as this user.
+///
+/// A KIND column with one value today, on purpose: API keys are a later
+/// milestone and land in this same listing, so the shape that scripts and eyes
+/// learn now is the shape that survives them arriving.
+async fn list_sessions(
+    State(sessions): State<Arc<SessionRepository>>,
+    UrlPath(user): UrlPath<String>,
+) -> Response {
+    let user: UserRef = match user.parse() {
+        Ok(user) => user,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    let (user, listed) = match sessions.list(&user).await {
+        Ok(listed) => listed,
+        Err(error) => return refuse_session(error),
+    };
+
+    if listed.is_empty() {
+        return (
+            StatusCode::OK,
+            format!(
+                "`{}` has no sessions — `spaceport auth session mint {}` starts one\n",
+                user.slug, user.slug
+            ),
+        )
+            .into_response();
+    }
+
+    let rows: Vec<Vec<String>> = listed
+        .iter()
+        .map(|session| {
+            vec![
+                "session".to_owned(),
+                session.id.to_string(),
+                session.created_at.clone(),
+                session.expires_at.clone(),
+            ]
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        columns(&["KIND", "ID", "CREATED", "EXPIRES"], &rows),
+    )
+        .into_response()
+}
+
+/// `POST /auth/users/{ref}/sessions?expires=…`: mint a one-time code.
+///
+/// The one response in the auth family that carries a credential, and it does
+/// so exactly once: the code is printed here, stored only as a hash, and no
+/// later command can recover it. An operator who loses it mints another.
+async fn mint_session(
+    State(sessions): State<Arc<SessionRepository>>,
+    UrlPath(user): UrlPath<String>,
+    Query(query): Query<MintQuery>,
+) -> Response {
+    let user: UserRef = match user.parse() {
+        Ok(user) => user,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+    let lifetime = match &query.expires {
+        Some(expires) => match crate::duration::parse(expires) {
+            Ok(lifetime) => lifetime,
+            Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+        },
+        None => crate::auth::DEFAULT_SESSION_LIFETIME,
+    };
+
+    match sessions.mint_code(&user, lifetime).await {
+        Ok(minted) => {
+            let body = format!(
+                "one-time code for `{}`: {}\n  shown once — it is stored only as a hash\n  good for 10 minutes, a single use, and 5 failed attempts\n  the session it redeems expires {}\n",
+                minted.user.slug,
+                // The deliberate exposure: this response is the terminal the
+                // spec says the code is printed to.
+                minted.code.expose(),
+                minted.session_expires_at,
+            );
+
+            (StatusCode::OK, body).into_response()
+        }
+        Err(error) => refuse_session(error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MintQuery {
+    /// How long the redeemed session lives, as a duration like `12h`.
+    expires: Option<String>,
+}
+
+/// `DELETE /auth/users/{ref}/sessions`: sign this user out everywhere.
+async fn drop_all_sessions(
+    State(sessions): State<Arc<SessionRepository>>,
+    UrlPath(user): UrlPath<String>,
+) -> Response {
+    drop_scoped(&sessions, &user, None).await
+}
+
+/// `DELETE /auth/users/{ref}/sessions/{id}`: sign one session out.
+async fn drop_session(
+    State(sessions): State<Arc<SessionRepository>>,
+    UrlPath((user, session)): UrlPath<(String, String)>,
+) -> Response {
+    let session: SessionId = match session.parse() {
+        Ok(session) => session,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    drop_scoped(&sessions, &user, Some(&session)).await
+}
+
+/// The shared tail of the two drop routes: resolve, drop, count.
+async fn drop_scoped(
+    sessions: &SessionRepository,
+    user: &str,
+    session: Option<&SessionId>,
+) -> Response {
+    let user: UserRef = match user.parse() {
+        Ok(user) => user,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    let (user, dropped) = match sessions.drop_sessions(&user, session).await {
+        Ok(dropped) => dropped,
+        Err(error) => return refuse_session(error),
+    };
+
+    let body = match dropped.as_slice() {
+        [] => format!("`{}` had no sessions — nothing to drop\n", user.slug),
+        [one] => format!("dropped session {} of `{}`\n", one.id, user.slug),
+        many => {
+            let mut lines = format!("dropped {} sessions of `{}`\n", many.len(), user.slug);
+            for session in many {
+                lines.push_str(&format!("  {}\n", session.id));
+            }
+
+            lines
+        }
+    };
+
+    (StatusCode::OK, body).into_response()
+}
+
+/// One mapping from what went wrong to whose problem it is, for every verb on
+/// sessions — the shape [`refuse_user`] sets: a mistyped user or session is a
+/// 404, a suspended user is a 409 (a state only `resume` changes), and a store
+/// that would not answer is a 500.
+fn refuse_session(error: SessionError) -> Response {
+    let status = match &error {
+        SessionError::UnknownUser(_) | SessionError::Nothing(_) => StatusCode::NOT_FOUND,
+        SessionError::Suspended(_) => StatusCode::CONFLICT,
+        SessionError::Failed(_) => {
+            warn!(%error, "a session command failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+
+    refuse(status, &error.to_string())
+}
+
 /// `GET /auth/log?user=…`: the append-only record, oldest first.
 ///
 /// A table like the listings rather than lines of prose: the log is read to
@@ -4215,6 +4397,7 @@ container:
             users: Arc::new(UserRepository::new(db.clone())),
             auth_log: Arc::new(AuthLogRepository::new(db.clone())),
             entitlements: Arc::new(EntitlementRepository::new(db.clone())),
+            sessions: Arc::new(SessionRepository::new(db.clone())),
             db: db.clone(),
             certificates: None,
             reconciled: crate::app::reconcile::Report::default(),
@@ -7770,6 +7953,171 @@ container:
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("not a user id"), "{body}");
+    }
+
+    /// A router and the database behind it, for the session tests: redemption
+    /// happens on the edge, not on this socket, so a test that needs a live
+    /// session redeems the printed code straight through the repository.
+    fn router_and_db() -> (Router, Db) {
+        let (parts, db, _) = parts_with_state(OneContainer::default(), CONFIG);
+
+        (parts.1, db)
+    }
+
+    /// The code out of a mint response — the one place it is ever printed.
+    fn code_in(body: &str) -> String {
+        body.lines()
+            .next()
+            .and_then(|line| line.rsplit_once(": "))
+            .expect("the response prints the code")
+            .1
+            .trim()
+            .to_owned()
+    }
+
+    /// Redeem a mint response's code, as the login page would.
+    async fn redeem(db: &Db, minted: &str) -> crate::auth::FreshSession {
+        crate::auth::SessionRepository::new(db.clone())
+            .redeem(&Secret::new(code_in(minted)))
+            .await
+            .expect("the printed code redeems")
+    }
+
+    /// The mint prints the code exactly once, with the session expiry that was
+    /// fixed by `--expires`; the listing that follows shows the session the
+    /// code became and never the code or token.
+    #[tokio::test]
+    async fn mints_a_code_that_redeems_into_a_listed_session() {
+        let (router, db) = router_and_db();
+        create_user_named(&router, "alice", "").await;
+
+        let (status, minted) =
+            user_command(&router, "POST", "/auth/users/alice/sessions?expires=1h").await;
+        assert_eq!(status, StatusCode::OK, "{minted}");
+        assert!(minted.contains("one-time code for `alice`"), "{minted}");
+        assert!(minted.contains("shown once"), "{minted}");
+        let code = code_in(&minted);
+        assert_eq!(code.len(), 8, "{minted}");
+
+        let fresh = redeem(&db, &minted).await;
+
+        let (status, listed) = user_command(&router, "GET", "/auth/users/alice/sessions").await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert!(listed.contains("KIND"), "{listed}");
+        assert!(listed.contains("session"), "{listed}");
+        assert!(listed.contains(fresh.id.as_str()), "{listed}");
+        assert!(!listed.contains(&code), "{listed}");
+        assert!(!listed.contains(fresh.token.expose()), "{listed}");
+    }
+
+    #[tokio::test]
+    async fn a_user_with_no_sessions_is_told_how_to_start_one() {
+        let (router, _) = router_and_db();
+        create_user_named(&router, "alice", "").await;
+
+        let (status, body) = user_command(&router, "GET", "/auth/users/alice/sessions").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("has no sessions"), "{body}");
+        assert!(body.contains("spaceport auth session mint alice"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn drops_one_session_by_id_over_http() {
+        let (router, db) = router_and_db();
+        create_user_named(&router, "alice", "").await;
+        let (_, first) = user_command(&router, "POST", "/auth/users/alice/sessions").await;
+        let first = redeem(&db, &first).await;
+        let (_, second) = user_command(&router, "POST", "/auth/users/alice/sessions").await;
+        let second = redeem(&db, &second).await;
+
+        let (status, body) = user_command(
+            &router,
+            "DELETE",
+            &format!("/auth/users/alice/sessions/{}", first.id),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains(&format!("dropped session {}", first.id)),
+            "{body}"
+        );
+        let (_, listed) = user_command(&router, "GET", "/auth/users/alice/sessions").await;
+        assert!(!listed.contains(first.id.as_str()), "{listed}");
+        assert!(listed.contains(second.id.as_str()), "{listed}");
+    }
+
+    #[tokio::test]
+    async fn drops_every_session_when_none_is_named() {
+        let (router, db) = router_and_db();
+        create_user_named(&router, "alice", "").await;
+        for _ in 0..2 {
+            let (_, minted) = user_command(&router, "POST", "/auth/users/alice/sessions").await;
+            redeem(&db, &minted).await;
+        }
+
+        let (status, body) = user_command(&router, "DELETE", "/auth/users/alice/sessions").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("dropped 2 sessions"), "{body}");
+        let (_, listed) = user_command(&router, "GET", "/auth/users/alice/sessions").await;
+        assert!(listed.contains("has no sessions"), "{listed}");
+    }
+
+    #[tokio::test]
+    async fn refuses_a_session_command_nobody_can_answer() {
+        let (router, _) = router_and_db();
+        create_user_named(&router, "alice", "").await;
+        user_command(&router, "POST", "/auth/users/alice/suspend").await;
+
+        // A mistyped user is a 404, a suspended one a 409, a bad duration and
+        // a bad session id a 400 apiece — each with a sentence to act on.
+        let (status, body) = user_command(&router, "POST", "/auth/users/ghost/sessions").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        let (status, body) = user_command(&router, "POST", "/auth/users/alice/sessions").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("suspended"), "{body}");
+
+        let (status, body) =
+            user_command(&router, "POST", "/auth/users/alice/sessions?expires=soon").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        let (status, body) =
+            user_command(&router, "DELETE", "/auth/users/alice/sessions/not-an-id").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("not a session id"), "{body}");
+
+        let (status, body) = user_command(
+            &router,
+            "DELETE",
+            "/auth/users/alice/sessions/00000000000000aa",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("no such session"), "{body}");
+    }
+
+    /// The spec's session verbs land in the same log the user verbs do, with
+    /// the mint and the drop stamped as the operator's and the login as the
+    /// web's.
+    #[tokio::test]
+    async fn session_mutations_land_in_the_auth_log() {
+        let (router, db) = router_and_db();
+        create_user_named(&router, "alice", "").await;
+        let (_, minted) = user_command(&router, "POST", "/auth/users/alice/sessions").await;
+        redeem(&db, &minted).await;
+        user_command(&router, "DELETE", "/auth/users/alice/sessions").await;
+
+        let (status, log) = user_command(&router, "GET", "/auth/log").await;
+
+        assert_eq!(status, StatusCode::OK);
+        for kind in ["session.minted", "login.succeeded", "session.dropped"] {
+            assert!(log.contains(kind), "{log}");
+        }
+        assert!(log.contains("web"), "{log}");
+        assert!(!log.contains(&code_in(&minted)), "{log}");
     }
 
     /// An app whose edge declares roles, for the entitlement tests: `blog`

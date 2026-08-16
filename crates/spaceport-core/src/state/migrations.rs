@@ -449,6 +449,55 @@ const MIGRATIONS: &[&str] = &[
         granted_at    TEXT NOT NULL,
         PRIMARY KEY (user_id, spaceport_app, role)
     ) STRICT;",
+    // 12 — who is signed in, and the one-time codes that get them there.
+    //
+    // Neither table ever stores the credential itself. `token_hash` and
+    // `code_hash` are SHA-256 of the value the browser or the operator holds,
+    // because a database read must not yield something a stranger could log in
+    // with: the state file is `0600`, but backups travel, and a copy of this
+    // table has to be worth less than the cookies it describes. The plaintext
+    // exists exactly twice — once in the cookie or on the operator's terminal,
+    // once in memory on its way to being hashed — and never in a row.
+    //
+    // `sessions.session_id` is a short random handle of its own rather than
+    // the token hash, because an operator has to be able to read it off
+    // `session list` and type it into `session drop` — and a listing that
+    // printed the hash would hand out exactly the string a stolen backup needs
+    // to forge nothing but still teaches people to paste secrets around.
+    //
+    // `login_codes` carries `session_expires_at` beside its own
+    // `code_expires_at` because the spec fixes the session's lifetime at mint:
+    // `--expires` is answered when the code is created, and redeeming it later
+    // must produce the session the operator described then, not one measured
+    // from whenever the user got around to the form. `attempts` is the
+    // per-code failure counter; the code dies at five, enforced by the reader
+    // rather than a CHECK so a row written by a newer build still reads.
+    //
+    // No foreign keys to `users`, for the reason step 4 gives and because the
+    // offboarding cascade is written by hand where the knowledge belongs:
+    // suspending or dropping a user deletes their rows here in the same
+    // transaction, which is the spec's immediate-offboarding lever.
+    //
+    // No cleanup job is scheduled anywhere. Expired rows are swept
+    // opportunistically when a code is minted or redeemed — the only moments
+    // the tables grow — so the tables cannot outgrow their traffic and there
+    // is no background loop to supervise for a table this small.
+    "CREATE TABLE sessions (
+        session_id TEXT NOT NULL PRIMARY KEY,
+        user_id    TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX sessions_by_user ON sessions (user_id);
+    CREATE TABLE login_codes (
+        code_hash          TEXT NOT NULL PRIMARY KEY,
+        user_id            TEXT NOT NULL,
+        attempts           INTEGER NOT NULL DEFAULT 0,
+        created_at         TEXT NOT NULL,
+        code_expires_at    TEXT NOT NULL,
+        session_expires_at TEXT NOT NULL
+    ) STRICT;",
 ];
 
 /// The schema version this build writes.
@@ -850,6 +899,57 @@ mod tests {
                     [],
                 )
                 .is_err()
+        );
+    }
+
+    /// A fresh code has no failed attempts against it, so the one column the
+    /// failure path moves is the only one an insert never mentions — and both
+    /// tables hold hashes, never the credential, which is what the column
+    /// names promise.
+    #[test]
+    fn the_twelfth_migration_creates_the_session_tables() {
+        let connection = empty();
+        migrate(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO login_codes
+                     (code_hash, user_id, created_at, code_expires_at, session_expires_at)
+                 VALUES ('a-hash', '3f29b1d4-8a6e-4c2b-9e77-1d5f6a2b9c40',
+                         '2026-01-01T00:00:00Z', '2026-01-01T00:10:00Z', '2026-01-01T12:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            columns(&connection, "sessions"),
+            [
+                "session_id",
+                "user_id",
+                "token_hash",
+                "created_at",
+                "expires_at"
+            ]
+        );
+        assert_eq!(
+            columns(&connection, "login_codes"),
+            [
+                "code_hash",
+                "user_id",
+                "attempts",
+                "created_at",
+                "code_expires_at",
+                "session_expires_at"
+            ]
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT attempts FROM login_codes WHERE code_hash = 'a-hash'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
         );
     }
 
