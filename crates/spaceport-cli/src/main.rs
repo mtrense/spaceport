@@ -774,7 +774,7 @@ async fn run(args: RunArgs) -> Result<()> {
             builds: (*build_records).clone(),
         }),
         app::deploy::Policy::default(),
-        deploying,
+        deploying.clone(),
         shutdown.clone(),
     ));
 
@@ -816,6 +816,10 @@ async fn run(args: RunArgs) -> Result<()> {
             // resolves the head of the branch it binds, and a commit written
             // down with nothing woken would wait out the builder's interval.
             building,
+            // And this one, for the same kind of reason: resuming an app, or
+            // arming one, can make an image that already exists deployable
+            // without anything being built to wake the loop on its own.
+            deploying,
             db,
             certificates: certificates.clone(),
             reconciled: report,

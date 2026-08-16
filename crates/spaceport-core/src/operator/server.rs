@@ -219,6 +219,22 @@ impl FromRef<Operator> for Building {
     }
 }
 
+/// The shove that tells the deploying worker to go and look, told apart from
+/// the other two the same way and for the same reason.
+///
+/// Waking it is one query for the armed trackings and one per armed app, all
+/// local — the cheapest of the three, and the one an operator is waiting on:
+/// see [`crate::status::Instance::deploying`] for what makes a handler here the
+/// thing that has to say so.
+#[derive(Clone)]
+struct Deploying(Nudge);
+
+impl FromRef<Operator> for Deploying {
+    fn from_ref(operator: &Operator) -> Self {
+        Self(operator.instance.deploying.clone())
+    }
+}
+
 impl FromRef<Operator> for Arc<EventBus> {
     fn from_ref(operator: &Operator) -> Self {
         operator.events.clone()
@@ -1825,7 +1841,18 @@ struct SuspendQuery {
 }
 
 /// `POST /apps/{id}/resume`: serve the app again.
-async fn resume(State(applier): State<Arc<Applier>>, UrlPath(id): UrlPath<String>) -> Response {
+///
+/// Resuming is also the moment a build that was already finished becomes
+/// deployable: the deploying loop leaves a suspended app alone, deliberately,
+/// so a push during a suspension ends as an image and a row saying nothing has
+/// run it. Nothing builds when an app comes back, so nothing would wake that
+/// loop — hence the shove below, which is what turns "up to five minutes" into
+/// "as soon as this app is serving again".
+async fn resume(
+    State(applier): State<Arc<Applier>>,
+    State(deploying): State<Deploying>,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
     let id: AppId = match id.parse() {
         Ok(id) => id,
         Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
@@ -1833,6 +1860,12 @@ async fn resume(State(applier): State<Arc<Applier>>, UrlPath(id): UrlPath<String
 
     match applier.resume(&id).await {
         Ok(app) => {
+            // After the app is running and never before, which is the order the
+            // builder shoves in and for its reason: the loop reads the store
+            // and the record for itself, and a shove that arrived first would
+            // send it to look at an app that is still suspended.
+            deploying.0.nudge();
+
             let hosts: Vec<&str> = app.hosts().iter().map(|host| host.as_str()).collect();
             let body = format!(
                 "app `{}` resumed\n  container {}\n  upstream  {}\n  routes    {}\n",
@@ -1908,12 +1941,18 @@ const DEFAULT_MANIFEST_PATH: &str = "spaceport.yaml";
 /// that somebody may change months from now, and an app that followed it would
 /// silently start building from somewhere else — a repointing nobody asked for,
 /// recorded nowhere, on an app that is already running.
+// The argument list is axum's dependency injection rather than a signature
+// anybody calls: every one of them is a `State` or an extractor, and bundling
+// two of them into a struct to get under a count would hide which pieces of the
+// instance this handler touches.
+#[allow(clippy::too_many_arguments)]
 async fn track(
     State(instance): State<Arc<Instance>>,
     State(connections): State<Arc<ConnectionRepository>>,
     State(tracking): State<Arc<TrackingRepository>>,
     State(github): State<Arc<dyn Transport>>,
     State(building): State<Building>,
+    State(deploying): State<Deploying>,
     UrlPath(id): UrlPath<String>,
     Query(query): Query<TrackQuery>,
 ) -> Response {
@@ -2084,6 +2123,14 @@ async fn track(
     // that arrived first would send it to look at a revision that is not
     // written down yet.
     building.0.nudge();
+
+    // And the loop that runs what was built, because arming is the other way a
+    // finished image becomes deployable with nothing being built: an app whose
+    // head was already built while it deployed nothing on its own has a row
+    // waiting, and the build about to happen may well be a no-op that shoves
+    // nothing. Unconditional on `armed`, because the pass reads the trackings
+    // itself and a shove for an unarmed app costs one local query.
+    deploying.0.nudge();
 
     let head = abbreviated(&head);
 
@@ -2752,7 +2799,7 @@ container:
     }
 
     fn router_and_events() -> (Router, Arc<EventBus>) {
-        let (_, router, events, _, _, _, _, _, _) = parts_on(OneContainer::default());
+        let (_, router, events, _, _, _, _, _, _, _) = parts_on(OneContainer::default());
 
         (router, events)
     }
@@ -2760,13 +2807,13 @@ container:
     /// A router and the GitHub behind it, for the connection tests — which are
     /// the only ones that care what GitHub answers.
     fn router_and_github() -> (Router, Arc<FakeGitHub>) {
-        let (_, router, _, _, github, _, _, _, _) = parts_on(OneContainer::default());
+        let (_, router, _, _, github, _, _, _, _, _) = parts_on(OneContainer::default());
 
         (router, github)
     }
 
     fn store_router_and_events_on(runtime: OneContainer) -> (Arc<AppStore>, Router, Arc<EventBus>) {
-        let (store, router, events, _, _, _, _, _, _) = parts_on(runtime);
+        let (store, router, events, _, _, _, _, _, _, _) = parts_on(runtime);
 
         (store, router, events)
     }
@@ -2787,6 +2834,10 @@ container:
         Arc<BuildRepository>,
         // The shove a track gives the build worker, which is the only way a
         // test can see that the worker was told at all.
+        Nudge,
+        // And the one a resume or a track gives the deploying worker, which is
+        // the only way a test can see that a built revision waiting on a
+        // suspension will be looked at now rather than in five minutes.
         Nudge,
     );
 
@@ -2835,6 +2886,8 @@ container:
         // Held rather than made in place, so that a test can watch it: this is
         // the builder's signal and emphatically not the reconciler's.
         let building = Nudge::new();
+        // Held for the same reason, and apart from it: they are two loops.
+        let deploying = Nudge::new();
         let instance = Arc::new(Instance {
             version: "9.9.9".to_owned(),
             started_at: time::OffsetDateTime::now_utc(),
@@ -2849,6 +2902,7 @@ container:
             attempts: Arc::new(crate::connections::github::Attempts::new()),
             nudge: Nudge::new(),
             building: building.clone(),
+            deploying: deploying.clone(),
             db,
             certificates: None,
             reconciled: crate::app::reconcile::Report::default(),
@@ -2864,6 +2918,7 @@ container:
             tracking,
             builds,
             building,
+            deploying,
         )
     }
 
@@ -3168,6 +3223,35 @@ container:
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("app `hello` resumed"), "{body}");
         assert!(store.routes().serving("alpha.test").is_some());
+    }
+
+    /// A push during a suspension is built and, correctly, not deployed — so
+    /// the moment the app comes back is the moment that image becomes
+    /// deployable, with nothing being built to say so. Without this shove the
+    /// operator watches a commit they can see was built sit there for the
+    /// length of the deploying loop's interval.
+    #[tokio::test]
+    async fn resuming_an_app_wakes_the_deploying_worker() {
+        let (_, router, _, _, _, _, _, _, _, deploying) = parts_on(OneContainer::default());
+        put_app(&router, "hello", MANIFEST).await;
+        suspend_app(&router, "hello", false).await;
+        let woken = deploying.changed();
+
+        resume_app(&router, "hello").await;
+
+        assert!(woken.has_changed().unwrap());
+    }
+
+    /// A resume that did not happen is not a deployment to go looking for: the
+    /// app is exactly where it was, which is what the loop already believes.
+    #[tokio::test]
+    async fn a_resume_that_failed_wakes_nothing() {
+        let (_, router, _, _, _, _, _, _, _, deploying) = parts_on(OneContainer::default());
+        let woken = deploying.changed();
+
+        assert_eq!(resume_app(&router, "ghost").await.0, StatusCode::NOT_FOUND);
+
+        assert!(!woken.has_changed().unwrap());
     }
 
     #[tokio::test]
@@ -3539,7 +3623,7 @@ container:
     /// for as long as anyone was watching it.
     #[tokio::test]
     async fn a_watcher_is_let_go_when_spaceport_shuts_down() {
-        let (_, router, _, shutdown, _, _, _, _, _) = parts_on(OneContainer::default());
+        let (_, router, _, shutdown, _, _, _, _, _, _) = parts_on(OneContainer::default());
         let mut stream = watch(&router, "").await;
 
         shutdown.cancel();
@@ -3920,7 +4004,7 @@ container:
     /// particular repository is in reach, and a count cannot answer that.
     #[tokio::test]
     async fn shows_the_repositories_each_installation_reaches() {
-        let (_, router, _, _, _, connections, _, _, _) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, _, _, _) = parts_on(OneContainer::default());
         post_connection(&router, registration("spaceport-acme", 42)).await;
         connections
             .record_installations(
@@ -3964,7 +4048,7 @@ container:
     /// a failure to look if it is printed as an empty list.
     #[tokio::test]
     async fn says_when_an_installation_reaches_no_repository_at_all() {
-        let (_, router, _, _, _, connections, _, _, _) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, _, _, _) = parts_on(OneContainer::default());
         post_connection(&router, registration("spaceport-acme", 42)).await;
         connections
             .record_installations(
@@ -4046,7 +4130,7 @@ container:
         Arc<BuildRepository>,
         Nudge,
     ) {
-        let (_, router, _, _, github, connections, tracking, builds, building) =
+        let (_, router, _, _, github, connections, tracking, builds, building, _) =
             parts_on(OneContainer::default());
         put_app(&router, "site", MANIFEST).await;
         connected_and_reaching(&router, &connections).await;
@@ -4540,6 +4624,31 @@ container:
             &router,
             "site",
             "?repository=an-organisation/site&connection=spaceport-acme&branch=main",
+        )
+        .await;
+
+        assert!(woken.has_changed().unwrap());
+    }
+
+    /// The other loop too, and for a case the build has no way to announce:
+    /// arming an app whose head was already built produces a build request that
+    /// is a no-op, so nothing finishes and nothing shoves the deploying worker
+    /// — while the row saying that image has run nowhere is sitting there.
+    ///
+    /// Built out of [`parts_on`] rather than [`tracking_parts`], which hands
+    /// back the builder's shove and not this one.
+    #[tokio::test]
+    async fn tracking_a_repository_wakes_the_deploying_worker() {
+        let (_, router, _, _, _, connections, _, _, _, deploying) =
+            parts_on(OneContainer::default());
+        put_app(&router, "site", MANIFEST).await;
+        connected_and_reaching(&router, &connections).await;
+        let woken = deploying.changed();
+
+        track_app(
+            &router,
+            "site",
+            "?repository=an-organisation/site&connection=spaceport-acme&branch=main&deploy=true",
         )
         .await;
 
@@ -5089,7 +5198,8 @@ container:
     /// they can be asking for without naming a revision.
     #[tokio::test]
     async fn deploys_the_newest_build_when_no_revision_is_named() {
-        let (store, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
+        let (store, router, _, _, _, connections, _, builds, _, _) =
+            parts_on(OneContainer::default());
         connected_and_reaching(&router, &connections).await;
         tracked_app(&router, "echo").await;
         build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
@@ -5112,7 +5222,7 @@ container:
     /// is rather than being a hint towards it.
     #[tokio::test]
     async fn deploys_the_revision_it_was_given_rather_than_the_newest() {
-        let (_, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, builds, _, _) = parts_on(OneContainer::default());
         connected_and_reaching(&router, &connections).await;
         tracked_app(&router, "echo").await;
         build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
@@ -5130,7 +5240,7 @@ container:
     /// single build of this app is not a guess.
     #[tokio::test]
     async fn takes_an_abbreviated_revision_that_names_one_build() {
-        let (_, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, builds, _, _) = parts_on(OneContainer::default());
         connected_and_reaching(&router, &connections).await;
         tracked_app(&router, "echo").await;
         build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
@@ -5146,7 +5256,7 @@ container:
     /// them in it.
     #[tokio::test]
     async fn refuses_an_abbreviation_that_names_two_builds() {
-        let (_, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, builds, _, _) = parts_on(OneContainer::default());
         connected_and_reaching(&router, &connections).await;
         tracked_app(&router, "echo").await;
         build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
@@ -5232,7 +5342,7 @@ container:
     /// where an operator compares the two.
     #[tokio::test]
     async fn records_the_manifest_the_commit_carried() {
-        let (_, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, builds, _, _) = parts_on(OneContainer::default());
         connected_and_reaching(&router, &connections).await;
         tracked_app(&router, "echo").await;
         build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
@@ -5252,7 +5362,8 @@ container:
     /// same rule applying a manifest to a suspended app follows.
     #[tokio::test]
     async fn deploying_to_a_suspended_app_leaves_it_suspended() {
-        let (store, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
+        let (store, router, _, _, _, connections, _, builds, _, _) =
+            parts_on(OneContainer::default());
         connected_and_reaching(&router, &connections).await;
         tracked_app(&router, "echo").await;
         build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
@@ -5273,7 +5384,7 @@ container:
     /// success.
     #[tokio::test]
     async fn shows_the_deployed_revision_against_the_newest_build() {
-        let (_, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, builds, _, _) = parts_on(OneContainer::default());
         connected_and_reaching(&router, &connections).await;
         tracked_app(&router, "echo").await;
         build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
@@ -5301,7 +5412,7 @@ container:
     /// image exists, the app is on the commit before, and nothing said why.
     #[tokio::test]
     async fn shows_a_deployment_that_failed_with_its_reason() {
-        let (_, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, builds, _, _) = parts_on(OneContainer::default());
         connected_and_reaching(&router, &connections).await;
         tracked_app(&router, "echo").await;
         build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
@@ -5339,7 +5450,7 @@ container:
     /// an operator to race the worker for it.
     #[tokio::test]
     async fn a_waiting_build_reads_differently_for_an_app_that_deploys_itself() {
-        let (_, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, builds, _, _) = parts_on(OneContainer::default());
         connected_and_reaching(&router, &connections).await;
         track_app(
             &router,
@@ -5365,7 +5476,7 @@ container:
     /// undeployed and restart a running app to arrive where it already is.
     #[tokio::test]
     async fn deploying_by_hand_marks_the_revision_deployed() {
-        let (_, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, builds, _, _) = parts_on(OneContainer::default());
         connected_and_reaching(&router, &connections).await;
         tracked_app(&router, "echo").await;
         build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
@@ -5392,7 +5503,7 @@ container:
     /// the very failure a person has just read.
     #[tokio::test]
     async fn a_deploy_that_fails_by_hand_is_not_left_for_a_worker_to_repeat() {
-        let (_, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, builds, _, _) = parts_on(OneContainer::default());
         connected_and_reaching(&router, &connections).await;
         tracked_app(&router, "echo").await;
         build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;
@@ -5423,7 +5534,7 @@ container:
     /// say.
     #[tokio::test]
     async fn tells_a_tracked_app_with_an_image_to_deploy_it() {
-        let (_, router, _, _, _, connections, _, builds, _) = parts_on(OneContainer::default());
+        let (_, router, _, _, _, connections, _, builds, _, _) = parts_on(OneContainer::default());
         connected_and_reaching(&router, &connections).await;
         tracked_app(&router, "echo").await;
         build_succeeded(&builds, "echo", "0123abc", FROM_A_BUILD).await;

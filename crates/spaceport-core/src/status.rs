@@ -81,6 +81,19 @@ pub struct Instance {
     /// ask GitHub where its App is installed, which is a round trip per
     /// connection and nothing a tracking has any use for.
     pub building: github::Nudge,
+    /// How a handler tells the deploying worker to go and look at what has been
+    /// built. The same one the builder shoves when an image exists, because
+    /// there is one loop and it reads the rows either way.
+    ///
+    /// What an operator does on this socket can make a built revision
+    /// deployable without anything being built: resuming an app that was
+    /// suspended when its build finished, or arming one whose image was made
+    /// while it deployed nothing on its own. Both leave a row saying "not
+    /// deployed yet" that the next pass would find — in up to
+    /// [`crate::app::deploy::Policy::interval`], which is five minutes of an
+    /// operator watching a commit they can see was built go nowhere. The shove
+    /// is what makes it seconds, and it decides only *when* the loop looks.
+    pub deploying: github::Nudge,
     /// Absent when tls is self-signed: then nothing ever orders a certificate.
     pub certificates: Option<Arc<Certificates>>,
     /// What the reconciliation at startup did. Kept because it is the only
@@ -549,6 +562,7 @@ container:
             attempts: Arc::new(github::Attempts::new()),
             nudge: github::Nudge::new(),
             building: github::Nudge::new(),
+            deploying: github::Nudge::new(),
             db,
             certificates: None,
             reconciled,
