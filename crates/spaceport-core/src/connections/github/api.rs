@@ -5,7 +5,11 @@
 //! connection is actually for: what does GitHub say this App is, where has it
 //! been installed, what can each installation see, what does one of those
 //! repositories look like, and — the one everything else is built on — a token
-//! that acts as an installation for the next hour.
+//! that acts as an installation for the next hour. Since the App became the
+//! way people sign in, it also asks the questions a login turns on: who GitHub
+//! says a person is, which of their emails GitHub has verified, and which
+//! organisations and teams they belong to — each asked with a token minted
+//! from the code GitHub hands the login callback.
 //!
 //! Every one of those goes through [`Transport`], which exists so the tests can
 //! answer in-process. That seam is the same shape as the ACME one: a trait with
@@ -49,6 +53,15 @@ use crate::secret::Secret;
 /// configurable so that nothing can point spaceport's credentials at another
 /// host by editing a config file.
 pub(super) const API: &str = "https://api.github.com";
+
+/// Where a user's authorization code is exchanged for a token.
+///
+/// On `github.com` and not on [`API`], because GitHub keeps its OAuth machinery
+/// on the website rather than the REST API — this is the one call in the module
+/// that does not live under the API base. Written out whole for the reason
+/// [`API`] is: nothing may point the App's client secret at another host by
+/// editing a config file.
+const USER_TOKEN_ENDPOINT: &str = "https://github.com/login/oauth/access_token";
 
 /// The media type that selects GitHub's current REST responses.
 ///
@@ -245,6 +258,45 @@ pub struct RepositoryRecord {
     pub full_name: String,
 }
 
+/// Who GitHub says a signed-in person is.
+///
+/// The id and the login and nothing else, because they answer different
+/// questions and both are asked: the id is what an identity is *keyed* by —
+/// logins are renameable and reassignable, and a link made on one would follow
+/// the name to whoever holds it next — and the login is what a person and the
+/// mapping rules recognise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserRecord {
+    pub id: i64,
+    pub login: String,
+}
+
+/// One email address GitHub holds for a signed-in person.
+///
+/// `verified` is the field the login flow is really after: linking an IdP
+/// identity to an existing user goes through an email the IdP *asserts*, and an
+/// unverified address is a string anybody can type into their GitHub settings.
+/// `primary` rides along so the flow can prefer the address a person actually
+/// reads when it records one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmailRecord {
+    pub email: String,
+    pub verified: bool,
+    pub primary: bool,
+}
+
+/// One team a signed-in person is on, with the organisation it belongs to
+/// flattened to its login the way [`AppRecord`] flattens its owner.
+///
+/// Both halves are kept because a team slug alone is ambiguous: `platform` in
+/// two organisations is two different teams, and a mapping rule that matched on
+/// the slug alone would grant across a boundary nobody drew.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamRecord {
+    pub slug: String,
+    pub org: String,
+}
+
 /// The wire shapes GitHub answers with.
 ///
 /// None of these carries `deny_unknown_fields`, which is the deliberate
@@ -318,6 +370,46 @@ mod wire {
     pub(super) struct Commit {
         pub(super) sha: String,
     }
+
+    /// What the code exchange answers, which is a token or a complaint — never
+    /// both, and GitHub's OAuth endpoint reports the complaint as a `200` with
+    /// an `error` field rather than as a status. One shape with options rather
+    /// than an untagged enum, because untagged deserialisation swallows the
+    /// reason a variant did not match, and this is a response worth reading the
+    /// failure of.
+    #[derive(Deserialize)]
+    pub(super) struct UserToken {
+        pub(super) access_token: Option<crate::secret::Secret>,
+        pub(super) error: Option<String>,
+        pub(super) error_description: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct User {
+        pub(super) id: i64,
+        pub(super) login: String,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct Email {
+        pub(super) email: String,
+        pub(super) verified: bool,
+        pub(super) primary: bool,
+    }
+
+    /// An organisation as the membership listings carry it — its login is the
+    /// only field read, so it is the only field named. Not [`Account`], which
+    /// requires a `type` these listings do not promise to send.
+    #[derive(Deserialize)]
+    pub(super) struct Organization {
+        pub(super) login: String,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct Team {
+        pub(super) slug: String,
+        pub(super) organization: Organization,
+    }
 }
 
 /// A freshly minted installation token, and when it stops working.
@@ -331,16 +423,26 @@ struct MintedToken {
 
 /// How a request says who is making it.
 ///
-/// The two levels of a GitHub App's authentication, and the distinction matters
-/// at every call site: the App itself may read `/app` and mint tokens and
-/// nothing else, and an installation may read the repositories it was granted
-/// and knows nothing about the App. Presenting the wrong one is a `403` with a
-/// message about permissions, which is a confusing thing to read.
+/// The three levels of a GitHub App's authentication, and the distinction
+/// matters at every call site: the App itself may read `/app` and mint tokens
+/// and nothing else, an installation may read the repositories it was granted
+/// and knows nothing about the App, and a user token sees GitHub as the person
+/// who signed in — filtered down to what they granted the App. Presenting the
+/// wrong one is a `403` with a message about permissions, which is a confusing
+/// thing to read.
 pub(super) enum Credential {
     /// A JWT the App signed, presented as `Bearer`.
     App(String),
     /// A token GitHub minted for one installation, presented as `token`.
     Installation(Secret),
+    /// A token minted from a user's authorization code, presented as `Bearer`.
+    ///
+    /// GitHub accepts `token` and `Bearer` interchangeably for these; `Bearer`
+    /// is the one chosen because it is the OAuth 2.0 scheme the token was
+    /// issued under and the spelling GitHub's own documentation shows for
+    /// user-to-server calls, so it is the form anybody debugging against the
+    /// docs will expect to see on the wire.
+    User(Secret),
 }
 
 impl Credential {
@@ -348,6 +450,7 @@ impl Credential {
         match self {
             Self::App(token) => format!("Bearer {token}"),
             Self::Installation(token) => format!("token {}", token.expose()),
+            Self::User(token) => format!("Bearer {}", token.expose()),
         }
     }
 }
@@ -360,6 +463,7 @@ impl std::fmt::Debug for Credential {
         match self {
             Self::App(_) => f.write_str("Credential::App(…)"),
             Self::Installation(token) => write!(f, "Credential::Installation({token:?})"),
+            Self::User(token) => write!(f, "Credential::User({token:?})"),
         }
     }
 }
@@ -378,6 +482,10 @@ pub struct Client {
     /// a key that cannot sign fails when the client is made rather than in the
     /// middle of a pass.
     key: ring::signature::RsaKeyPair,
+    /// The OAuth client the App is, which is what a login speaks as: the code
+    /// exchange authenticates with these rather than with the private key.
+    client_id: String,
+    client_secret: Secret,
     transport: Arc<dyn Transport>,
     /// Installation tokens, by installation id, with the moment GitHub said
     /// each stops working.
@@ -390,6 +498,8 @@ impl Client {
             app_id: connection.app_id,
             key: key::parse(connection.private_key.expose())
                 .with_context(|| format!("the private key of `{}`", connection.slug))?,
+            client_id: connection.client_id.clone(),
+            client_secret: connection.client_secret.clone(),
             transport,
             tokens: Mutex::new(HashMap::new()),
         })
@@ -573,6 +683,152 @@ impl Client {
             .with_context(|| format!("asking github for the {what}"))?;
 
         location(&response, &what)
+    }
+
+    /// A token that acts as the person who just authorized on github.com, in
+    /// exchange for the code GitHub sent to the login callback.
+    ///
+    /// This is the one call in the module that leaves [`API`]: the exchange
+    /// lives on `github.com` itself, so the request is built here rather than
+    /// through [`request`] — that helper carries the REST API's accept and
+    /// version headers, and this endpoint is not the REST API and answers
+    /// form-encoded unless plain `application/json` is asked for. The
+    /// parameters go in a JSON body rather than the query string GitHub also
+    /// accepts, because a query string holding the client secret is a secret in
+    /// every access log between here and GitHub.
+    ///
+    /// A refused code comes back as a `200` whose body carries `error` — that
+    /// is GitHub's OAuth behaviour, not a quirk — so the body is read before
+    /// the status is trusted to mean anything.
+    ///
+    /// No refresh token is asked for or kept: GitHub only issues them when the
+    /// App opts into expiring user tokens, and spaceport spends this token on
+    /// the handful of calls a login needs and then drops it. A credential worth
+    /// refreshing would be a credential worth storing, which the module's whole
+    /// design refuses to do.
+    pub async fn exchange_user_code(&self, code: &str) -> Result<Secret> {
+        let what = "user authorization code";
+        // The one place the client secret leaves its wrapper: onto the wire, to
+        // the host pinned above.
+        let body = serde_json::json!({
+            "client_id": self.client_id,
+            "client_secret": self.client_secret.expose(),
+            "code": code,
+        });
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(USER_TOKEN_ENDPOINT)
+            .header(header::ACCEPT, "application/json")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::USER_AGENT, USER_AGENT)
+            .body(Bytes::from(body.to_string()))
+            .context("preparing the code exchange request")?;
+        let response = self
+            .transport
+            .send(request)
+            .await
+            .with_context(|| format!("asking github to exchange the {what}"))?;
+        let answer: wire::UserToken = decode(&response, what)?;
+
+        if let Some(error) = answer.error {
+            let description = answer
+                .error_description
+                .unwrap_or_else(|| "github gave no further description".to_owned());
+            bail!("github refused to exchange the {what} ({error}): {description}");
+        }
+
+        answer.access_token.ok_or_else(|| {
+            anyhow!(
+                "github's answer to the {what} exchange carried neither a token nor an error, which is not how that endpoint is documented to behave"
+            )
+        })
+    }
+
+    /// Who GitHub says the holder of a user token is.
+    pub async fn user(&self, token: &Secret) -> Result<UserRecord> {
+        let user: wire::User = self
+            .fetch("/user", &Credential::User(token.clone()), "signed-in user")
+            .await?;
+
+        Ok(UserRecord {
+            id: user.id,
+            login: user.login,
+        })
+    }
+
+    /// Every email GitHub holds for the signed-in person, verified or not.
+    ///
+    /// All of them rather than the verified ones pre-filtered, because which
+    /// addresses count is the login flow's decision to make and to explain —
+    /// a listing that silently dropped the unverified ones would leave that
+    /// flow unable to say "GitHub has your address but has not verified it".
+    /// Needs the App's `emails: read`, which the manifest asks for.
+    pub async fn user_emails(&self, token: &Secret) -> Result<Vec<EmailRecord>> {
+        let pages: Vec<Vec<wire::Email>> = self
+            .paginate(
+                "/user/emails",
+                &Credential::User(token.clone()),
+                "emails of the signed-in user",
+            )
+            .await?;
+
+        Ok(pages
+            .into_iter()
+            .flatten()
+            .map(|email| EmailRecord {
+                email: email.email,
+                verified: email.verified,
+                primary: email.primary,
+            })
+            .collect())
+    }
+
+    /// The organisations the signed-in person belongs to, as their logins.
+    ///
+    /// Asked with a user token, this is *not* every organisation the person is
+    /// in: GitHub only lists the ones where the App is installed and the person
+    /// is a member. That is the right narrowing for mapping rules — an
+    /// organisation that never installed the App is one no rule about this
+    /// spaceport should be granting from — but anybody comparing the answer to
+    /// the person's profile page will see fewer, and that is GitHub's doing.
+    pub async fn user_orgs(&self, token: &Secret) -> Result<Vec<String>> {
+        let pages: Vec<Vec<wire::Organization>> = self
+            .paginate(
+                "/user/orgs",
+                &Credential::User(token.clone()),
+                "organisations of the signed-in user",
+            )
+            .await?;
+
+        Ok(pages
+            .into_iter()
+            .flatten()
+            .map(|organization| organization.login)
+            .collect())
+    }
+
+    /// The teams the signed-in person is on, each with its organisation.
+    ///
+    /// Narrowed the way [`Self::user_orgs`] is and for the same reason: only
+    /// teams in organisations where the App is installed. Needs the App's
+    /// `members: read`, which the manifest asks for.
+    pub async fn user_teams(&self, token: &Secret) -> Result<Vec<TeamRecord>> {
+        let pages: Vec<Vec<wire::Team>> = self
+            .paginate(
+                "/user/teams",
+                &Credential::User(token.clone()),
+                "teams of the signed-in user",
+            )
+            .await?;
+
+        Ok(pages
+            .into_iter()
+            .flatten()
+            .map(|team| TeamRecord {
+                slug: team.slug,
+                org: team.organization.login,
+            })
+            .collect())
     }
 
     /// A token that acts as installation `installation_id`, minting one only if
@@ -1319,6 +1575,187 @@ mod tests {
                 request.path
             );
         }
+    }
+
+    /// The exchange is what turns a login callback into somebody: the code
+    /// GitHub sent comes back as a token, and both halves of the App's OAuth
+    /// client have to be on the request — which the fake checks, so this test
+    /// proves the secret was sent and not just that a token came back.
+    #[tokio::test]
+    async fn exchanges_a_login_code_for_a_user_token() {
+        let github = FakeGitHub::new();
+        github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
+
+        let token = client(&github)
+            .exchange_user_code("a-login-code")
+            .await
+            .unwrap();
+
+        assert_eq!(token.expose(), "ghu_a-user-token");
+        let exchange = github
+            .requests()
+            .into_iter()
+            .find(|request| request.path == "/login/oauth/access_token")
+            .expect("the exchange was asked for");
+        // No credential header: the client id and secret in the body are the
+        // whole of the authentication.
+        assert_eq!(exchange.authorization, Authorization::None);
+        // Plain JSON asked for, because github.com's OAuth endpoint answers
+        // form-encoded without it — this is not the REST API.
+        assert_eq!(exchange.accept.as_deref(), Some("application/json"));
+    }
+
+    /// GitHub reports a refused code as a `200` whose body carries `error`, so
+    /// a client that only read the status would hand a "token" that is really
+    /// a complaint to the login flow. The description is the part a person
+    /// debugging a broken login can act on, so it has to reach the message.
+    #[tokio::test]
+    async fn surfaces_githubs_oauth_error_with_its_description() {
+        let github = FakeGitHub::new();
+
+        let error = format!(
+            "{:#}",
+            client(&github)
+                .exchange_user_code("a-code-nobody-issued")
+                .await
+                .unwrap_err()
+        );
+
+        assert!(error.contains("bad_verification_code"), "{error}");
+        assert!(error.contains("incorrect or expired"), "{error}");
+    }
+
+    /// The id is what an identity is keyed by and the login is what a person
+    /// recognises, and the call is made as the person — the fake refuses it
+    /// under anything but their token, so the recorded credential is proof.
+    #[tokio::test]
+    async fn reads_who_the_signed_in_person_is() {
+        let github = FakeGitHub::new();
+        github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
+
+        let user = client(&github)
+            .user(&Secret::new("ghu_a-user-token"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            user,
+            UserRecord {
+                id: 1001,
+                login: "octocat".to_owned(),
+            }
+        );
+        let read = github
+            .requests()
+            .into_iter()
+            .find(|request| request.path == "/user")
+            .expect("the user was read");
+        assert_eq!(read.authorization, Authorization::User);
+    }
+
+    /// The emails are what verified-email linking reads, so the flags have to
+    /// survive the trip — and GitHub paginates the listing, so a person with
+    /// many addresses must not lose the ones past the first page.
+    #[tokio::test]
+    async fn reads_the_persons_emails_across_every_page() {
+        let github = FakeGitHub::new();
+        github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
+        github.user_emails_in_pages(&[
+            &[("octocat@acme.example", true, true)],
+            &[("octocat@example.com", false, false)],
+        ]);
+
+        let emails = client(&github)
+            .user_emails(&Secret::new("ghu_a-user-token"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            emails,
+            [
+                EmailRecord {
+                    email: "octocat@acme.example".to_owned(),
+                    verified: true,
+                    primary: true,
+                },
+                EmailRecord {
+                    email: "octocat@example.com".to_owned(),
+                    verified: false,
+                    primary: false,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_the_organisations_github_shows_the_signed_in_person() {
+        let github = FakeGitHub::new();
+        github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
+        github.user_belongs_to_orgs(&["acme-corp", "another-org"]);
+
+        let orgs = client(&github)
+            .user_orgs(&Secret::new("ghu_a-user-token"))
+            .await
+            .unwrap();
+
+        assert_eq!(orgs, ["acme-corp", "another-org"]);
+    }
+
+    /// A team slug alone is ambiguous across organisations, which is why the
+    /// record carries both halves — a mapping rule grants inside one org, not
+    /// wherever a slug happens to repeat.
+    #[tokio::test]
+    async fn reads_the_persons_teams_with_the_organisation_each_belongs_to() {
+        let github = FakeGitHub::new();
+        github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
+        github.user_belongs_to_teams(&[("acme-corp", "platform"), ("another-org", "platform")]);
+
+        let teams = client(&github)
+            .user_teams(&Secret::new("ghu_a-user-token"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            teams,
+            [
+                TeamRecord {
+                    slug: "platform".to_owned(),
+                    org: "acme-corp".to_owned(),
+                },
+                TeamRecord {
+                    slug: "platform".to_owned(),
+                    org: "another-org".to_owned(),
+                },
+            ]
+        );
+    }
+
+    /// The user endpoints answer as the person the token is, so a token that is
+    /// not theirs must be refused — a fake that waved any `Bearer` through
+    /// would let the App's own JWT pass exactly where it must not.
+    #[tokio::test]
+    async fn refuses_a_user_call_that_presents_the_wrong_token() {
+        let github = FakeGitHub::new();
+        github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
+
+        let error = format!(
+            "{:#}",
+            client(&github)
+                .user(&Secret::new("ghu_somebody-elses-token"))
+                .await
+                .unwrap_err()
+        );
+
+        assert!(error.contains("credentials"), "{error}");
+    }
+
+    /// The user token is a credential like the installation one, and the same
+    /// rule holds: it must not survive a `Debug` format, however it got there.
+    #[tokio::test]
+    async fn never_puts_a_user_token_in_a_debug_line() {
+        let credential = Credential::User(Secret::new("ghu_a-user-token"));
+
+        assert!(!format!("{credential:?}").contains("ghu_a-user-token"));
     }
 
     /// The whole point of [`Secret`]: a token spaceport is holding must not

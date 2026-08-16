@@ -4,14 +4,17 @@
 //! the installations of an App — over as many pages as a test wants — the
 //! repositories of an installation, one repository read by name, the commit a
 //! branch of it is at, and the mint
-//! that turns an installation into a token. Requests never leave the process; the client is handed this as
+//! that turns an installation into a token — and, since the App became the way
+//! people sign in, one scripted person: the code exchange that turns their
+//! authorization code into a token, and the `/user` family that token opens.
+//! Requests never leave the process; the client is handed this as
 //! its [`Transport`] and there is no socket anywhere.
 //!
 //! What makes it worth having is the recording. Every request is kept with the
-//! method, the path and — the part the tests are really about — which of the
-//! two credentials was presented, because "the App signed this" and "an
-//! installation token was used" are the distinction that decides whether a call
-//! works at all, and it is invisible in a response.
+//! method, the path and — the part the tests are really about — which
+//! credential was presented, because "the App signed this", "an installation
+//! token was used" and "the person's own token was used" are the distinction
+//! that decides whether a call works at all, and it is invisible in a response.
 //!
 //! What it deliberately does not do is check the JWT. Verifying the signature
 //! here would test [`super::super::jwt`] a second time, and that module
@@ -68,6 +71,12 @@ pub(crate) enum Authorization {
     Jwt,
     /// `token …` — one GitHub minted for an installation.
     Token,
+    /// `Bearer …` holding the scripted person's token — a user-to-server call.
+    ///
+    /// Told apart from [`Self::Jwt`] by value rather than by scheme, because on
+    /// the wire they *are* the same scheme — which is exactly why the tests
+    /// need the recording to say which one was really sent.
+    User,
     /// Nothing at all, which is what the unauthenticated calls look like.
     None,
 }
@@ -130,7 +139,29 @@ struct State {
     /// The app a manifest conversion hands back, for the tests that create one
     /// the way GitHub's manifest flow does.
     converted: Option<Value>,
+    /// The one person this GitHub will sign in, once a test scripts them.
+    ///
+    /// None to begin with, because a code exchange nothing has been said about
+    /// should fail the way a stale or mistyped code really does — as GitHub's
+    /// `200`-with-`error` answer, not as a path the fake forgot.
+    user: Option<ScriptedUser>,
     requests: Vec<Recorded>,
+}
+
+/// A person a test has told this GitHub about: the code that signs them in,
+/// the token that acts as them, and everything the `/user` family answers.
+struct ScriptedUser {
+    code: String,
+    token: String,
+    id: i64,
+    login: String,
+    /// Pages of `/user/emails`, each a JSON array — pages rather than a flat
+    /// list so a test can make GitHub paginate the way it really does.
+    email_pages: Vec<Value>,
+    /// Pages of `/user/orgs`, each a JSON array.
+    org_pages: Vec<Value>,
+    /// Pages of `/user/teams`, each a JSON array.
+    team_pages: Vec<Value>,
 }
 
 impl FakeGitHub {
@@ -172,6 +203,7 @@ impl FakeGitHub {
                 refusal_headers: Vec::new(),
                 endless: false,
                 converted: None,
+                user: None,
                 requests: Vec::new(),
             }),
         })
@@ -330,6 +362,79 @@ impl FakeGitHub {
         state.apps = vec![app(id, slug, name, "an-organisation")];
     }
 
+    /// Script the person this GitHub signs in: `code` is what the login
+    /// callback will bring back, `token` is what the exchange answers with and
+    /// what every `/user` call must then present.
+    ///
+    /// Any other code gets GitHub's real refusal — a `200` carrying
+    /// `bad_verification_code` — so a test about the error path needs no setter
+    /// of its own: it just exchanges a code nobody scripted.
+    ///
+    /// The person starts with no emails, organisations or teams; the setters
+    /// below add those separately, because who a person is and what they belong
+    /// to are different facts and a test about one should not have to state the
+    /// other.
+    pub(crate) fn signs_in(&self, code: &str, token: &str, id: i64, login: &str) {
+        self.state.lock().unwrap().user = Some(ScriptedUser {
+            code: code.to_owned(),
+            token: token.to_owned(),
+            id,
+            login: login.to_owned(),
+            email_pages: Vec::new(),
+            org_pages: Vec::new(),
+            team_pages: Vec::new(),
+        });
+    }
+
+    /// Serve the signed-in person's emails over these pages, in this order —
+    /// each email as `(address, verified, primary)`.
+    pub(crate) fn user_emails_in_pages(&self, pages: &[&[(&str, bool, bool)]]) {
+        self.script(|user| {
+            user.email_pages = pages
+                .iter()
+                .map(|page| {
+                    page.iter()
+                        .map(|(email, verified, primary)| {
+                            json!({"email": email, "verified": verified, "primary": primary})
+                        })
+                        .collect()
+                })
+                .collect();
+        });
+    }
+
+    /// Say which organisations the signed-in person belongs to, on one page.
+    pub(crate) fn user_belongs_to_orgs(&self, orgs: &[&str]) {
+        self.script(|user| {
+            user.org_pages = vec![orgs.iter().map(|login| json!({"login": login})).collect()];
+        });
+    }
+
+    /// Say which teams the signed-in person is on, each as `(org, slug)`, on
+    /// one page.
+    pub(crate) fn user_belongs_to_teams(&self, teams: &[(&str, &str)]) {
+        self.script(|user| {
+            user.team_pages = vec![
+                teams
+                    .iter()
+                    .map(|(org, slug)| json!({"slug": slug, "organization": {"login": org}}))
+                    .collect(),
+            ];
+        });
+    }
+
+    /// Change the scripted person, for the setters that fill them in.
+    fn script(&self, change: impl FnOnce(&mut ScriptedUser)) {
+        change(
+            self.state
+                .lock()
+                .unwrap()
+                .user
+                .as_mut()
+                .expect("a test says who signs in before saying what they belong to"),
+        );
+    }
+
     /// Offer a next page for ever — a `Link` header that points at itself.
     pub(crate) fn paginate_endlessly(&self) {
         self.state.lock().unwrap().endless = true;
@@ -350,7 +455,10 @@ impl FakeGitHub {
         let signed_by = issuer(request);
         let mut state = self.state.lock().unwrap();
 
-        state.requests.push(recorded(request));
+        let user_token = state.user.as_ref().map(|user| user.token.clone());
+        state
+            .requests
+            .push(recorded(request, user_token.as_deref()));
 
         if state.refused_app.is_some() && state.refused_app == signed_by {
             return Response::builder()
@@ -491,6 +599,76 @@ impl FakeGitHub {
                     None,
                 )
             }
+            // The code exchange, which really lives on github.com rather than
+            // the API host — the fake dispatches on path alone, and this path
+            // exists nowhere else, so the distinction costs nothing here.
+            // Answered the way GitHub answers it: a `200` whatever happened,
+            // with the complaint in the body when there is one.
+            ["", "login", "oauth", "access_token"] => {
+                let body: Value = serde_json::from_slice(request.body()).unwrap_or(Value::Null);
+                let field = |name: &str| {
+                    body.get(name)
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned()
+                };
+                // The credentials are checked before the code, as GitHub does:
+                // a wrong client secret is its own refusal however good the
+                // code is — and checking it here is what makes the happy-path
+                // test prove the secret was actually sent.
+                let answer = if field("client_id") != "Iv1.0123456789abcdef"
+                    || field("client_secret") != "a-client-secret"
+                {
+                    json!({
+                        "error": "incorrect_client_credentials",
+                        "error_description": "The client_id and/or client_secret passed are incorrect.",
+                    })
+                } else {
+                    match &state.user {
+                        Some(user) if field("code") == user.code => json!({
+                            "access_token": user.token,
+                            "token_type": "bearer",
+                            "scope": "",
+                        }),
+                        // A code nobody scripted is what a stale, replayed or
+                        // mistyped one really gets.
+                        _ => json!({
+                            "error": "bad_verification_code",
+                            "error_description": "The code passed is incorrect or expired.",
+                        }),
+                    }
+                };
+
+                ok(answer, None)
+            }
+            ["", "user"] => match signed_in(&state, request) {
+                Some(user) => ok(json!({"id": user.id, "login": user.login}), None),
+                None => unauthorized(),
+            },
+            ["", "user", "emails"] => match signed_in(&state, request) {
+                Some(user) => {
+                    let (body, next) = paged(&state, &user.email_pages, &path, page);
+
+                    ok(body, next)
+                }
+                None => unauthorized(),
+            },
+            ["", "user", "orgs"] => match signed_in(&state, request) {
+                Some(user) => {
+                    let (body, next) = paged(&state, &user.org_pages, &path, page);
+
+                    ok(body, next)
+                }
+                None => unauthorized(),
+            },
+            ["", "user", "teams"] => match signed_in(&state, request) {
+                Some(user) => {
+                    let (body, next) = paged(&state, &user.team_pages, &path, page);
+
+                    ok(body, next)
+                }
+                None => unauthorized(),
+            },
             // The manifest conversion, which carries no credential at all: the
             // one-time code in the path is the whole of it.
             ["", "app-manifests", _code, "conversions"] => match state.converted.clone() {
@@ -544,6 +722,31 @@ fn issuer(request: &Request<Bytes>) -> Option<i64> {
         .ok()
 }
 
+/// The scripted person, if the request presents their token — anything else
+/// gets [`unauthorized`] from the `/user` family.
+///
+/// The check is by value rather than by scheme, because scheme is all the App's
+/// own JWT differs by on the wire: a fake that only looked for `Bearer` would
+/// wave through exactly the wrong-credential mistake these endpoints exist to
+/// catch.
+fn signed_in<'a>(state: &'a State, request: &Request<Bytes>) -> Option<&'a ScriptedUser> {
+    state.user.as_ref().filter(|user| {
+        request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            == Some(format!("Bearer {}", user.token).as_str())
+    })
+}
+
+/// GitHub's `401`, which is what a wrong or missing user token gets.
+fn unauthorized() -> Response<Bytes> {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .body(Bytes::from_static(br#"{"message":"Bad credentials"}"#))
+        .unwrap()
+}
+
 /// The page a request asked for, counting from one as GitHub does.
 fn page_number(query: Option<&str>) -> usize {
     query
@@ -584,7 +787,7 @@ fn ok(body: Value, next: Option<String>) -> Response<Bytes> {
     response.body(Bytes::from(body.to_string())).unwrap()
 }
 
-fn recorded(request: &Request<Bytes>) -> Recorded {
+fn recorded(request: &Request<Bytes>, user_token: Option<&str>) -> Recorded {
     let text = |name: header::HeaderName| {
         request
             .headers()
@@ -593,6 +796,11 @@ fn recorded(request: &Request<Bytes>) -> Recorded {
             .map(ToOwned::to_owned)
     };
     let authorization = match text(header::AUTHORIZATION) {
+        // The scripted person's token first, because it arrives as `Bearer`
+        // too and the arm below would swallow it as the App's JWT.
+        Some(value) if user_token.is_some_and(|token| value == format!("Bearer {token}")) => {
+            Authorization::User
+        }
         Some(value) if value.starts_with("Bearer ") => Authorization::Jwt,
         Some(value) if value.starts_with("token ") => Authorization::Token,
         _ => Authorization::None,
