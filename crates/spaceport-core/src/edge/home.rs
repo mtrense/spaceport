@@ -36,7 +36,12 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 use tracing::warn;
 
-use crate::auth::{RedeemError, SessionRepository};
+use super::gate::query_encode;
+use crate::app::manifest::Host;
+use crate::app::{AppId, AppStore, Auth};
+use crate::auth::{
+    AuthLogRepository, EntitlementRepository, RedeemError, SessionRepository, UserRef, WEB_ORIGIN,
+};
 use crate::connections::github::manifest::{self, Attempts, Manifest};
 use crate::connections::github::{
     ConnectionRepository, Nudge, TrackingRepository, Transport, register, webhook,
@@ -79,6 +84,21 @@ pub struct Home {
     /// the cookie they manage is scoped to spaceport's own name, which is what
     /// keeps it out of every app's cookie jar.
     pub sessions: Arc<SessionRepository>,
+    /// What each user may reach, for the access check the exchange makes
+    /// before it mints anything: a nonce is a promise the callback will keep,
+    /// so the entitlement question has to be answered before one exists.
+    pub entitlements: Arc<EntitlementRepository>,
+    /// Where the exchange records an access denial. The one auth event a page
+    /// here writes outside a mutation's transaction, because a denial *is* no
+    /// mutation — see [`AuthLogRepository::record`].
+    pub auth_log: Arc<AuthLogRepository>,
+    /// The routing table, for the exchange to re-derive an app's hosts and
+    /// manifest from: nothing about where a user is sent is taken from the
+    /// request that sent them here.
+    pub apps: Arc<AppStore>,
+    /// Named in the callback URLs the exchange builds when it is not 443,
+    /// exactly as the plaintext redirect names it.
+    pub https_port: u16,
 }
 
 /// The session cookie's name. The `__Host-` prefix is a promise the browser
@@ -96,6 +116,7 @@ pub fn router(home: Arc<Home>) -> Router {
         .route("/", get(index))
         .route("/login", get(login_page).post(login))
         .route("/logout", get(logout_page).post(logout))
+        .route("/auth/exchange", get(exchange))
         .route(&format!("{}/{{state}}", manifest::SETUP_PATH), get(setup))
         .route(
             &format!("{}/{{state}}/callback", manifest::SETUP_PATH),
@@ -129,7 +150,21 @@ async fn login_page(Query(query): Query<LoginQuery>) -> Response {
 /// repository already collapses them into one error precisely so this handler
 /// *cannot* tell them apart; anything more specific would be an oracle for
 /// whoever is guessing codes.
-async fn login(State(home): State<Arc<Home>>, body: String) -> Response {
+///
+/// The CSRF gate stands in front, held to the same rules as the apps' — not
+/// because a forged login steals a session, but because it plants one: a
+/// cross-site form that signs the victim into the attacker's account makes
+/// everything they then do the attacker's to read.
+async fn login(State(home): State<Arc<Home>>, headers: HeaderMap, body: String) -> Response {
+    if let Some(refusal) = super::gate::csrf_refusal(
+        &http::Method::POST,
+        &headers,
+        home.hostname.as_deref(),
+        home.https_port,
+    ) {
+        return refusal;
+    }
+
     let next = form_value(&body, "next");
     let next = next.as_deref();
     let Some(code) = form_value(&body, "code").filter(|code| !code.is_empty()) else {
@@ -207,7 +242,20 @@ async fn logout_page() -> Response {
 /// are. Derived app sessions are dropped inside
 /// [`SessionRepository::logout`]'s transaction when that milestone lands — see
 /// the hook there — so this handler will not change shape for it.
+///
+/// The CSRF gate stands in front for the same reason the confirm form does:
+/// this is a cookie-authenticated POST, and a page that could sign a user out
+/// cross-site is the small cousin the form already refused to be.
 async fn logout(State(home): State<Arc<Home>>, headers: HeaderMap) -> Response {
+    if let Some(refusal) = super::gate::csrf_refusal(
+        &http::Method::POST,
+        &headers,
+        home.hostname.as_deref(),
+        home.https_port,
+    ) {
+        return refusal;
+    }
+
     if let Some(token) = cookie_value(&headers, SESSION_COOKIE)
         && let Err(error) = home.sessions.logout(&Secret::new(token)).await
     {
@@ -236,6 +284,193 @@ async fn logout(State(home): State<Arc<Home>>, headers: HeaderMap) -> Response {
         ))
         .expect("a literal cookie is a header value"),
     );
+
+    response
+}
+
+#[derive(Debug, Deserialize)]
+struct ExchangeQuery {
+    /// Which app the exchange is for — the id, which the routing table turns
+    /// back into a manifest nothing in this request can forge.
+    app: Option<String>,
+    /// The host the user was knocking on. Honoured only if the app's manifest
+    /// lists it; anything else falls back to the manifest's first host, so
+    /// this parameter can steer between an app's own domains and nowhere else.
+    host: Option<String>,
+    /// The path and query to land on afterwards, held to [`safe_next`]'s
+    /// shape on the way out.
+    next: Option<String>,
+}
+
+/// `GET /auth/exchange?app=…&host=…&next=…`: the edge-side hop of the app
+/// sign-in dance.
+///
+/// The order of questions is the security argument. Which app, from the
+/// routing table — so everything after speaks about a manifest, not about
+/// request values. Who is asking, from the global session — no session means
+/// the login form, with this very URL as its `next`, so finishing the login
+/// resumes the exchange. Whether they may enter, from entitlements against the
+/// deployed manifest's declared roles — an empty intersection is a plain "no
+/// access" page and an `access.denied` event, never a nonce. Only then is the
+/// nonce minted and the browser bounced to the app's own domain to redeem it.
+async fn exchange(
+    State(home): State<Arc<Home>>,
+    headers: HeaderMap,
+    Query(query): Query<ExchangeQuery>,
+) -> Response {
+    let Some(app_id) = query
+        .app
+        .as_deref()
+        .and_then(|app| app.parse::<AppId>().ok())
+    else {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "This sign-in link names no app",
+            "The link is incomplete. Go back to the app you were opening and try again.",
+        );
+    };
+
+    // The app, from the table rather than the request. Only a *running* app
+    // can finish the exchange — a suspended or down one could not serve the
+    // page the user is after anyway, and the honest answer is the same one
+    // its own domain would give.
+    let Some(app) = home.apps.get(&app_id) else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "This app is not being served",
+            "It may be suspended or down. Try again later, or ask its operator.",
+        );
+    };
+
+    // The host to send the user to: theirs if the manifest lists it, the
+    // manifest's first host otherwise. Either way the redirect target is a
+    // name the app's own document claims — the allowlist the spec asks for.
+    let host = query
+        .host
+        .as_deref()
+        .and_then(|asked| {
+            app.manifest
+                .routing
+                .hosts
+                .iter()
+                .find(|host| host.as_str() == asked)
+        })
+        .or_else(|| app.manifest.routing.hosts.first())
+        .map(Host::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let next = safe_next(query.next.as_deref()).to_owned();
+
+    // An open app has no session to mint: whatever brought someone here, the
+    // app's own domain answers as itself.
+    let Auth::Edge { roles, .. } = &app.manifest.auth else {
+        return see_other(&format!(
+            "https://{}{next}",
+            super::gate::authority(&host, home.https_port)
+        ));
+    };
+
+    // Who is asking — the database's answer, not a cookie's.
+    let session = match cookie_value(&headers, SESSION_COOKIE) {
+        Some(token) => match home.sessions.session_of(&Secret::new(token)).await {
+            Ok(session) => session,
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "the exchange could not check a session");
+
+                return problem(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Spaceport could not check the session",
+                    "Nothing was decided. Try again.",
+                );
+            }
+        },
+        None => None,
+    };
+    let Some((session, user)) = session else {
+        // Not signed in on the edge either: the login form, with this very
+        // exchange as its `next`, so the login's last redirect resumes here.
+        let resume = format!(
+            "/auth/exchange?app={}&host={}&next={}",
+            query_encode(app_id.as_str()),
+            query_encode(&host),
+            query_encode(&next),
+        );
+
+        return see_other(&format!("/login?next={}", query_encode(&resume)));
+    };
+
+    // The access check: at least one entitlement for a role the *deployed*
+    // manifest declares. An entitlement for a role the app never heard of is
+    // stored, warned about at grant — and worth exactly nothing here.
+    let held = match home.entitlements.audit(&UserRef::Id(user.clone())).await {
+        Ok((_, held)) => held,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "the exchange could not read entitlements");
+
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Spaceport could not check your access",
+                "Nothing was decided. Try again.",
+            );
+        }
+    };
+    let entitled = held
+        .iter()
+        .any(|entitlement| entitlement.app == app_id && roles.contains(&entitlement.role));
+    if !entitled {
+        // Recorded, because a denial is the event an auditor goes looking
+        // for; a plain page rather than a redirect, because there is nowhere
+        // sending them that would change the answer.
+        if let Err(error) = home
+            .auth_log
+            .record(
+                "access.denied",
+                Some(&user),
+                WEB_ORIGIN,
+                Some(&format!("no entitled role at app `{app_id}`")),
+            )
+            .await
+        {
+            warn!(error = %format!("{error:#}"), "an access denial could not be recorded");
+        }
+
+        return problem(
+            StatusCode::FORBIDDEN,
+            "No access",
+            &format!(
+                "You are signed in, and your account has no access to `{app_id}`. An operator can grant it."
+            ),
+        );
+    }
+
+    let nonce = match home.sessions.mint_nonce(&user, &app_id, &session).await {
+        Ok(nonce) => nonce,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "the exchange could not mint a nonce");
+
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Spaceport could not complete the sign-in",
+                "Nothing was minted. Try again.",
+            );
+        }
+    };
+
+    see_other(&format!(
+        "https://{}/.spaceport/callback?nonce={}&next={}",
+        super::gate::authority(&host, home.https_port),
+        query_encode(nonce.expose()),
+        query_encode(&next),
+    ))
+}
+
+/// A 303 to `location`: fetched with GET whatever this was.
+fn see_other(location: &str) -> Response {
+    let mut response = Response::new(axum::body::Body::empty());
+    *response.status_mut() = StatusCode::SEE_OTHER;
+    if let Ok(value) = HeaderValue::from_str(location) {
+        response.headers_mut().insert(http::header::LOCATION, value);
+    }
 
     response
 }
@@ -287,7 +522,7 @@ fn login_form(status: StatusCode, error: Option<&str>, next: Option<&str>) -> Re
 /// Anything with a scheme fails the leading-`/` test already. The fallback is
 /// `/` and never an error, because the value arrives on urls users share and
 /// a broken link should still land them somewhere signed in.
-fn safe_next(next: Option<&str>) -> &str {
+pub(super) fn safe_next(next: Option<&str>) -> &str {
     match next {
         Some(next) if next.starts_with('/') && !next.starts_with("//") && !next.contains('\\') => {
             next
@@ -328,7 +563,7 @@ fn session_cookie(fresh: &crate::auth::FreshSession) -> String {
 
 /// The value of the cookie `name`, out of however many `Cookie` headers the
 /// request carries.
-fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+pub(super) fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get_all(http::header::COOKIE)
         .iter()
@@ -675,7 +910,11 @@ mod tests {
             nudge: Nudge::new(),
             builds: Nudge::new(),
             hostname: Some(HOSTNAME.to_owned()),
-            sessions: Arc::new(SessionRepository::new(db)),
+            sessions: Arc::new(SessionRepository::new(db.clone())),
+            entitlements: Arc::new(EntitlementRepository::new(db.clone())),
+            auth_log: Arc::new(AuthLogRepository::new(db)),
+            apps: Arc::new(AppStore::new()),
+            https_port: 443,
         });
 
         (home, github)
@@ -1354,7 +1593,22 @@ mod tests {
     /// A home whose database the test can also reach, for planting the user
     /// and the code a login needs.
     fn auth_home() -> (Arc<Home>, crate::auth::UserRepository) {
+        let (home, users, _) = exchange_home(Arc::new(AppStore::new()));
+
+        (home, users)
+    }
+
+    /// The same, over a routing table the test controls — what the exchange
+    /// tests steer apps into — with the entitlement repository to grant with.
+    fn exchange_home(
+        apps: Arc<AppStore>,
+    ) -> (
+        Arc<Home>,
+        crate::auth::UserRepository,
+        Arc<EntitlementRepository>,
+    ) {
         let db = Db::in_memory().unwrap();
+        let entitlements = Arc::new(EntitlementRepository::new(db.clone()));
         let home = Arc::new(Home {
             attempts: Arc::new(Attempts::new()),
             connections: Arc::new(ConnectionRepository::new(db.clone())),
@@ -1364,9 +1618,13 @@ mod tests {
             builds: Nudge::new(),
             hostname: Some(HOSTNAME.to_owned()),
             sessions: Arc::new(SessionRepository::new(db.clone())),
+            entitlements: entitlements.clone(),
+            auth_log: Arc::new(AuthLogRepository::new(db.clone())),
+            apps,
+            https_port: 443,
         });
 
-        (home, crate::auth::UserRepository::new(db))
+        (home, crate::auth::UserRepository::new(db), entitlements)
     }
 
     /// A code as the operator socket would have minted one, exposed for the
@@ -1386,7 +1644,9 @@ mod tests {
             .to_owned()
     }
 
-    /// One form submission at `path`, as a browser would send it.
+    /// One form submission at `path`, as a browser would send it — fetch
+    /// metadata included, since a browser posting its own page's form always
+    /// says `same-origin` and the CSRF gate now insists on hearing it.
     async fn post_form(home: Arc<Home>, path: &str, body: &str) -> http::Response<Body> {
         router(home)
             .oneshot(
@@ -1397,6 +1657,7 @@ mod tests {
                         http::header::CONTENT_TYPE,
                         "application/x-www-form-urlencoded",
                     )
+                    .header("sec-fetch-site", "same-origin")
                     .body(Body::from(body.to_owned()))
                     .unwrap(),
             )
@@ -1544,6 +1805,7 @@ mod tests {
                     .method("POST")
                     .uri("/logout")
                     .header(http::header::COOKIE, &cookie)
+                    .header("sec-fetch-site", "same-origin")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1572,6 +1834,302 @@ mod tests {
         let response = post_form(home, "/logout", "").await;
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// The edge's own forms are held to the same CSRF rules as the apps':
+    /// another site's POST to `/login` would plant the attacker's session,
+    /// and to `/logout` would sign the victim out — both die at the gate,
+    /// whether the browser said `cross-site` or said nothing at all.
+    #[tokio::test]
+    async fn a_cross_site_post_to_login_or_logout_is_refused() {
+        for path in ["/login", "/logout"] {
+            for hostile in [
+                &[("sec-fetch-site", "cross-site")][..],
+                &[("origin", "https://evil.example")][..],
+                &[][..],
+            ] {
+                let (home, users) = auth_home();
+                let code = minted_code(&home, &users, "alice").await;
+
+                let mut request = Request::builder().method("POST").uri(path).header(
+                    http::header::CONTENT_TYPE,
+                    "application/x-www-form-urlencoded",
+                );
+                for (name, value) in hostile {
+                    request = request.header(*name, *value);
+                }
+                let response = router(home.clone())
+                    .oneshot(request.body(Body::from(format!("code={code}"))).unwrap())
+                    .await
+                    .unwrap();
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::FORBIDDEN,
+                    "{path} {hostile:?}"
+                );
+                // And the code is still unspent: nothing was redeemed on the
+                // way to the refusal.
+                assert!(
+                    post_form(home, "/login", &format!("code={code}"))
+                        .await
+                        .status()
+                        .is_redirection(),
+                    "{path} {hostile:?}"
+                );
+            }
+        }
+    }
+
+    /// The fallback for clients without fetch metadata: an `Origin` naming
+    /// this very host passes the form through.
+    #[tokio::test]
+    async fn a_login_post_with_a_matching_origin_and_no_fetch_metadata_passes() {
+        let (home, users) = auth_home();
+        let code = minted_code(&home, &users, "alice").await;
+
+        let response = router(home)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header(
+                        http::header::CONTENT_TYPE,
+                        "application/x-www-form-urlencoded",
+                    )
+                    .header(http::header::ORIGIN, format!("https://{HOSTNAME}"))
+                    .body(Body::from(format!("code={code}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    }
+
+    /// A gated app for the routing table, in the shape the proxy tests use.
+    fn gated_app(id: &str, hosts: &str, roles: &str) -> crate::app::App {
+        crate::app::App {
+            id: id.parse().unwrap(),
+            manifest: crate::AppManifest::parse(&format!(
+                "schema_version: 1\nsource:\n  type: image\n  image: x\nrouting:\n  hosts: [{hosts}]\nauth:\n  gating: edge\n  roles: [{roles}]\n"
+            ))
+            .unwrap(),
+            container: crate::runtime::ContainerId::new("test-container"),
+            upstream: "127.0.0.1:1".parse().unwrap(),
+        }
+    }
+
+    /// A signed-in browser's cookie header, made the way the login page makes
+    /// one.
+    async fn session_cookie_for(home: &Arc<Home>, users: &crate::auth::UserRepository) -> String {
+        let code = minted_code(home, users, "alice").await;
+        let login = post_form(home.clone(), "/login", &format!("code={code}")).await;
+
+        login.headers()[http::header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
+    async fn get_exchange(home: Arc<Home>, path: &str, cookie: Option<&str>) -> Response {
+        let mut request = Request::builder().uri(path);
+        if let Some(cookie) = cookie {
+            request = request.header(http::header::COOKIE, cookie);
+        }
+
+        router(home)
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    const EXCHANGE: &str = "/auth/exchange?app=blog&host=alpha.test&next=%2Fposts%3Fq%3D1";
+
+    /// Without a global session the exchange is a login form away, and the
+    /// form's `next` is the exchange itself — finishing the login resumes it.
+    #[tokio::test]
+    async fn the_exchange_sends_a_stranger_to_login_and_completes_after_it() {
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated_app("blog", "alpha.test", "reader"))
+            .unwrap();
+        let (home, users, entitlements) = exchange_home(apps);
+        users.create(&"alice".parse().unwrap(), None).await.unwrap();
+        entitlements
+            .grant(
+                &crate::auth::UserRef::Slug("alice".parse().unwrap()),
+                &"reader@blog".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let response = get_exchange(home.clone(), EXCHANGE, None).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let login = response.headers()[http::header::LOCATION].to_str().unwrap();
+        assert!(login.starts_with("/login?next="), "{login}");
+
+        // The login form carries that next through, and redeeming a code
+        // lands back on the exchange...
+        let code = home
+            .sessions
+            .mint_code(
+                &crate::auth::UserRef::Slug("alice".parse().unwrap()),
+                crate::auth::DEFAULT_SESSION_LIFETIME,
+            )
+            .await
+            .unwrap();
+        // The hidden field travels back form-encoded, as a browser would send
+        // it — which is what keeps the nested encoding intact.
+        let next = form_decode(login.strip_prefix("/login?next=").unwrap());
+        let login = post_form(
+            home.clone(),
+            "/login",
+            &format!("code={}&next={}", code.code.expose(), query_encode(&next)),
+        )
+        .await;
+        assert_eq!(login.status(), StatusCode::SEE_OTHER);
+        let resumed = login.headers()[http::header::LOCATION].to_str().unwrap();
+        assert!(resumed.starts_with("/auth/exchange?app=blog"), "{resumed}");
+        let cookie = login.headers()[http::header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        // ...which, now signed in, bounces to the app's own callback with a
+        // nonce and the original path and query intact.
+        let response = get_exchange(home, resumed, Some(&cookie)).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let callback = response.headers()[http::header::LOCATION].to_str().unwrap();
+        assert!(
+            callback.starts_with("https://alpha.test/.spaceport/callback?nonce="),
+            "{callback}"
+        );
+        assert!(callback.ends_with("&next=%2Fposts%3Fq%3D1"), "{callback}");
+    }
+
+    /// Signed in and not entitled is a page, not a redirect: nowhere the
+    /// browser could be sent would change the answer — and the denial is the
+    /// event an auditor goes looking for, so it is in the log.
+    #[tokio::test]
+    async fn the_exchange_refuses_a_user_with_no_entitlement_and_records_it() {
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated_app("blog", "alpha.test", "reader"))
+            .unwrap();
+        let (home, users, _) = exchange_home(apps);
+        let cookie = session_cookie_for(&home, &users).await;
+
+        let response = get_exchange(home.clone(), EXCHANGE, Some(&cookie)).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("No access")
+        );
+        let entries = home.auth_log.entries(None).await.unwrap();
+        assert!(entries.iter().any(|entry| entry.kind == "access.denied"
+            && entry.detail.as_deref() == Some("no entitled role at app `blog`")),);
+    }
+
+    /// An entitlement the manifest does not declare opens nothing: the spec
+    /// stores it, warns at grant, and the exchange values it at exactly zero.
+    #[tokio::test]
+    async fn an_entitlement_for_an_undeclared_role_grants_no_access() {
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated_app("blog", "alpha.test", "reader"))
+            .unwrap();
+        let (home, users, entitlements) = exchange_home(apps);
+        let cookie = session_cookie_for(&home, &users).await;
+        entitlements
+            .grant(
+                &crate::auth::UserRef::Slug("alice".parse().unwrap()),
+                &"editor@blog".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let response = get_exchange(home, EXCHANGE, Some(&cookie)).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// The redirect target is allowlisted to the app's manifest: a host the
+    /// manifest never claimed falls back to one it did, and the path is held
+    /// to the same shape a login `next` is.
+    #[tokio::test]
+    async fn the_exchange_only_redirects_to_hosts_the_manifest_claims() {
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated_app("blog", "alpha.test", "reader"))
+            .unwrap();
+        let (home, users, entitlements) = exchange_home(apps);
+        let cookie = session_cookie_for(&home, &users).await;
+        entitlements
+            .grant(
+                &crate::auth::UserRef::Slug("alice".parse().unwrap()),
+                &"reader@blog".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let response = get_exchange(
+            home,
+            "/auth/exchange?app=blog&host=evil.example&next=%2F%2Fevil.example",
+            Some(&cookie),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers()[http::header::LOCATION].to_str().unwrap();
+        assert!(
+            location.starts_with("https://alpha.test/.spaceport/callback?nonce="),
+            "{location}"
+        );
+        // The scheme-relative `next` was replaced by the fallback `/`.
+        assert!(location.ends_with("&next=%2F"), "{location}");
+    }
+
+    /// An open app has no session to mint, whoever asks: the exchange simply
+    /// hands the browser back to the app's own domain.
+    #[tokio::test]
+    async fn the_exchange_sends_an_open_apps_visitor_straight_back() {
+        let apps = Arc::new(AppStore::new());
+        apps.insert(crate::app::App {
+            id: "blog".parse().unwrap(),
+            manifest: crate::AppManifest::parse(
+                "schema_version: 1\nsource:\n  type: image\n  image: x\nrouting:\n  hosts: [alpha.test]\nauth:\n  gating: open\n",
+            )
+            .unwrap(),
+            container: crate::runtime::ContainerId::new("test-container"),
+            upstream: "127.0.0.1:1".parse().unwrap(),
+        })
+        .unwrap();
+        let (home, _, _) = exchange_home(apps);
+
+        let response = get_exchange(home, EXCHANGE, None).await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers()[http::header::LOCATION],
+            "https://alpha.test/posts?q=1"
+        );
+    }
+
+    /// An app nothing serves cannot finish an exchange, and the page says why
+    /// in the words its own domain would use.
+    #[tokio::test]
+    async fn the_exchange_answers_for_an_app_that_is_not_served() {
+        let (home, _, _) = exchange_home(Arc::new(AppStore::new()));
+
+        let response = get_exchange(home, EXCHANGE, None).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

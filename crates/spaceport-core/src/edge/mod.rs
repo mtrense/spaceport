@@ -5,6 +5,7 @@
 //! the TLS handshake, so a slow or hostile client can never stall the loop
 //! that is admitting everyone else.
 
+mod gate;
 pub(crate) mod home;
 pub(crate) mod proxy;
 pub(crate) mod routes;
@@ -46,6 +47,14 @@ pub struct EdgeState {
     pub apps: Arc<AppStore>,
     /// The connection pool traffic is forwarded through.
     pub upstreams: proxy::Upstreams,
+    /// The sessions the gate checks app cookies against, per request on gated
+    /// apps — the same repository the login page and the callback write, or a
+    /// cookie one listener minted would be one another refuses.
+    pub sessions: Arc<crate::auth::SessionRepository>,
+    /// Spaceport's own hostname, for building the exchange URL a gated app
+    /// bounces strangers to. Absent when the config named none, in which case
+    /// gated apps can only refuse.
+    pub hostname: Option<String>,
     /// Port plaintext clients are redirected to.
     pub https_port: u16,
 }
@@ -71,11 +80,26 @@ pub async fn serve(
 ) -> Result<()> {
     let listen = &config.edge.listen;
 
+    // The pieces the every-host routes and the gate share with the home
+    // router, copied out before `home` is consumed into its router: they are
+    // the same repositories on purpose — the callback redeems what the login
+    // page minted — and this is where that sameness is wired.
+    let sessions = home.sessions.clone();
+    let hostname = home.hostname.clone();
+
     let state = Arc::new(EdgeState {
-        router: routes::router(challenges),
+        router: routes::router(routes::SpaceportRoutes {
+            challenges,
+            apps: apps.clone(),
+            sessions: sessions.clone(),
+            hostname: hostname.clone(),
+            https_port: listen.https.port(),
+        }),
         home: home::router(home),
         apps,
         upstreams: proxy::Upstreams::new(),
+        sessions,
+        hostname,
         https_port: listen.https.port(),
     });
 

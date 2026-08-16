@@ -1102,6 +1102,11 @@ async fn run(args: RunArgs) -> Result<()> {
     // repositories would only be two handles to the same table pretending
     // otherwise.
     let sessions = Arc::new(SessionRepository::new(db.clone()));
+    // Shared with the operator interface for the reason sessions are: the
+    // exchange on the edge must be answering over the same rows a grant or a
+    // denial audit reads on the socket.
+    let entitlements = Arc::new(EntitlementRepository::new(db.clone()));
+    let auth_log = Arc::new(AuthLogRepository::new(db.clone()));
 
     let home = Arc::new(edge::Home {
         attempts: attempts.clone(),
@@ -1112,6 +1117,10 @@ async fn run(args: RunArgs) -> Result<()> {
         builds: building.clone(),
         hostname: config.edge.hostname.as_ref().map(ToString::to_string),
         sessions: sessions.clone(),
+        entitlements: entitlements.clone(),
+        auth_log: auth_log.clone(),
+        apps: apps.clone(),
+        https_port: config.edge.listen.https.port(),
     });
 
     let operator = args.operator.map(|endpoint| {
@@ -1139,8 +1148,8 @@ async fn run(args: RunArgs) -> Result<()> {
             // without anything being built to wake the loop on its own.
             deploying,
             users: Arc::new(UserRepository::new(db.clone())),
-            auth_log: Arc::new(AuthLogRepository::new(db.clone())),
-            entitlements: Arc::new(EntitlementRepository::new(db.clone())),
+            auth_log,
+            entitlements,
             sessions,
             db,
             certificates: certificates.clone(),

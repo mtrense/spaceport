@@ -498,6 +498,51 @@ const MIGRATIONS: &[&str] = &[
         code_expires_at    TEXT NOT NULL,
         session_expires_at TEXT NOT NULL
     ) STRICT;",
+    // 13 — who is signed in on an app's own domain, and the one-time nonces
+    // the redirect exchange spends getting them there.
+    //
+    // `app_sessions` is the derived half of step 12's story: a row here exists
+    // only because a row in `sessions` did when the exchange ran, and it dies
+    // with it — logout, `session drop`, suspend and drop all delete by
+    // `parent_session` or `user_id` in the same transaction that removes the
+    // parent. `expires_at` is *copied* from the parent at mint rather than
+    // joined at read time, because the parent row is deleted at logout and an
+    // expiry that lived only in a row that can vanish first would leave the
+    // reader guessing; the copy is safe precisely because the cascades delete
+    // both together. Keyed by `token_hash` and nothing else: unlike a global
+    // session there is no operator handle to type — `session drop` aims at the
+    // parent and takes these rows with it, which is the spec's contract.
+    //
+    // `exchange_nonces` is the login-code shape again, and hashed for the same
+    // reason step 12 gives: the nonce rides a redirect URL through a browser's
+    // history, so the table must be worth less than the URL. `spaceport_app`
+    // pins the nonce to the one app it was minted for — a nonce redeemed on
+    // any other app's domain is refused — and `parent_session` is re-checked
+    // at redemption so a logout between mint and redeem wins. Sixty seconds of
+    // TTL is carried in `expires_at` like every other expiry in this schema.
+    //
+    // No foreign keys, for the reason step 4 gives everywhere: the cascades
+    // are written by hand in the transactions that need them, and expired rows
+    // are swept opportunistically by the same writes that grow the tables.
+    "CREATE TABLE app_sessions (
+        token_hash     TEXT NOT NULL PRIMARY KEY,
+        user_id        TEXT NOT NULL,
+        spaceport_app  TEXT NOT NULL,
+        parent_session TEXT NOT NULL,
+        created_at     TEXT NOT NULL,
+        expires_at     TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX app_sessions_by_parent ON app_sessions (parent_session);
+    CREATE INDEX app_sessions_by_user ON app_sessions (user_id);
+    CREATE TABLE exchange_nonces (
+        nonce_hash     TEXT NOT NULL PRIMARY KEY,
+        user_id        TEXT NOT NULL,
+        spaceport_app  TEXT NOT NULL,
+        parent_session TEXT NOT NULL,
+        created_at     TEXT NOT NULL,
+        expires_at     TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX exchange_nonces_by_user ON exchange_nonces (user_id);",
 ];
 
 /// The schema version this build writes.
@@ -950,6 +995,47 @@ mod tests {
                 )
                 .unwrap(),
             0
+        );
+    }
+
+    /// An app session is a row and never a credential: both new tables store
+    /// hashes, and the derived row carries the expiry it inherited at mint so
+    /// nothing has to join a parent that logout may already have deleted.
+    #[test]
+    fn the_thirteenth_migration_creates_the_app_session_tables() {
+        let connection = empty();
+        migrate(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO app_sessions
+                     (token_hash, user_id, spaceport_app, parent_session, created_at, expires_at)
+                 VALUES ('a-hash', '3f29b1d4-8a6e-4c2b-9e77-1d5f6a2b9c40', 'blog',
+                         '0123456789abcdef', '2026-01-01T00:00:00Z', '2026-01-01T12:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            columns(&connection, "app_sessions"),
+            [
+                "token_hash",
+                "user_id",
+                "spaceport_app",
+                "parent_session",
+                "created_at",
+                "expires_at"
+            ]
+        );
+        assert_eq!(
+            columns(&connection, "exchange_nonces"),
+            [
+                "nonce_hash",
+                "user_id",
+                "spaceport_app",
+                "parent_session",
+                "created_at",
+                "expires_at"
+            ]
         );
     }
 

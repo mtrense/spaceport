@@ -274,6 +274,88 @@ impl PathPrefix {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Whether this prefix covers `path`, which must already be
+    /// [`canonical_path`]'s output.
+    ///
+    /// The boundary check is the whole point: `/public` covers `/public` and
+    /// `/public/x` and never `/publicfoo`, because a prefix names a subtree of
+    /// the URL space and `publicfoo` is a different segment that merely shares
+    /// spelling. Taking the canonical form rather than the raw path is what
+    /// makes the answer mean anything — a raw `/css/../secret` would match
+    /// `/css` here while the app serves `/secret` there.
+    pub fn matches(&self, canonical: &str) -> bool {
+        canonical == self.0
+            || (canonical.starts_with(&self.0)
+                && canonical.as_bytes().get(self.0.len()) == Some(&b'/'))
+    }
+}
+
+/// The one spelling of a request path that public-prefix matching compares
+/// against: percent-decoded, dot segments resolved, empty segments dropped.
+///
+/// This exists because a path is an instruction the *app* will interpret, and
+/// the gate must not read it more naively than the app will. `/css/%2e%2e/x`
+/// is `/css/../x` to any framework that decodes before routing, so a matcher
+/// that saw a `/css` prefix there would wave through a request the app treats
+/// as `/x` — decoding first closes that dodge. Resolving `..` after decoding
+/// closes the plain-text spelling of the same trick, and dropping empty
+/// segments means `//public/x` cannot hide from a `/public` prefix it would
+/// reach anyway. Everything that decodes into something unspeakable — a stray
+/// `%`, bytes that are not UTF-8 — stays as it came or becomes a replacement
+/// character, neither of which can equal an ASCII prefix segment: the failure
+/// mode is always "not public", never "public by accident".
+///
+/// The request forwarded upstream is untouched; only the matching sees this
+/// form. What the app is asked for is what the client sent, byte for byte.
+pub fn canonical_path(raw: &str) -> String {
+    // Percent-decode into bytes first: an encoded `/` becomes a real segment
+    // boundary *before* segmentation, which is the conservative direction —
+    // it can only split segments further, never glue two into a fake match.
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len()
+                && bytes[index + 1].is_ascii_hexdigit()
+                && bytes[index + 2].is_ascii_hexdigit() =>
+            {
+                let hex = std::str::from_utf8(&bytes[index + 1..=index + 2])
+                    .expect("two ascii hex digits are utf-8");
+                decoded.push(u8::from_str_radix(hex, 16).expect("two hex digits are a byte"));
+                index += 2;
+            }
+            byte => decoded.push(byte),
+        }
+        index += 1;
+    }
+    let text = String::from_utf8_lossy(&decoded);
+
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in text.split('/') {
+        match segment {
+            // Empty covers both the leading slash and `//`; `.` is "here".
+            "" | "." => {}
+            // `..` climbs, and climbing above the root stays at the root —
+            // the same answer every filesystem and browser gives.
+            ".." => {
+                segments.pop();
+            }
+            segment => segments.push(segment),
+        }
+    }
+
+    let mut canonical = String::with_capacity(text.len() + 1);
+    for segment in segments {
+        canonical.push('/');
+        canonical.push_str(segment);
+    }
+    if canonical.is_empty() {
+        canonical.push('/');
+    }
+
+    canonical
 }
 
 impl FromStr for PathPrefix {
@@ -2187,5 +2269,67 @@ roles: [reader, writer]",
     fn leaves_variables_that_merely_mention_spaceport_alone() {
         let raw = with_container("env:\n  MY_SPACEPORT_URL: x\n  SPACEPOR: y");
         assert!(AppManifest::parse(&raw).is_ok());
+    }
+
+    fn prefix(s: &str) -> PathPrefix {
+        s.parse().unwrap()
+    }
+
+    /// The segment boundary is what separates a subtree from a lookalike:
+    /// `/publicfoo` shares thirteen characters with `/public` and none of its
+    /// meaning.
+    #[test]
+    fn a_prefix_matches_its_subtree_and_not_a_lookalike_segment() {
+        let public = prefix("/public");
+
+        assert!(public.matches("/public"));
+        assert!(public.matches("/public/x"));
+        assert!(public.matches("/public/x/y"));
+        assert!(!public.matches("/publicfoo"));
+        assert!(!public.matches("/pub"));
+        assert!(!public.matches("/"));
+        assert!(!public.matches("/x/public"));
+    }
+
+    #[test]
+    fn canonicalization_leaves_a_plain_path_alone() {
+        assert_eq!(canonical_path("/public/x"), "/public/x");
+        assert_eq!(canonical_path("/"), "/");
+        assert_eq!(canonical_path(""), "/");
+    }
+
+    /// The dodges: spellings of a private path that would slip past a naive
+    /// prefix compare, and spellings of a public one that would hide from it.
+    /// Both directions matter — the first is an information leak, the second
+    /// only a nuisance, and canonicalization settles both the same way.
+    #[test]
+    fn canonicalization_resolves_dot_segments_and_empty_segments() {
+        assert_eq!(canonical_path("/css/../secret"), "/secret");
+        assert_eq!(canonical_path("/css/%2e%2e/secret"), "/secret");
+        assert_eq!(canonical_path("//public/x"), "/public/x");
+        assert_eq!(canonical_path("/public/./x"), "/public/x");
+        assert_eq!(canonical_path("/a/b/../../public"), "/public");
+        // Climbing above the root stays at the root.
+        assert_eq!(canonical_path("/../../etc/passwd"), "/etc/passwd");
+    }
+
+    /// An encoded slash decodes into a real boundary before segmentation, so
+    /// `%2f` can neither glue a fake match together nor smuggle a `..` past
+    /// the resolver.
+    #[test]
+    fn canonicalization_decodes_an_encoded_slash_into_a_boundary() {
+        assert_eq!(canonical_path("/secret%2f..%2fpublic/x"), "/public/x");
+        assert_eq!(canonical_path("/css%2f..%2fsecret"), "/secret");
+    }
+
+    /// What cannot be decoded must fail towards "not public": a stray percent
+    /// and non-UTF-8 bytes stay unmatchable rather than becoming a prefix.
+    #[test]
+    fn undecodable_paths_never_fake_a_match() {
+        let public = prefix("/public");
+
+        assert!(!public.matches(&canonical_path("/public%")));
+        assert!(public.matches(&canonical_path("/public/%ff")));
+        assert!(!public.matches(&canonical_path("/%ffpublic")));
     }
 }

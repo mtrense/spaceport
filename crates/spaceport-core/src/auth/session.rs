@@ -163,6 +163,13 @@ pub struct SessionRecord {
     pub id: SessionId,
     pub created_at: String,
     pub expires_at: String,
+    /// The app sessions the redirect exchange has derived from this one.
+    /// Carried on the parent rather than listed flat, because that is the
+    /// only relationship they have: they were minted from it, expire with it,
+    /// and dropping it takes them along — a listing that showed them apart
+    /// would invite an operator to try dropping one alone, which no command
+    /// offers on purpose.
+    pub derived: Vec<super::app_session::AppSessionRecord>,
 }
 
 /// Why a session command did not happen, kept apart the way
@@ -230,7 +237,11 @@ impl std::error::Error for RedeemError {}
 /// lists.
 #[derive(Debug, Clone)]
 pub struct SessionRepository {
-    db: Db,
+    /// Visible to [`super::app_session`], which is the same repository's other
+    /// half in another file: app sessions and exchange nonces are session
+    /// tables, and a second repository over them could drop rows this one's
+    /// cascades believe it owns.
+    pub(super) db: Db,
 }
 
 impl SessionRepository {
@@ -492,9 +503,10 @@ impl SessionRepository {
     /// page treats a token nobody recognises exactly like a real one, because
     /// either way the right response is a cleared cookie.
     ///
-    /// HOOK POINT: when app sessions land, the derived sessions — and the
-    /// WebSocket connections tracked under them — are dropped here, in this
-    /// transaction, so a logout is one commit however many domains it reaches.
+    /// The derived app sessions go in the same transaction — one commit
+    /// however many domains the logout reaches. HOOK POINT: when WebSocket
+    /// tracking lands, the connections held under those app sessions are
+    /// terminated here too.
     pub async fn logout(&self, token: &Secret) -> Result<bool> {
         let token_hash = hash(token.expose());
 
@@ -525,6 +537,7 @@ impl SessionRepository {
                         rusqlite::params![token_hash],
                     )
                     .context("dropping a session at logout")?;
+                super::app_session::remove_derived_in(&transaction, &session_id)?;
 
                 if is_past(&expires_at) {
                     transaction.commit().context("committing a logout")?;
@@ -632,6 +645,10 @@ impl SessionRepository {
                             rusqlite::params![session.id.as_str()],
                         )
                         .context("dropping a session")?;
+                    // The derived app sessions die with their parent, in this
+                    // commit: `session drop` is the offboarding lever, and a
+                    // lever that left an app's cookie working would not be one.
+                    super::app_session::remove_derived_in(&transaction, session.id.as_str())?;
                     record_in(
                         &transaction,
                         &at,
@@ -687,7 +704,7 @@ fn live_sessions_in(transaction: &Transaction<'_>, user: &UserId) -> Result<Vec<
         .collect::<rusqlite::Result<Vec<_>>>()
         .context("listing the sessions")?;
 
-    Ok(rows
+    let mut sessions: Vec<SessionRecord> = rows
         .into_iter()
         .filter(|(_, _, expires_at)| !is_past(expires_at))
         .filter_map(|(id, created_at, expires_at)| match id.parse() {
@@ -695,13 +712,24 @@ fn live_sessions_in(transaction: &Transaction<'_>, user: &UserId) -> Result<Vec<
                 id,
                 created_at,
                 expires_at,
+                derived: Vec::new(),
             }),
             Err(error) => {
                 tracing::warn!(%error, "skipping a stored session this build cannot read");
                 None
             }
         })
-        .collect())
+        .collect();
+
+    // The derived app sessions, hung under their parents: read in the same
+    // transaction so a listing never shows an app session whose parent it
+    // just denied. One derived from a parent this listing skipped is skipped
+    // with it — it dies with the parent either way.
+    for record in &mut sessions {
+        record.derived = super::app_session::derived_in(transaction, record.id.as_str())?;
+    }
+
+    Ok(sessions)
 }
 
 /// Delete every session and pending code of `user`, inside the caller's
@@ -727,6 +755,10 @@ pub(super) fn remove_all_in(transaction: &Transaction<'_>, user: &UserId) -> Res
             rusqlite::params![user.as_str()],
         )
         .context("removing an offboarded user's pending codes")?;
+    // The derived tables go by user rather than by walking the sessions just
+    // deleted: an app session whose parent row was somehow already gone must
+    // still not survive its user's offboarding.
+    super::app_session::remove_users_in(transaction, user)?;
 
     Ok(())
 }
@@ -740,7 +772,7 @@ pub(super) fn remove_all_in(transaction: &Transaction<'_>, user: &UserId) -> Res
 /// different fractional digits do not always order lexicographically within a
 /// second of each other. A sweep that keeps a dead row one extra second, or
 /// takes it one early, costs nothing — the *authoritative* checks parse.
-fn sweep_expired_in(transaction: &Transaction<'_>) -> Result<()> {
+pub(super) fn sweep_expired_in(transaction: &Transaction<'_>) -> Result<()> {
     let at = now();
     transaction
         .execute(
@@ -754,6 +786,18 @@ fn sweep_expired_in(transaction: &Transaction<'_>) -> Result<()> {
             rusqlite::params![at, MAX_CODE_ATTEMPTS],
         )
         .context("sweeping dead one-time codes")?;
+    transaction
+        .execute(
+            "DELETE FROM app_sessions WHERE expires_at < ?1",
+            rusqlite::params![at],
+        )
+        .context("sweeping expired app sessions")?;
+    transaction
+        .execute(
+            "DELETE FROM exchange_nonces WHERE expires_at < ?1",
+            rusqlite::params![at],
+        )
+        .context("sweeping expired exchange nonces")?;
 
     Ok(())
 }
@@ -762,14 +806,14 @@ fn sweep_expired_in(transaction: &Transaction<'_>) -> Result<()> {
 /// answers "past": it was written by something other than this build, and
 /// treating it as live access on the strength of an unreadable date would be
 /// the wrong side to fail on.
-fn is_past(at: &str) -> bool {
+pub(super) fn is_past(at: &str) -> bool {
     time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
         .map(|at| at <= time::OffsetDateTime::now_utc())
         .unwrap_or(true)
 }
 
 /// The RFC 3339 stamp `after` from now — how every expiry here is written.
-fn stamp_after(after: Duration) -> String {
+pub(super) fn stamp_after(after: Duration) -> String {
     (time::OffsetDateTime::now_utc() + after)
         .format(&time::format_description::well_known::Rfc3339)
         // The only way this fails is a format description that cannot render a
@@ -781,7 +825,7 @@ fn stamp_after(after: Duration) -> String {
 /// with no salt or work factor, and that is enough here: the preimages are 40
 /// and 256 bits of `ring` randomness, not passwords, so there is nothing a
 /// rainbow table or a fast guess could do with the digest.
-fn hash(value: &str) -> String {
+pub(super) fn hash(value: &str) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, value.as_bytes());
 
     let mut rendered = String::with_capacity(64);
@@ -823,7 +867,7 @@ fn generate_code() -> Result<Secret> {
 /// A fresh session token: [`TOKEN_BYTES`] of randomness in the url-safe
 /// alphabet, the same shape as every nonce this codebase mints — a cookie
 /// value must survive the trip without quoting, and base64url does.
-fn generate_token() -> Result<Secret> {
+pub(super) fn generate_token() -> Result<Secret> {
     let mut bytes = [0_u8; TOKEN_BYTES];
     ring::rand::SystemRandom::new()
         .fill(&mut bytes)

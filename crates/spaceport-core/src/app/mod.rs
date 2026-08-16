@@ -14,7 +14,7 @@ pub mod supervisor;
 
 pub use apply::{Applied, Applier, Restored};
 pub use data::DataDir;
-pub use manifest::{AppManifest, Auth, PathPrefix, VarName};
+pub use manifest::{AppManifest, Auth, PathPrefix, VarName, canonical_path};
 pub use pattern::Pattern;
 pub use reconcile::reconcile;
 pub use repository::{AppRecord, AppRepository};

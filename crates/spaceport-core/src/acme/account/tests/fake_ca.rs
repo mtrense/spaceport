@@ -251,15 +251,23 @@ impl FakeDirectory {
 
     /// `GET /.well-known/acme-challenge/{token}` against the real router.
     async fn fetch_challenge(&self, token: &str) -> Option<String> {
-        let response = routes::router(self.challenges.clone())
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/.well-known/acme-challenge/{token}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let response = routes::router(routes::SpaceportRoutes {
+            challenges: self.challenges.clone(),
+            apps: std::sync::Arc::new(crate::app::AppStore::new()),
+            sessions: std::sync::Arc::new(crate::auth::SessionRepository::new(
+                crate::state::Db::in_memory().unwrap(),
+            )),
+            hostname: None,
+            https_port: 443,
+        })
+        .oneshot(
+            Request::builder()
+                .uri(format!("/.well-known/acme-challenge/{token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
         if response.status() != StatusCode::OK {
             return None;

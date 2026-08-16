@@ -99,6 +99,44 @@ impl AuthLogRepository {
         Self { db }
     }
 
+    /// Append one entry on its own, for the events that mutate nothing.
+    ///
+    /// The narrow exception to [`record_in`]'s rule, and the rule is why it is
+    /// narrow: `record_in` exists so a mutation and its record commit
+    /// together, and an access denial *has* no mutation — no row changed, so
+    /// there is no transaction whose fate this entry must share. Anything that
+    /// does change a table keeps going through `record_in`.
+    pub async fn record(
+        &self,
+        kind: &str,
+        user: Option<&UserId>,
+        origin: &str,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        let kind = kind.to_owned();
+        let user = user.cloned();
+        let origin = origin.to_owned();
+        let detail = detail.map(str::to_owned);
+
+        self.db
+            .call(move |connection| {
+                let transaction = connection
+                    .transaction()
+                    .context("beginning to record an auth event")?;
+                record_in(
+                    &transaction,
+                    &crate::state::now(),
+                    &kind,
+                    user.as_ref(),
+                    &origin,
+                    detail.as_deref(),
+                )?;
+
+                transaction.commit().context("committing an auth event")
+            })
+            .await
+    }
+
     /// Every entry, oldest first, optionally only those about `user`.
     ///
     /// Oldest first because the log is read as a story, and `id` rather than

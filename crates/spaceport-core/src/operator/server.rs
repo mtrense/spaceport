@@ -3630,17 +3630,27 @@ async fn list_sessions(
             .into_response();
     }
 
-    let rows: Vec<Vec<String>> = listed
-        .iter()
-        .map(|session| {
-            vec![
-                "session".to_owned(),
-                session.id.to_string(),
-                session.created_at.clone(),
-                session.expires_at.clone(),
-            ]
-        })
-        .collect();
+    // Derived app sessions render directly under their parent, KIND `app`
+    // and the app's id where a session id would be: the indentation of the
+    // ordering is what says "this one dies with the row above", which is the
+    // one thing an operator deciding what to drop needs to read.
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for session in &listed {
+        rows.push(vec![
+            "session".to_owned(),
+            session.id.to_string(),
+            session.created_at.clone(),
+            session.expires_at.clone(),
+        ]);
+        for derived in &session.derived {
+            rows.push(vec![
+                "app".to_owned(),
+                format!("↳ {}", derived.app),
+                derived.created_at.clone(),
+                derived.expires_at.clone(),
+            ]);
+        }
+    }
 
     (
         StatusCode::OK,

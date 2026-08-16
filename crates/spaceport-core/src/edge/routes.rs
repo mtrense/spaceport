@@ -1,8 +1,10 @@
-//! The routes spaceport answers itself.
+//! The routes spaceport answers itself, on every host.
 //!
 //! An ordinary [`axum::Router`], reached only for paths under the prefixes
-//! claimed in [`super::service`]. The ACME `HTTP-01` responder, auth provider
-//! callbacks and the admin API all hang off here.
+//! claimed in [`super::service`] — which is what makes `/.spaceport/*`
+//! spaceport's reserved path space on every host it serves, gated apps
+//! included. The ACME `HTTP-01` responder, the exchange callback that sets an
+//! app's session cookie, and the health check all hang off here.
 
 use std::sync::Arc;
 
@@ -12,13 +14,41 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 
+use super::gate;
 use crate::acme::Challenges;
+use crate::app::AppStore;
+use crate::auth::SessionRepository;
 
-pub fn router(challenges: Arc<Challenges>) -> Router {
+/// What the every-host routes are served out of. One struct, in the shape of
+/// [`super::home::Home`] and for its reason: everything here lives for the
+/// process, and the alternative is threading each `Arc` through `edge::serve`
+/// separately.
+#[derive(Clone)]
+pub struct SpaceportRoutes {
+    /// What the ACME responder answers a CA out of.
+    pub challenges: Arc<Challenges>,
+    /// How the exchange callback finds which app serves the host it arrived
+    /// at — the binding that makes a nonce good for one domain only.
+    pub apps: Arc<AppStore>,
+    /// The sessions the callback redeems nonces against and mints app
+    /// sessions into: the same repository the login page writes, because the
+    /// nonce's parent has to be a row that page created.
+    pub sessions: Arc<SessionRepository>,
+    /// Spaceport's own hostname, for restarting a failed exchange. Absent when
+    /// the config named none — in which case no exchange ever started, and a
+    /// callback reached anyway says so instead of building a URL from nothing.
+    pub hostname: Option<String>,
+    /// Named in restart URLs when it is not 443, exactly as the plaintext
+    /// redirect names it.
+    pub https_port: u16,
+}
+
+pub fn router(state: SpaceportRoutes) -> Router {
     Router::new()
         .route("/.spaceport/health", get(health))
+        .route("/.spaceport/callback", get(gate::callback))
         .route("/.well-known/acme-challenge/{token}", get(acme_challenge))
-        .with_state(challenges)
+        .with_state(state)
 }
 
 async fn health() -> &'static str {
@@ -32,10 +62,10 @@ async fn health() -> &'static str {
 /// nobody is waiting on is a `404`, the same as any other path — there is no
 /// question to answer, and inventing one would be answering a stranger.
 async fn acme_challenge(
-    State(challenges): State<Arc<Challenges>>,
+    State(state): State<SpaceportRoutes>,
     Path(token): Path<String>,
 ) -> Response {
-    match challenges.answer(&token) {
+    match state.challenges.answer(&token) {
         // RFC 8555 §8.3: the response body is the key authorization and
         // nothing else, served as `application/octet-stream`.
         Some(answer) => (
@@ -58,7 +88,16 @@ mod tests {
 
     /// The status and body of a `GET` for `path`.
     async fn get_path(challenges: Arc<Challenges>, path: &str) -> (StatusCode, String) {
-        let response = router(challenges)
+        let state = SpaceportRoutes {
+            challenges,
+            apps: Arc::new(AppStore::new()),
+            sessions: Arc::new(SessionRepository::new(
+                crate::state::Db::in_memory().unwrap(),
+            )),
+            hostname: None,
+            https_port: 443,
+        };
+        let response = router(state)
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
             .await
             .unwrap();
