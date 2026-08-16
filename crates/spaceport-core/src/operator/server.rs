@@ -2031,6 +2031,11 @@ async fn secrets(
 /// routing table, no tracking — is a 404. That is the difference between an
 /// app whose manifest has not arrived yet and a typo, and only the second is
 /// worth refusing.
+///
+/// An app something else is already working on is a 409, refused before the
+/// value is written. A secret is set by somebody at a terminal, and the useful
+/// answer for them is "not now, and nothing changed" — not a request that hangs
+/// for the length of a deploy and then writes into a world that has moved.
 async fn set_secret(
     State(instance): State<Arc<Instance>>,
     State(applier): State<Arc<Applier>>,
@@ -2053,12 +2058,24 @@ async fn set_secret(
     };
     let value = Secret::new(value);
 
-    // Held from before the app is looked up until after its value is written,
-    // the way every verb on the applier holds it: this is the app being seen
-    // to, and a `destroy` that runs alongside must not report the container it
-    // is removing as one that broke. The mark excludes nobody, which is why the
-    // orphan below is caught by looking again rather than by holding this.
-    let _settling = applier.settling(&id);
+    // Taken from before the app is looked up until after its value is written,
+    // the way every verb on the applier takes it: this is the app being seen to,
+    // and a `destroy` that ran alongside would be removing the app whose secret
+    // this is writing.
+    //
+    // Immediately or not at all, and before the value is written. Somebody is
+    // holding a terminal waiting for this, and an answer that says the app is
+    // busy is worth more to them than a request that hangs for the length of a
+    // deploy. Refusing *before* the write is the part that matters: a caller
+    // who is told no has to be able to take it that nothing changed.
+    let Some(working) = applier.try_working(&id) else {
+        return refuse(
+            StatusCode::CONFLICT,
+            &format!(
+                "app `{id}` is busy being worked on, so the secret `{name}` was not set — nothing was changed, try again once the app has settled"
+            ),
+        );
+    };
 
     let record = match AppRepository::new(instance.db.clone()).recorded(&id).await {
         Ok(record) => record,
@@ -2086,14 +2103,19 @@ async fn set_secret(
     };
 
     // Asked again, after the write, because the check above and the write are
-    // two awaits and a `destroy` fits between them: it removes the app from the
-    // store, forgets its record, and only then forgets its secrets, so a value
-    // written after that step is one nothing will ever remove. An app of the
-    // same id applied tomorrow would inherit the credentials of the one
+    // two awaits and a `destroy` used to fit between them: it removes the app
+    // from the store, forgets its record, and only then forgets its secrets, so
+    // a value written after that step is one nothing will ever remove. An app of
+    // the same id applied tomorrow would inherit the credentials of the one
     // destroyed today, which is the outcome `Applier::destroy` forgets secrets
     // to prevent. Looking again strictly after the write closes it: either the
     // destroy's own forget runs later and takes this row with it, or it has
     // already run and the app is gone from everywhere this looks.
+    //
+    // The lock taken above now excludes that destroy outright, so this is a net
+    // under a net. It stays: it costs one read, and the promise it keeps — that
+    // no value outlives the app it was set for — should not rest on every future
+    // path that forgets an app remembering to take the lock first.
     match AppRepository::new(instance.db.clone()).recorded(&id).await {
         Ok(still) if !known(&instance, &id, still.as_ref()).await => {
             if let Err(error) = applier.secrets().delete(&id, &name).await {
@@ -2201,6 +2223,15 @@ async fn set_secret(
     // would answer `Stored` with a 200 for an app that is up and would go on
     // serving the value this call replaced — for good, since nothing else is
     // coming to notice.
+    //
+    // The lock goes here, and it has to: everything below re-enters the applier,
+    // and the applier's lock is not reentrant. What it was protecting is done —
+    // the value is written and the app was still there afterwards — and the verb
+    // this hands off to takes the lock again for itself, so the app is marked as
+    // being worked on for the whole of the part that touches a container. The
+    // gap is two reads of the store.
+    drop(working);
+
     if applier.store().get(&id).is_some() {
         return redeployed(&applier, record, id, name, manifest, created, true).await;
     }
@@ -6420,6 +6451,44 @@ container:
         // An app that came back may have an image built during its suspension
         // that nothing has run, exactly as a resume does.
         assert!(woken.has_changed().unwrap());
+    }
+
+    /// A secret set into an app somebody else is in the middle of applying is a
+    /// value written against a world that is moving: the deploy in flight has
+    /// already read the secrets it is building a container from, so the value
+    /// would be stored and silently not used, and the answer would say the app
+    /// had been brought up to date on it. Refused instead — and refused before
+    /// the write, because "409" has to mean nothing changed, or a script that
+    /// retries would have no way to know what it had already done.
+    #[tokio::test]
+    async fn refuses_to_set_a_secret_of_an_app_something_else_is_working_on() {
+        let ((_, router, ..), _, applier) = parts_with_state(OneContainer::default(), CONFIG);
+        let (applied, _) = put_app(&router, "hello", NEEDS_SECRET).await;
+        assert_eq!(applied, StatusCode::CONFLICT);
+        let working = applier.working(&app_id("hello")).await;
+
+        let (status, body) = put_secret(&router, "hello", "DB_PASSWORD", "hunter2").await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.contains("busy being worked on"), "{body}");
+        assert!(body.contains("was not set"), "{body}");
+        // The substance of the refusal: the value is not there. A 409 that had
+        // stored it would leave an operator retrying a write that had already
+        // happened, and the app on a password nobody believes it has.
+        assert!(
+            applier
+                .secrets()
+                .names(&app_id("hello"), None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        drop(working);
+
+        // And once the app is free, the same call goes through.
+        let (status, _) = put_secret(&router, "hello", "DB_PASSWORD", "hunter2").await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     /// A rotation script that re-sets what it set yesterday, or an operator who

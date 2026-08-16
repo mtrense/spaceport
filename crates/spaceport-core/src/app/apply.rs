@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::anyhow;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tracing::{debug, info, warn};
 
 use super::manifest::{Source, VarName};
@@ -265,19 +266,43 @@ pub struct Applier {
     /// manifest that reaches the runtime has to be one the runtime can run, and
     /// one whose environment still says `{{DB_PASSWORD}}` is not.
     secrets: SecretRepository,
-    /// The apps something is in the middle of doing something to.
+    /// The apps something is in the middle of doing something to, and the lock
+    /// that keeps it to one thing at a time.
     ///
-    /// Every verb here takes containers down and puts them up, and the engine
-    /// reports all of it — a replaced container dying is indistinguishable, in
-    /// an event stream, from one that crashed. This is how the supervisor tells
-    /// the difference: an app in here is being seen to, and whatever the engine
-    /// has to say about it is spaceport's own doing.
+    /// Two jobs in one map, because they are the same question asked twice.
     ///
-    /// Counted rather than a set, because two operators applying the same app
-    /// at once must not have the first one to finish clear the mark for the
-    /// second.
-    settling: Mutex<HashMap<AppId, usize>>,
+    /// The first is what the supervisor asks. Every verb here takes containers
+    /// down and puts them up, and the engine reports all of it — a replaced
+    /// container dying is indistinguishable, in an event stream, from one that
+    /// crashed. An app in here is being seen to, and whatever the engine has to
+    /// say about it is spaceport's own doing.
+    ///
+    /// The second is exclusion. Every verb is a read of the world followed by a
+    /// series of awaits that change it, and two of them interleaved on one app
+    /// produce states no single verb can: a destroy that removes the container
+    /// an apply is about to route to, two applies whose containers both survive
+    /// with only one of them routed, a suspend that stops the container a resume
+    /// has just started. The per-app lock is what makes each verb see the world
+    /// its predecessor left.
+    ///
+    /// A [`tokio::sync::Mutex`] and not a `std` one because the critical section
+    /// is the whole verb: engine calls and a readiness wait that is allowed to
+    /// take tens of seconds. The `std` mutex around the map guards the map and
+    /// nothing else, and is never held across an await — holding it while
+    /// waiting would serialise every app against every other, which is the one
+    /// thing a per-app lock exists not to do.
+    ///
+    /// The count beside each lock is holders *and* waiters. It is what lets the
+    /// entry go when the last of them leaves without a waiter being left holding
+    /// an `Arc` to an entry a newcomer has already replaced with a second lock
+    /// for the same id — two locks for one app being exactly no lock at all.
+    worked_on: Mutex<WorkedOn>,
 }
+
+/// One lock per app, and beside it the number of holders and waiters that lock
+/// has — which is what says when the app can be forgotten again. Named only so
+/// that the shape is written once.
+type WorkedOn = HashMap<AppId, (Arc<AsyncMutex<()>>, usize)>;
 
 impl Applier {
     pub fn new(
@@ -293,28 +318,65 @@ impl Applier {
             repository,
             builds,
             secrets,
-            settling: Mutex::default(),
+            worked_on: Mutex::default(),
         }
     }
 
-    /// Mark `id` as being worked on until the returned guard is dropped.
+    /// Take `id` for as long as the returned guard is held, waiting for whoever
+    /// has it now.
     ///
-    /// Not a lock: it excludes nobody and blocks nothing. Two applies of the
-    /// same app still race each other exactly as they did before — the store is
-    /// what settles that — and all this says is that whatever the engine
-    /// reports about this app in the meantime was asked for.
+    /// The one way to work on an app. Everything a verb reads about the world
+    /// must be read *after* this returns, because the world the caller looked at
+    /// before it is the world some other verb was in the middle of changing: an
+    /// app that was running when the caller checked can be destroyed, suspended
+    /// or replaced while it waits here.
     ///
-    /// Public for one caller outside this type: the operator interface's
-    /// `set`, which writes a secret of an app it did not start. That is not a
-    /// verb here, but it runs alongside the ones that are — a `set` overlapping
-    /// a `destroy` is the app being seen to as much as either half is — so it
-    /// takes the same mark rather than reaching for a second mechanism.
-    pub fn settling(&self, id: &AppId) -> Settling<'_> {
-        *self.settle_marks().entry(id.clone()).or_insert(0) += 1;
+    /// Not reentrant, and deliberately so — a lock that could be taken twice by
+    /// the same task would excuse exactly the nesting that makes a verb's view
+    /// of the world stale. Nothing here takes it twice: the six verbs are the
+    /// only holders and none of them calls another, and the callers outside that
+    /// re-enter the applier drop the guard first.
+    ///
+    /// Public for one caller outside this type: the operator interface's `set`,
+    /// which writes a secret of an app it did not start. That is not a verb
+    /// here, but it changes what the app's container would be built from, and it
+    /// races a `destroy` for the row it writes — so it takes the same lock
+    /// rather than reaching for a second mechanism.
+    pub async fn working(&self, id: &AppId) -> Working<'_> {
+        // The map's guard is dropped at the end of this statement, before the
+        // await below: what is waited on is one app's lock, never the map's.
+        let lock = self.enrol(id);
 
-        Settling {
+        Working {
             applier: self,
             id: id.clone(),
+            held: Some(lock.lock_owned().await),
+        }
+    }
+
+    /// The same, for a caller that would rather be told no than wait.
+    ///
+    /// What the operator interface's `set` uses. A secret is set by somebody
+    /// holding a terminal, and an answer that says "the app is busy, try again"
+    /// is worth more to them than a request that hangs for the length of a
+    /// deploy and then writes a value into a world that has moved.
+    pub fn try_working(&self, id: &AppId) -> Option<Working<'_>> {
+        let lock = self.enrol(id);
+
+        match lock.try_lock_owned() {
+            Ok(held) => Some(Working {
+                applier: self,
+                id: id.clone(),
+                held: Some(held),
+            }),
+            // Enrolling counted this caller as a waiter, and it is not one.
+            // Leaving the count behind would be an app marked as being worked on
+            // by nobody, for good, which is a container the supervisor would
+            // never restart.
+            Err(_) => {
+                self.leave(id);
+                None
+            }
         }
     }
 
@@ -323,16 +385,54 @@ impl Applier {
     /// The supervisor's one question before it acts on an event: an app that is
     /// being applied, resumed, suspended or destroyed is not an app that has
     /// broken, however much the engine's event stream makes it look like one.
+    ///
+    /// Presence in the map, which counts waiters as well as holders — and that
+    /// is the right answer, because a waiter is something that is going to work
+    /// on this app the moment it can, and the container it will take down is not
+    /// a container that failed.
     pub fn is_settling(&self, id: &AppId) -> bool {
-        self.settle_marks().contains_key(id)
+        self.marks().contains_key(id)
+    }
+
+    /// Count this caller among the holders and waiters of `id`'s lock, and hand
+    /// back the lock itself to be waited on with the map released.
+    fn enrol(&self, id: &AppId) -> Arc<AsyncMutex<()>> {
+        let mut marks = self.marks();
+        let (lock, held) = marks
+            .entry(id.clone())
+            .or_insert_with(|| (Arc::new(AsyncMutex::new(())), 0));
+        *held += 1;
+
+        lock.clone()
+    }
+
+    /// Stop counting one holder or waiter, and forget the app entirely once
+    /// there are none.
+    fn leave(&self, id: &AppId) {
+        let mut marks = self.marks();
+        match marks.get_mut(id) {
+            Some((_, 1)) | None => {
+                marks.remove(id);
+            }
+            Some((_, held)) => *held -= 1,
+        }
     }
 
     /// A poisoned lock means a thread panicked mid-mutation. Nothing here can
     /// repair that, and carrying on would leave an app marked as being worked
     /// on by nobody, which the supervisor would take as a reason to leave it
     /// down forever.
-    fn settle_marks(&self) -> std::sync::MutexGuard<'_, HashMap<AppId, usize>> {
-        self.settling.lock().expect("applier settle lock poisoned")
+    fn marks(&self) -> std::sync::MutexGuard<'_, WorkedOn> {
+        self.worked_on.lock().expect("applier settle lock poisoned")
+    }
+
+    /// How many apps the map is holding a lock for, for the tests that are
+    /// about the map itself rather than about one app: an entry that outlives
+    /// its last holder is a leak `is_settling` cannot see once the id it leaked
+    /// under is forgotten.
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.marks().len()
     }
 
     /// The apps this applier has running.
@@ -378,7 +478,12 @@ impl Applier {
     /// Failing leaves the app down, claiming its hosts, with `reason` on it for
     /// a status report to show. The supervisor is what decides to try again.
     pub async fn restart(&self, id: &AppId, reason: &str) -> Result<Arc<App>, ApplyError> {
-        let _settling = self.settling(id);
+        // Waited for, and the app is looked up afterwards. The supervisor
+        // decided this app was down before it called, and the wait here is
+        // exactly long enough for that to stop being true — a deploy finishing
+        // in the meantime has put the app back up, and the lookup below finds it
+        // running rather than down.
+        let _working = self.working(id).await;
 
         // Whichever of the two it is, the manifest is the same one: what the
         // store is holding for this app, which is what the record said.
@@ -428,7 +533,11 @@ impl Applier {
     /// the error names it, because by then it is a container only the operator
     /// can clean up.
     pub async fn destroy(&self, id: &AppId) -> Result<Removed, DestroyError> {
-        let _settling = self.settling(id);
+        // Removed after the wait and not before, so that what this destroys is
+        // the app as the verb it waited for left it: the container an apply
+        // started while this was queued is the one that goes, rather than the
+        // one that apply already replaced.
+        let _working = self.working(id).await;
         let app = self
             .store
             .remove(id)
@@ -486,7 +595,10 @@ impl Applier {
     /// for the same state it is in. It will still stop the container if that is
     /// now being asked for and it is still running.
     pub async fn suspend(&self, id: &AppId, stop_container: bool) -> Result<(), SuspendError> {
-        let _settling = self.settling(id);
+        // The store is read after the wait: whether this app is running,
+        // suspended or neither is the question a suspend is about, and it is
+        // precisely what the verb ahead of it in the queue was changing.
+        let _working = self.working(id).await;
         let held = match self.store.get(id) {
             // Unroute first, holding on to where its container was: until the
             // engine says otherwise, it is running and reachable there.
@@ -539,7 +651,12 @@ impl Applier {
     /// Resuming an app that is already running is not an error, for the same
     /// reason suspending a suspended one is not.
     pub async fn resume(&self, id: &AppId) -> Result<Arc<App>, ResumeError> {
-        let _settling = self.settling(id);
+        let _working = self.working(id).await;
+        // Asked after the wait, and this is the one that matters most: "already
+        // running, nothing to do" is the answer a resume gives, and an app that
+        // was suspended when the caller asked may have been resumed by the verb
+        // this waited for. Checking before the wait would start a second
+        // container for an app that is already serving.
         if let Some(app) = self.store.get(id) {
             return Ok(app);
         }
@@ -656,8 +773,14 @@ impl Applier {
         revision: Option<&str>,
         suspend: bool,
     ) -> Result<Applied, ApplyError> {
-        let _settling = self.settling(&id);
+        let _working = self.working(&id).await;
 
+        // Everything below is read after the wait, and none of it is a
+        // formality: the build this revision resolves to, the secrets the
+        // manifest needs and whether the app is suspended are all things the
+        // verb ahead of this one in the queue may have changed — a `set` of the
+        // last missing secret, or a `suspend` of the app this is about to start.
+        //
         // The document, taken before anything is resolved: what is recorded is
         // what the operator or the repository wrote, and resolving a build
         // deliberately leaves that text alone.
@@ -773,7 +896,12 @@ impl Applier {
         revision: Option<&str>,
         suspended: bool,
     ) -> Result<Restored, ApplyError> {
-        let _settling = self.settling(&id);
+        // The revision is resolved and the hosts are checked after the wait, for
+        // the reason `deploy` does the same: a restore that queued behind an
+        // apply must not claim hosts against the routing table as it was before
+        // that apply, nor start a container from a build record it read while
+        // the app was somebody else's.
+        let _working = self.working(&id).await;
         let manifest = self.resolved(&id, manifest, revision).await?;
         let (manifest, missing) = self.with_secrets(&id, manifest).await?;
         self.free_of_conflict(&id, &manifest)?;
@@ -1067,24 +1195,35 @@ impl Applier {
     }
 }
 
-/// The mark that says an app is being worked on, for as long as it is held.
+/// The right to work on one app, for as long as it is held.
 ///
 /// Held by value and never inspected: it exists for its `Drop`, and the one
 /// thing a caller must do with it is keep it alive until the work is finished.
-pub struct Settling<'a> {
+/// Dropping it hands the app to whoever is waiting and, if nobody is, forgets
+/// it — which is what makes [`Applier::is_settling`] answer no again.
+pub struct Working<'a> {
     applier: &'a Applier,
     id: AppId,
+    /// An `Option` only so that `Drop` can release the app before it stops
+    /// counting itself among its holders. See the comment there: the order is
+    /// the whole correctness argument.
+    held: Option<OwnedMutexGuard<()>>,
 }
 
-impl Drop for Settling<'_> {
+impl Drop for Working<'_> {
     fn drop(&mut self) {
-        let mut marks = self.applier.settle_marks();
-        match marks.get_mut(&self.id) {
-            Some(1) | None => {
-                marks.remove(&self.id);
-            }
-            Some(held) => *held -= 1,
-        }
+        // The lock goes first and the count second, and never the other way
+        // round. Decrementing first can take the count to zero and drop the map
+        // entry while this guard still holds the lock — and a newcomer arriving
+        // in that window would find no entry, make a *second* lock for the same
+        // app, and take it. Two locks for one app is two verbs on one app.
+        //
+        // This way the worst case is a count that is one too high for the length
+        // of a `HashMap` lookup: whoever arrives in the window finds the entry,
+        // takes the lock this has just released, and is correctly serialised
+        // behind it.
+        drop(self.held.take());
+        self.applier.leave(&self.id);
     }
 }
 
@@ -1101,6 +1240,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::net::SocketAddr;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     /// A runtime that starts nothing, so the apply logic can be tested without
     /// a container engine anywhere near it.
@@ -1129,6 +1269,41 @@ mod tests {
         /// What the spaceport before this one is pretending to have left
         /// running, for every app. Overrides `running` where it is set.
         survivor: Option<Container>,
+        /// How long a launch takes. A real one takes long enough for a second
+        /// verb to arrive during it, and a fake one that returns immediately
+        /// would let two verbs on the same app pass each other without ever
+        /// being in flight at the same instant — so a test about exclusion
+        /// would pass whether or not anything excluded anything.
+        launch_takes: Option<Duration>,
+        /// How many launches this runtime has had in flight at once.
+        concurrency: Mutex<Concurrency>,
+    }
+
+    /// Launches in flight, and the most there have ever been at one time.
+    ///
+    /// The peak is the whole point: it is the one number that says whether two
+    /// verbs overlapped, and unlike an ordering of events it cannot be satisfied
+    /// by a scheduler that happened to run them in the right order anyway.
+    #[derive(Default)]
+    struct Concurrency {
+        active: usize,
+        peak: usize,
+    }
+
+    impl FakeRuntime {
+        /// A launch slow enough that anything else working on the same app
+        /// would be caught in flight beside it.
+        fn slow_to_launch() -> Self {
+            Self {
+                launch_takes: Some(Duration::from_millis(50)),
+                ..Self::default()
+            }
+        }
+
+        /// The most launches this runtime has ever had in flight at once.
+        fn overlap(&self) -> usize {
+            self.concurrency.lock().unwrap().peak
+        }
     }
 
     impl FakeRuntime {
@@ -1198,11 +1373,24 @@ mod tests {
                 .unwrap()
                 .push(manifest.container.environment()?);
 
-            let mut launched = self.launched.lock().unwrap();
-            launched.push(app.clone());
+            let port = {
+                let mut launched = self.launched.lock().unwrap();
+                launched.push(app.clone());
 
-            // A different port per launch, so a replacement is visible.
-            let port = 9000 + u16::try_from(launched.len()).unwrap();
+                // A different port per launch, so a replacement is visible.
+                9000 + u16::try_from(launched.len()).unwrap()
+            };
+
+            {
+                let mut concurrency = self.concurrency.lock().unwrap();
+                concurrency.active += 1;
+                concurrency.peak = concurrency.peak.max(concurrency.active);
+            }
+            if let Some(takes) = self.launch_takes {
+                tokio::time::sleep(takes).await;
+            }
+            self.concurrency.lock().unwrap().active -= 1;
+
             let container = Container {
                 id: ContainerId::new(format!("{app}-{port}")),
                 upstream: SocketAddr::from(([127, 0, 0, 1], port)),
@@ -2242,27 +2430,40 @@ container:
 
         assert!(!applier.is_settling(&id));
         {
-            let _held = applier.settling(&id);
+            let _held = applier.working(&id).await;
             assert!(applier.is_settling(&id));
         }
         assert!(!applier.is_settling(&id));
     }
 
     /// Two operators applying the same app at once must not have the first one
-    /// to finish clear the mark for the second.
+    /// to finish clear the mark for the second — the second is only about to
+    /// start, and the container it is going to replace is not one that broke.
     #[tokio::test]
     async fn the_mark_outlasts_the_first_of_two_verbs_to_finish() {
         let runtime = Arc::new(FakeRuntime::default());
         let (applier, _) = applier(runtime);
         let id: AppId = "hello".parse().unwrap();
 
-        let outer = applier.settling(&id);
-        let inner = applier.settling(&id);
+        let first = applier.working(&id).await;
+        let queued = async {
+            // Waiting counts: this is something that is going to work on the
+            // app the instant it can.
+            let second = applier.working(&id).await;
+            assert!(applier.is_settling(&id), "the second holder is not marked");
+            drop(second);
+        };
+        let finishing = async {
+            assert!(applier.is_settling(&id));
+            drop(first);
+            // Long enough for the waiter to be woken and to take the app.
+            tokio::task::yield_now().await;
+        };
 
-        drop(inner);
-        assert!(applier.is_settling(&id));
-        drop(outer);
+        tokio::join!(queued, finishing);
+
         assert!(!applier.is_settling(&id));
+        assert_eq!(applier.tracked(), 0, "the app was left in the map");
     }
 
     /// The mark is one app's, not the applier's: an apply of one app must not
@@ -2272,9 +2473,98 @@ container:
         let runtime = Arc::new(FakeRuntime::default());
         let (applier, _) = applier(runtime);
 
-        let _held = applier.settling(&"hello".parse().unwrap());
+        let _held = applier.working(&"hello".parse().unwrap()).await;
 
         assert!(!applier.is_settling(&"other".parse().unwrap()));
+    }
+
+    /// The race the lock exists for. Two applies of one app both take its
+    /// container down and put a new one up, and interleaved they leave a
+    /// container running that nothing routes to — or route to one the other has
+    /// already removed. Neither is a state either apply could produce alone,
+    /// which is why nothing downstream can be written to cope with it.
+    #[tokio::test]
+    async fn two_deploys_of_one_app_do_not_overlap() {
+        let runtime = Arc::new(FakeRuntime::slow_to_launch());
+        let (applier, store) = applier(runtime.clone());
+        let id: AppId = "hello".parse().unwrap();
+
+        let (first, second) = tokio::join!(
+            applier.apply(id.clone(), manifest("alpha.test"), false),
+            applier.apply(id.clone(), manifest("alpha.test"), false),
+        );
+
+        first.unwrap();
+        second.unwrap();
+        // Both ran — one did not refuse or get skipped — and they ran one after
+        // the other.
+        assert_eq!(runtime.launched.lock().unwrap().len(), 2);
+        assert_eq!(runtime.overlap(), 1, "two applies of one app overlapped");
+        // And the app is on the second of them, not on whichever finished last.
+        assert_eq!(store.routes().serving("alpha.test").unwrap().id, id);
+        assert_eq!(applier.tracked(), 0);
+    }
+
+    /// And the lock is one app's. A per-applier lock would pass every test
+    /// above and make one slow deploy hold up every other app on the host,
+    /// which is the whole reason the map is keyed by id.
+    #[tokio::test]
+    async fn work_on_two_apps_happens_at_the_same_time() {
+        let runtime = Arc::new(FakeRuntime::slow_to_launch());
+        let (applier, _) = applier(runtime.clone());
+
+        let (hello, other) = tokio::join!(
+            applier.apply("hello".parse().unwrap(), manifest("alpha.test"), false),
+            applier.apply("other".parse().unwrap(), manifest("beta.test"), false),
+        );
+
+        hello.unwrap();
+        other.unwrap();
+        assert_eq!(runtime.overlap(), 2, "one app's apply held up another's");
+        assert_eq!(applier.tracked(), 0);
+    }
+
+    /// What the operator interface's `set` needs: an answer now. Somebody is
+    /// holding a terminal, and a request that hangs for the length of a deploy
+    /// is worse for them than being told to try again.
+    #[tokio::test]
+    async fn the_immediate_form_refuses_an_app_somebody_else_is_working_on() {
+        let runtime = Arc::new(FakeRuntime::default());
+        let (applier, _) = applier(runtime);
+        let id: AppId = "hello".parse().unwrap();
+
+        let held = applier.working(&id).await;
+        assert!(applier.try_working(&id).is_none());
+
+        drop(held);
+
+        assert!(applier.try_working(&id).is_some());
+        // A refusal that counted itself among the holders would leave the app
+        // marked as being worked on by nobody, for good — and the supervisor
+        // would never restart its container again.
+        assert!(!applier.is_settling(&id));
+        assert_eq!(applier.tracked(), 0);
+    }
+
+    /// An entry that outlives its last holder is a lock nothing will ever take
+    /// again and an app the supervisor will never touch again. Checked after a
+    /// contended pair rather than a lone holder, because contention is where a
+    /// count can be got wrong.
+    #[tokio::test]
+    async fn nothing_is_left_behind_once_every_holder_and_waiter_is_done() {
+        let runtime = Arc::new(FakeRuntime::slow_to_launch());
+        let (applier, _) = applier(runtime);
+        let id: AppId = "hello".parse().unwrap();
+
+        let (first, second) = tokio::join!(
+            applier.apply(id.clone(), manifest("alpha.test"), false),
+            applier.destroy(&id),
+        );
+
+        first.unwrap();
+        second.unwrap();
+        assert!(!applier.is_settling(&id));
+        assert_eq!(applier.tracked(), 0);
     }
 
     // Deploying an app spaceport builds itself.
