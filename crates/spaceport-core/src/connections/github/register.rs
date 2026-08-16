@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::api::{Client, Transport};
 use super::key;
@@ -166,6 +166,25 @@ pub async fn connect(
             confirmed.id,
             connection.app_id
         );
+    }
+
+    // Said and not refused: an App made by hand likely predates the manifest's
+    // SSO permissions or diverges from them, and everything except SSO login
+    // works without these two. Refusing would hold today's registration
+    // hostage to a feature the operator may never turn on — but a login that
+    // cannot link by verified email, or a mapping rule that silently never
+    // matches, is exactly the invisible-in-three-weeks mistake this module
+    // exists to say out loud now.
+    for (permission, why) in [
+        ("members", "`org=`/`team=` mapping rules will never match"),
+        ("emails", "SSO logins cannot link users by verified email"),
+    ] {
+        if confirmed.permissions.get(permission).map(String::as_str) != Some("read") {
+            warn!(
+                slug = %confirmed.slug,
+                "this app does not hold `{permission}: read`, so {why} — request it on the app's settings page, where every account that installed the app must approve the change",
+            );
+        }
     }
 
     // The slug, the display name and the owner are all things an operator read
@@ -474,6 +493,24 @@ mod tests {
 
         assert_eq!(connected.name, "Spaceport for Acme");
         assert_eq!(connected.owner, "an-organisation");
+    }
+
+    /// An App created by hand likely predates the manifest's SSO permissions,
+    /// and a registration whose secrets are every one of them correct must not
+    /// be refused over a feature the operator may never turn on. The gap is a
+    /// warning in the log, not a refusal — so the assertion here is that the
+    /// connection lands.
+    #[tokio::test]
+    async fn connects_an_app_that_lacks_the_sso_permissions() {
+        let repository = repository();
+        let github = github();
+        github.app_permissions(&[("metadata", "read"), ("contents", "read")]);
+
+        connect(&repository, github, registration(), &Nudge::new())
+            .await
+            .unwrap();
+
+        assert_eq!(repository.all().await.unwrap().len(), 1);
     }
 
     /// A key from one app's settings page and an id from another's: both are

@@ -71,27 +71,59 @@ pub const SETUP_PATH: &str = "/connections/github/setup";
 /// on every App this flow has ever created.
 pub const WEBHOOK_PATH: &str = "/connections/github/webhooks";
 
+/// The path the edge will answer GitHub's user-authorization callback on.
+///
+/// Declared here, beside the manifest that writes it into `callback_urls`,
+/// because the manifest is the one chance to declare it on the App — the same
+/// argument as [`WEBHOOK_PATH`] — while the route itself belongs to the SSO
+/// login flow and does not exist yet. One constant, so the manifest and the
+/// route the next slice adds cannot quietly disagree about the spelling.
+///
+/// Distinct from the per-attempt setup `redirect_url` on purpose: that one
+/// answers the manifest conversion for a single registration attempt and dies
+/// with it, while this one is where GitHub returns every user who logs in
+/// through this App, for as long as the App exists.
+pub const LOGIN_CALLBACK_PATH: &str = "/auth/github/callback";
+
 /// What the App may do, and nothing beyond it.
 ///
-/// The fewest permissions a thing which watches repositories and reports on
-/// commits can be given: read the metadata that says a repository exists, read
-/// the code, write the checks and statuses that appear against a commit, write
-/// the deployments that record where that commit went, and read the pull
-/// requests those checks belong to. Nothing writes to a repository's contents,
-/// and nothing reads an organisation's members or its secrets.
+/// The fewest permissions a thing which watches repositories, reports on
+/// commits and signs its users in can be given: read the metadata that says a
+/// repository exists, read the code, write the checks and statuses that appear
+/// against a commit, write the deployments that record where that commit went,
+/// and read the pull requests those checks belong to. Nothing writes to a
+/// repository's contents, and nothing reads an organisation's secrets.
 ///
-/// Starting narrow is the point. Widening this later is not a deployment — it
-/// is a permission change every account that has installed the App has to
+/// The last two rows are what SSO costs. An IdP login may only link to an
+/// existing user through an email GitHub asserts as verified — that is
+/// `emails: read` on the account — and the mapping rules an operator writes
+/// with `spaceport auth mapping add` match on `org=` and `team=` membership,
+/// which nothing can evaluate without `members: read` on the organisation. The
+/// older rationale here said nothing reads an organisation's members, and it
+/// held exactly until membership became the thing access is decided by.
+///
+/// Starting narrow is still the point, because widening is not a deployment —
+/// it is a permission change every account that has installed the App has to
 /// approve by hand, and until each of them does, the App keeps the permissions
-/// it had. Anything added here is therefore added once and forever, so it is
-/// added only when something actually cannot work without it.
-const PERMISSIONS: [(&str, &str); 6] = [
+/// it had. That is the price the two SSO rows paid on the way in: every App
+/// created before them has to have its owner approve the request GitHub sends,
+/// and logins through it cannot map anything until they do. Anything added
+/// here is added once and forever, so it is added only when something actually
+/// cannot work without it.
+const PERMISSIONS: [(&str, &str); 8] = [
     ("metadata", "read"),
     ("contents", "read"),
     ("checks", "write"),
     ("statuses", "write"),
     ("deployments", "write"),
     ("pull_requests", "read"),
+    // The organisation-members permission: GitHub's manifest key is `members`,
+    // filed under the organisation permissions even though the key does not
+    // say so.
+    ("members", "read"),
+    // The account permission over a user's email addresses, verified flags
+    // included — which is the only thing an SSO login is allowed to link by.
+    ("emails", "read"),
 ];
 
 /// What GitHub is asked to tell spaceport about.
@@ -154,6 +186,11 @@ pub struct Manifest {
     hook_attributes: Hook,
     /// Where GitHub returns the browser once the App exists.
     redirect_url: String,
+    /// Where GitHub returns a user it has just authorized — the SSO login's
+    /// callback, declared now because callback urls are app settings GitHub
+    /// offers no API to edit later. One entry, though GitHub allows ten: this
+    /// spaceport's edge is the only place a login ever comes back to.
+    callback_urls: [String; 1],
     /// Never public. A public App can be installed by anybody who finds it, and
     /// this one exists to serve the accounts one operator runs.
     public: bool,
@@ -183,6 +220,7 @@ impl Manifest {
                 active: true,
             },
             redirect_url: callback_url(hostname, state),
+            callback_urls: [format!("https://{hostname}{LOGIN_CALLBACK_PATH}")],
             public: false,
             default_permissions: PERMISSIONS.into_iter().collect(),
             default_events: EVENTS,
@@ -407,7 +445,7 @@ mod tests {
     /// checked only that `contents` was there would pass just as happily for an
     /// App that could also write to it.
     #[test]
-    fn the_manifest_asks_for_exactly_six_permissions() {
+    fn the_manifest_asks_for_exactly_eight_permissions() {
         let permissions = manifest()["default_permissions"].clone();
 
         assert_eq!(
@@ -419,6 +457,8 @@ mod tests {
                 "statuses": "write",
                 "deployments": "write",
                 "pull_requests": "read",
+                "members": "read",
+                "emails": "read",
             })
         );
     }
@@ -481,6 +521,18 @@ mod tests {
         assert_eq!(
             manifest["redirect_url"],
             "https://spaceport.example.com/connections/github/setup/a-state/callback"
+        );
+    }
+
+    /// The login callback is an app setting GitHub offers no API to edit, so
+    /// the manifest is the one chance to declare it — and it must be the edge's
+    /// own hostname under [`LOGIN_CALLBACK_PATH`], or the route the next slice
+    /// adds will answer at an address GitHub was never told about.
+    #[test]
+    fn the_manifest_declares_the_login_callback_on_this_spaceport() {
+        assert_eq!(
+            manifest()["callback_urls"],
+            serde_json::json!(["https://spaceport.example.com/auth/github/callback"])
         );
     }
 

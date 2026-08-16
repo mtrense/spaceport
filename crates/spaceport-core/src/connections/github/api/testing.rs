@@ -44,6 +44,23 @@ const TOKEN_LIFETIME: Duration = Duration::hours(1);
 /// whether it did.
 pub(crate) const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
 
+/// The permissions `/app` reports unless a test says otherwise: what the
+/// manifest asks for, so the fixture App and one the manifest flow would
+/// create are the same App. Kept as one expression rather than eight setter
+/// calls, because the tests that care are the ones taking permissions *away*.
+fn default_permissions() -> Value {
+    json!({
+        "metadata": "read",
+        "contents": "read",
+        "checks": "write",
+        "statuses": "write",
+        "deployments": "write",
+        "pull_requests": "read",
+        "members": "read",
+        "emails": "read",
+    })
+}
+
 /// Which credential a request presented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Authorization {
@@ -128,6 +145,9 @@ impl FakeGitHub {
                     "slug": "spaceport-for-acme",
                     "name": "Spaceport for Acme",
                     "owner": {"login": "an-organisation", "type": "Organization"},
+                    // What the manifest asks for, so a test that says nothing
+                    // about permissions gets an App the manifest flow made.
+                    "permissions": default_permissions(),
                     // A field spaceport does not know, present on purpose: a
                     // response that grows one must still parse.
                     "html_url": "https://github.com/apps/spaceport-for-acme",
@@ -161,6 +181,21 @@ impl FakeGitHub {
     /// the shape of a key and an app id taken from two different apps.
     pub(crate) fn app_is(&self, id: i64, slug: &str, name: &str, owner: &str) {
         self.state.lock().unwrap().apps = vec![app(id, slug, name, owner)];
+    }
+
+    /// Answer `/app` saying every app registered here holds exactly these
+    /// permissions — the shape of an App created before the manifest widened,
+    /// which GitHub keeps at what its owner once approved.
+    pub(crate) fn app_permissions(&self, permissions: &[(&str, &str)]) {
+        let permissions: Value = permissions
+            .iter()
+            .map(|(name, level)| ((*name).to_owned(), json!(level)))
+            .collect::<serde_json::Map<String, Value>>()
+            .into();
+
+        for app in &mut self.state.lock().unwrap().apps {
+            app["permissions"] = permissions.clone();
+        }
     }
 
     /// Register another app here, so that a test can connect two.
@@ -480,6 +515,7 @@ fn app(id: i64, slug: &str, name: &str, owner: &str) -> Value {
         "slug": slug,
         "name": name,
         "owner": {"login": owner, "type": "Organization"},
+        "permissions": default_permissions(),
     })
 }
 

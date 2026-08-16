@@ -207,6 +207,12 @@ pub struct AppRecord {
     pub slug: String,
     pub name: String,
     pub owner: String,
+    /// What GitHub says the App may do, permission by permission — `members`
+    /// to `read`, say. Carried whole rather than as the one or two flags a
+    /// caller checks today, because the questions asked of it are prose for an
+    /// operator ("this App lacks…") and the map is GitHub's own vocabulary. A
+    /// `BTreeMap` so anything that ever prints it prints it in one order.
+    pub permissions: std::collections::BTreeMap<String, String>,
 }
 
 /// One place the App is installed, as GitHub reports it.
@@ -256,6 +262,12 @@ mod wire {
         pub(super) slug: String,
         pub(super) name: String,
         pub(super) owner: Account,
+        /// Defaulted rather than required for the reason nothing here denies
+        /// unknown fields: GitHub sends the map today, and a response that
+        /// stopped carrying it should read as an App with no permissions to
+        /// speak of rather than as a spaceport that cannot ask who it is.
+        #[serde(default)]
+        pub(super) permissions: std::collections::BTreeMap<String, String>,
     }
 
     #[derive(Deserialize)]
@@ -397,6 +409,7 @@ impl Client {
             slug: app.slug,
             name: app.name,
             owner: app.owner.login,
+            permissions: app.permissions,
         })
     }
 
@@ -888,14 +901,19 @@ mod tests {
 
         let app = client(&github).app().await.unwrap();
 
+        assert_eq!(app.id, 42);
+        assert_eq!(app.slug, "spaceport-for-acme");
+        assert_eq!(app.name, "Spaceport for Acme");
+        assert_eq!(app.owner, "an-organisation");
+        // The permissions ride along on the same answer — `members` is the one
+        // the mapping handler asks after, so it is the one asserted by name.
         assert_eq!(
-            app,
-            AppRecord {
-                id: 42,
-                slug: "spaceport-for-acme".to_owned(),
-                name: "Spaceport for Acme".to_owned(),
-                owner: "an-organisation".to_owned(),
-            }
+            app.permissions.get("members").map(String::as_str),
+            Some("read")
+        );
+        assert_eq!(
+            app.permissions.get("emails").map(String::as_str),
+            Some("read")
         );
     }
 

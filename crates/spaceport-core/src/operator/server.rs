@@ -4437,8 +4437,73 @@ async fn add_mapping(
             out.push_str(&format!("  warning: {warning}\n"));
         }
     }
+    out.push_str(&membership_readable_via(&instance, &added.connection).await);
 
     (StatusCode::OK, out).into_response()
+}
+
+/// What `mapping add` can still check once the rule is written: whether the
+/// connection's App may actually read the memberships the rule matches on.
+///
+/// An App connected before the manifest asked for `members: read` never got
+/// it, and GitHub offers no API to grant it — the operator has to request it on
+/// the App's settings page and every account that installed the App has to
+/// approve. A rule via such an App is stored all the same, because writing
+/// rules ahead of that approval is the same ordinary order as writing them
+/// ahead of the first deploy — but it silently never matches, which is exactly
+/// the fate `--when` typos meet, so it earns the same kind of warning beside
+/// the rule rather than instead of it.
+///
+/// Asked of GitHub live rather than off anything cached, because the answer
+/// moves on GitHub's side when an owner approves and spaceport hears nothing.
+/// And every failure on the way degrades into prose: the rule is already
+/// written, correctly, and a GitHub having a bad minute must not read back as
+/// a mapping that was refused.
+async fn membership_readable_via(instance: &Instance, via: &str) -> String {
+    let could_not = |error: String| format!("  could not verify the App's permissions: {error}\n");
+
+    let connection = match instance.connections.by_slug(via).await {
+        Ok(Some(connection)) => connection,
+        // `add` verified the slug a moment ago, so a miss here is the store
+        // faltering between two reads of it — the host's trouble, degraded
+        // like any other.
+        Ok(None) => return could_not(format!("the connection `{via}` has just vanished")),
+        Err(error) => return could_not(format!("{error:#}")),
+    };
+    let app = match Client::new(&connection, instance.github.clone()) {
+        Ok(client) => match client.app().await {
+            Ok(app) => app,
+            Err(error) => return could_not(format!("{error:#}")),
+        },
+        Err(error) => return could_not(format!("{error:#}")),
+    };
+
+    // `write` counts too: GitHub's levels contain each other, and an App that
+    // may edit an organisation's members may certainly read them.
+    if matches!(
+        app.permissions.get("members").map(String::as_str),
+        Some("read" | "write")
+    ) {
+        return String::new();
+    }
+
+    let callback = match &instance.config.edge.hostname {
+        Some(hostname) => format!("https://{hostname}{}", manifest::LOGIN_CALLBACK_PATH),
+        // No hostname is no address to spell out, so the placeholder the docs
+        // use stands in — the path is the part the operator has to get right.
+        None => format!("https://<edge.hostname>{}", manifest::LOGIN_CALLBACK_PATH),
+    };
+    let warning = format!(
+        "`{via}` does not hold the `members: read` permission, so github will not tell it who \
+         is in an organisation and this rule can never match — request the permission on the \
+         app's settings page, where every account that installed the app must approve the change"
+    );
+    warn!(connection = %via, "{warning}");
+
+    format!(
+        "  warning: {warning}\n  make sure the app's settings also list `{callback}` as a \
+         callback url — github offers no api spaceport could check that with\n"
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -8705,12 +8770,21 @@ container:
     /// A router with a user `alice` and the gated `blog` app already in place,
     /// which is the stage every entitlement test opens on.
     async fn router_with_alice_and_blog() -> (Router, Db) {
-        let ((_, router, ..), db, _) = parts_with_state(OneContainer::default(), CONFIG);
+        let (router, db, _) = router_github_alice_and_blog().await;
+
+        (router, db)
+    }
+
+    /// The same, keeping a hand on the GitHub behind it — for the mapping
+    /// tests that script what `/app` answers about the App's permissions.
+    async fn router_github_alice_and_blog() -> (Router, Db, Arc<FakeGitHub>) {
+        let ((_, router, _, _, github, ..), db, _) =
+            parts_with_state(OneContainer::default(), CONFIG);
         create_user_named(&router, "alice", "").await;
         let (status, body) = put_app(&router, "blog", GATED).await;
         assert_eq!(status, StatusCode::OK, "{body}");
 
-        (router, db)
+        (router, db, github)
     }
 
     /// Plant a row as an IdP login will one day write it: tagged with the rule
@@ -9172,6 +9246,9 @@ container:
 
     /// Plant the connection `--via` is verified against, exactly as `connect`
     /// records one: the mapping routes read the table, not the API behind it.
+    /// The private key is the fixture one, because `mapping add` now signs as
+    /// the App to ask GitHub what it may do — a key that cannot sign would
+    /// degrade every one of these tests into "could not verify".
     async fn plant_connection(db: &Db, slug: &str) {
         let slug = slug.to_owned();
         db.call(move |connection| {
@@ -9181,8 +9258,8 @@ container:
                          (slug, app_id, name, owner, client_id, client_secret, webhook_secret,
                           private_key, connected_at)
                      VALUES (?1, 42, 'Spaceport for Acme', 'an-organisation', 'iv1.abc', 'secret',
-                             'hook', 'pem', '2026-01-01T00:00:00Z')",
-                    rusqlite::params![slug],
+                             'hook', ?2, '2026-01-01T00:00:00Z')",
+                    rusqlite::params![slug, crate::connections::github::key::testing::PKCS1],
                 )
                 .map(|_| ())
                 .map_err(anyhow::Error::from)
@@ -9245,6 +9322,10 @@ container:
             "{body}"
         );
         assert!(!body.contains("warning"), "{body}");
+        // The connection's App holds `members: read`, so the live check has
+        // nothing to say — not even that it could not be made.
+        assert!(!body.contains("could not verify"), "{body}");
+        assert!(!body.contains("make sure"), "{body}");
         let rule = rule_in(&body);
 
         let (status, listed) = user_command(&router, "GET", "/auth/mappings").await;
@@ -9288,6 +9369,71 @@ container:
         );
         let (_, listed) = user_command(&router, "GET", "/auth/mappings").await;
         assert!(listed.contains("editor@blog"), "{listed}");
+    }
+
+    /// An App connected before the manifest asked for `members: read` never
+    /// got it, and a rule matching on membership through it silently never
+    /// matches. The rule still lands — the owner approves the wider
+    /// permissions on github.com in their own time — with the warning beside
+    /// it, and the callback-url reminder with the warning, because neither is
+    /// anything spaceport can fix over an API.
+    #[tokio::test]
+    async fn a_mapping_via_an_app_that_cannot_read_members_is_stored_but_warns() {
+        let (router, db, github) = router_github_alice_and_blog().await;
+        plant_connection(&db, "spaceport-acme").await;
+        github.app_permissions(&[("metadata", "read"), ("contents", "read")]);
+
+        let (status, body) = add_mapping_over_http(
+            &router,
+            r#"{"via":"spaceport-acme","app":"blog","roles":["reader"],
+                "conditions":[{"attr":"org","value":"acme-corp"}]}"#,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("mapping added"), "{body}");
+        assert!(
+            body.contains("warning: `spaceport-acme` does not hold the `members: read` permission"),
+            "{body}"
+        );
+        assert!(body.contains("must approve the change"), "{body}");
+        assert!(
+            body.contains("make sure the app's settings also list"),
+            "{body}"
+        );
+        assert!(body.contains("/auth/github/callback"), "{body}");
+        let (_, listed) = user_command(&router, "GET", "/auth/mappings").await;
+        assert!(listed.contains("reader@blog"), "{listed}");
+    }
+
+    /// GitHub having a bad minute must not turn a correctly written rule into
+    /// a refusal: the add has already committed, and the check over it
+    /// degrades into a sentence saying it could not be made.
+    #[tokio::test]
+    async fn a_mapping_still_lands_when_the_apps_permissions_cannot_be_verified() {
+        let (router, db, github) = router_github_alice_and_blog().await;
+        plant_connection(&db, "spaceport-acme").await;
+        github.refuse_with(StatusCode::BAD_GATEWAY, "<html>");
+
+        let (status, body) = add_mapping_over_http(
+            &router,
+            r#"{"via":"spaceport-acme","app":"blog","roles":["reader"],
+                "conditions":[{"attr":"org","value":"acme-corp"}]}"#,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("mapping added"), "{body}");
+        assert!(
+            body.contains("could not verify the App's permissions"),
+            "{body}"
+        );
+        // Degraded is not the same prose as missing: nothing here claims to
+        // know what the App may do.
+        assert!(!body.contains("warning"), "{body}");
+        let rule = rule_in(&body);
+        let (_, listed) = user_command(&router, "GET", "/auth/mappings").await;
+        assert!(listed.contains(&rule), "{listed}");
     }
 
     /// The spec's hard rule, held at the socket too: `admin` is never
