@@ -135,8 +135,8 @@ struct RunArgs {
     #[command(flatten)]
     config: ConfigArgs,
 
-    /// Expose the operator interface on a unix socket path or local address.
-    #[arg(short, long, value_name = "SOCKET|ADDRESS")]
+    /// Expose the operator interface on a unix socket at this path.
+    #[arg(short, long, value_name = "SOCKET")]
     operator: Option<OperatorEndpoint>,
 }
 
@@ -150,9 +150,9 @@ struct SetupArgs {
     #[command(flatten)]
     config: ConfigArgs,
 
-    /// Expose the operator interface on a unix socket path or local address.
-    /// Leaving it out is what takes an installed one away again.
-    #[arg(short, long, value_name = "SOCKET|ADDRESS")]
+    /// Expose the operator interface on a unix socket at this path. Leaving it
+    /// out is what takes an installed one away again.
+    #[arg(short, long, value_name = "SOCKET")]
     operator: Option<OperatorEndpoint>,
 }
 
@@ -949,12 +949,12 @@ struct StatusArgs {
 
 #[derive(Debug, Args)]
 struct ServerArgs {
-    /// The spaceport to talk to: an operator socket, or an address over the
-    /// network.
+    /// The operator socket of the spaceport to talk to. Always a local one:
+    /// reaching a spaceport on another host is what `ssh` is for.
     #[arg(
         short,
         long,
-        value_name = "SOCKET|ADDRESS",
+        value_name = "SOCKET",
         env = "SPACEPORT_SERVER",
         default_value = DEFAULT_OPERATOR_ENDPOINT
     )]

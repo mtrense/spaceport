@@ -2,17 +2,23 @@
 //!
 //! Separate from the edge in every way that matters. The edge is public and
 //! serves whoever connects; this is private, and whoever reaches it can start
-//! containers. Hence the default of a unix socket, where the filesystem does
-//! the access control — a TCP endpoint is available for the cases that need it
-//! and is nobody's default.
+//! containers, read every secret and mint credentials for anybody. So it is a
+//! unix socket and only ever a unix socket, where the filesystem does the
+//! access control and the kernel refuses anything off this host.
+//!
+//! There is deliberately no way to put it on a port. Serving this interface —
+//! unauthenticated and in the clear, because a mode-0600 socket needs neither —
+//! on a TCP address would hand whoever can reach that address the whole host,
+//! and the address is the sort of thing that gets widened to `0.0.0.0` by
+//! somebody in a hurry. Reaching a spaceport from elsewhere is what SSH is
+//! for: `ssh host spaceport apps ...`, or a forwarded socket.
 
 pub mod client;
 pub mod server;
 pub mod wire;
 
 use std::fmt;
-use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -85,32 +91,58 @@ pub enum SecretOutcome {
 /// otherwise.
 pub const DEFAULT_OPERATOR_ENDPOINT: &str = "/run/spaceport.sock";
 
-/// Address the operator interface listens on.
+/// Where the operator interface listens: the path of a unix socket.
+///
+/// A named type over a bare [`PathBuf`] because a socket address used to be
+/// spellable here, and the parser is where an operator who still spells one
+/// finds out it is gone.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OperatorEndpoint {
-    /// A unix domain socket at the given path.
-    Unix(PathBuf),
-    /// A TCP socket bound to a local address.
-    Tcp(SocketAddr),
+pub struct OperatorEndpoint(PathBuf);
+
+impl OperatorEndpoint {
+    /// The socket to bind, or to connect to.
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl From<PathBuf> for OperatorEndpoint {
+    fn from(path: PathBuf) -> Self {
+        Self(path)
+    }
 }
 
 impl FromStr for OperatorEndpoint {
     type Err = anyhow::Error;
 
-    /// Anything that looks like a path (contains a `/`, or carries an explicit
-    /// `unix:` scheme) is a unix socket; everything else must parse as a
-    /// socket address.
+    /// A path, with or without an explicit `unix:` scheme.
+    ///
+    /// Something shaped like a socket address is refused rather than taken as
+    /// the peculiar filename it technically is: it is what a spaceport
+    /// configured before the TCP endpoint was removed says, and silently
+    /// binding `./127.0.0.1:8080` would leave an operator hunting for a socket
+    /// nobody is listening on.
     fn from_str(s: &str) -> Result<Self> {
         if let Some(path) = s.strip_prefix("unix:") {
-            return Ok(Self::Unix(PathBuf::from(path)));
+            return named(path);
         }
-        if s.contains('/') {
-            return Ok(Self::Unix(PathBuf::from(s)));
+        if !s.contains('/') && s.contains(':') {
+            return Err(anyhow!(
+                "`{s}` is a network address, and the operator interface only listens on a unix \
+                 socket — give it a path (`{DEFAULT_OPERATOR_ENDPOINT}`), and reach a spaceport \
+                 elsewhere over ssh. Spell it `unix:{s}` if that really is the filename you meant."
+            ));
         }
-        s.parse::<SocketAddr>()
-            .map(Self::Tcp)
-            .map_err(|e| anyhow!("`{s}` is neither a unix socket path nor a socket address: {e}"))
+        named(s)
     }
+}
+
+fn named(path: &str) -> Result<OperatorEndpoint> {
+    if path.is_empty() {
+        return Err(anyhow!("the operator interface needs a socket path"));
+    }
+
+    Ok(OperatorEndpoint(PathBuf::from(path)))
 }
 
 /// How long a command waits for an answer before it decides nothing is coming.
@@ -135,7 +167,7 @@ const PATIENT_MULTIPLE: u32 = 10;
 /// A spaceport to talk to, and how long to wait for it.
 ///
 /// The two travel together because neither is any use alone: every call in
-/// [`client`] needs an address to reach and a point at which to stop hoping.
+/// [`client`] needs a socket to reach and a point at which to stop hoping.
 ///
 /// A `timeout` of [`Duration::ZERO`] is the escape hatch — no deadline at all,
 /// for the operator who knows their apply takes an hour and would rather watch
@@ -148,10 +180,7 @@ pub struct Operator {
 
 impl fmt::Display for OperatorEndpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unix(path) => write!(f, "unix:{}", path.display()),
-            Self::Tcp(addr) => write!(f, "{addr}"),
-        }
+        write!(f, "unix:{}", self.0.display())
     }
 }
 
@@ -159,32 +188,52 @@ impl fmt::Display for OperatorEndpoint {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_socket_addresses() {
-        assert_eq!(
-            "127.0.0.1:8080".parse::<OperatorEndpoint>().unwrap(),
-            OperatorEndpoint::Tcp("127.0.0.1:8080".parse().unwrap())
-        );
-        assert_eq!(
-            "[::1]:8080".parse::<OperatorEndpoint>().unwrap(),
-            OperatorEndpoint::Tcp("[::1]:8080".parse().unwrap())
-        );
+    fn parsed(raw: &str) -> OperatorEndpoint {
+        raw.parse().unwrap()
     }
 
     #[test]
     fn parses_unix_socket_paths() {
         assert_eq!(
-            "/run/spaceport.sock".parse::<OperatorEndpoint>().unwrap(),
-            OperatorEndpoint::Unix("/run/spaceport.sock".into())
+            parsed("/run/spaceport.sock").path(),
+            Path::new("/run/spaceport.sock")
         );
         assert_eq!(
-            "unix:spaceport.sock".parse::<OperatorEndpoint>().unwrap(),
-            OperatorEndpoint::Unix("spaceport.sock".into())
+            parsed("unix:spaceport.sock").path(),
+            Path::new("spaceport.sock")
+        );
+        assert_eq!(parsed("spaceport.sock").path(), Path::new("spaceport.sock"));
+    }
+
+    /// The security fix, in the one place an operator meets it: whoever
+    /// upgrades with a port in their unit file is told, rather than handed a
+    /// socket named after an address they cannot reach.
+    #[test]
+    fn refuses_a_network_address() {
+        for raw in [
+            "127.0.0.1:8080",
+            "0.0.0.0:8080",
+            "[::1]:8080",
+            "example.com:9000",
+        ] {
+            let err = raw.parse::<OperatorEndpoint>().unwrap_err().to_string();
+
+            assert!(err.contains("unix socket"), "{raw}: {err}");
+        }
+    }
+
+    /// The escape hatch the refusal names has to actually work.
+    #[test]
+    fn takes_an_address_shaped_filename_under_the_scheme() {
+        assert_eq!(
+            parsed("unix:127.0.0.1:8080").path(),
+            Path::new("127.0.0.1:8080")
         );
     }
 
     #[test]
-    fn rejects_garbage() {
-        assert!("not-an-endpoint".parse::<OperatorEndpoint>().is_err());
+    fn rejects_nothing_at_all() {
+        assert!("".parse::<OperatorEndpoint>().is_err());
+        assert!("unix:".parse::<OperatorEndpoint>().is_err());
     }
 }

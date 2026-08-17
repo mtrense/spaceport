@@ -1,10 +1,14 @@
 //! The operator interface's server side.
 //!
-//! Plain HTTP over whichever endpoint was configured, so the client is a few
-//! lines of hyper and anything else that can speak to a socket — `curl
-//! --unix-socket` included — can drive spaceport too. Bodies are the manifest
-//! files themselves, verbatim; responses are plain text meant to be read by a
-//! person, because that is who is running the command.
+//! Plain HTTP over the unix socket, so the client is a few lines of hyper and
+//! anything else that can speak to a socket — `curl --unix-socket` included —
+//! can drive spaceport too. Bodies are the manifest files themselves, verbatim;
+//! responses are plain text meant to be read by a person, because that is who
+//! is running the command.
+//!
+//! Plain, and unauthenticated, because [`super`] guarantees the only way to
+//! reach it is a mode-0600 socket on this host. Nothing here may be put on a
+//! port without an answer to authentication first.
 
 use std::convert::Infallible;
 use std::path::{Component, Path};
@@ -20,7 +24,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use http::StatusCode;
 use serde::Deserialize;
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::UnixListener;
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -48,7 +52,8 @@ use crate::status::Instance;
 
 /// Only the owner may talk to the socket: reaching it is the right to start
 /// containers on this host.
-#[cfg(unix)]
+///
+/// This mode is the whole of the interface's access control — see [`super`].
 const SOCKET_MODE: u32 = 0o600;
 
 /// Serve the operator interface until `shutdown` is cancelled.
@@ -59,35 +64,22 @@ pub async fn serve(
     shutdown: CancellationToken,
 ) -> Result<()> {
     let router = router(instance, events, shutdown.clone());
+    let path = endpoint.path();
 
-    match endpoint {
-        OperatorEndpoint::Tcp(addr) => {
-            let listener = TcpListener::bind(addr)
-                .await
-                .with_context(|| format!("binding the operator interface to {addr}"))?;
-            info!(%endpoint, "operator interface listening");
+    let listener = bind_socket(path)?;
+    info!(%endpoint, "operator interface listening");
 
-            run(listener, router, shutdown).await
-        }
-        OperatorEndpoint::Unix(path) => {
-            let listener = bind_socket(path)?;
-            info!(%endpoint, "operator interface listening");
-
-            let result = run(listener, router, shutdown).await;
-            // The socket file outlives the process that bound it, and a stale
-            // one is indistinguishable from a live one to anything that tries
-            // to connect.
-            if let Err(error) = std::fs::remove_file(path) {
-                warn!(path = %path.display(), %error, "could not remove the operator socket");
-            }
-
-            result
-        }
+    let result = run(listener, router, shutdown).await;
+    // The socket file outlives the process that bound it, and a stale one is
+    // indistinguishable from a live one to anything that tries to connect.
+    if let Err(error) = std::fs::remove_file(path) {
+        warn!(path = %path.display(), %error, "could not remove the operator socket");
     }
+
+    result
 }
 
 /// Bind a unix socket, clearing a socket left behind by a previous run.
-#[cfg(unix)]
 fn bind_socket(path: &Path) -> Result<UnixListener> {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
@@ -114,11 +106,7 @@ fn bind_socket(path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-async fn run<L>(listener: L, router: Router, shutdown: CancellationToken) -> Result<()>
-where
-    L: axum::serve::Listener,
-    L::Addr: std::fmt::Debug,
-{
+async fn run(listener: UnixListener, router: Router, shutdown: CancellationToken) -> Result<()> {
     axum::serve(listener, router)
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await

@@ -2,12 +2,12 @@
 //! `spaceport stream`.
 //!
 //! One request per command and no connection reuse, so this drives a single
-//! hyper connection directly rather than carrying a pooled client. The
-//! endpoint decides the transport; everything above that is the same HTTP.
+//! hyper connection directly rather than carrying a pooled client. Always over
+//! the unix socket [`super`] describes, which is why nothing here presents a
+//! credential: the socket's mode already said who may ask.
 
 use std::fmt::Write as _;
 use std::future::Future;
-use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -19,10 +19,9 @@ use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::UnixStream;
 
-use super::{Operator, OperatorEndpoint, PATIENT_MULTIPLE, SecretSet, wire};
+use super::{Operator, PATIENT_MULTIPLE, SecretSet, wire};
 use crate::app::manifest::VarName;
 use crate::app::{AppId, Pattern};
 use crate::auth::{Condition, RevokeScope, Role, RoleAtApp, SessionId, UserId, UserRef, UserSlug};
@@ -776,12 +775,6 @@ fn builder(method: &str, uri: &str) -> http::request::Builder {
         .header(http::header::HOST, "spaceport")
 }
 
-/// Whatever the endpoint turned out to be. The transport is chosen once, on
-/// connecting, and nothing above this cares which one it got.
-trait Transport: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
-
-impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Transport for T {}
-
 /// How long a call is willing to wait, which depends on what it asked for.
 ///
 /// The two tiers are [`super::PATIENT_MULTIPLE`]'s subject: an ordinary route
@@ -903,34 +896,22 @@ fn spelled(duration: Duration) -> String {
     }
 }
 
-/// Make the one connection a request needs, over whichever transport the
-/// endpoint names.
+/// Make the one connection a request needs.
 ///
 /// A connection that times out is reported as one that was refused. The
 /// distinction between nothing listening and something listening that never
 /// accepts is real, and it is not the concern of the person who typed the
 /// command: either way no spaceport is answering there.
-async fn connect(operator: &Operator, deadline: Deadline) -> Result<Box<dyn Transport>> {
-    Ok(match &operator.endpoint {
-        OperatorEndpoint::Unix(path) => Box::new(
-            within(
-                deadline.remaining(),
-                || unreachable_at(path),
-                UnixStream::connect(path),
-            )
-            .await?
-            .with_context(|| unreachable_at(path))?,
-        ),
-        OperatorEndpoint::Tcp(addr) => Box::new(
-            within(
-                deadline.remaining(),
-                || unreachable_on(addr),
-                TcpStream::connect(addr),
-            )
-            .await?
-            .with_context(|| unreachable_on(addr))?,
-        ),
-    })
+async fn connect(operator: &Operator, deadline: Deadline) -> Result<UnixStream> {
+    let path = operator.endpoint.path();
+
+    within(
+        deadline.remaining(),
+        || unreachable_at(path),
+        UnixStream::connect(path),
+    )
+    .await?
+    .with_context(|| unreachable_at(path))
 }
 
 fn unreachable_at(path: &Path) -> String {
@@ -941,17 +922,13 @@ fn unreachable_at(path: &Path) -> String {
     )
 }
 
-fn unreachable_on(addr: &SocketAddr) -> String {
-    format!("no spaceport is listening on {addr}")
-}
-
 /// Send `request` and hand back the response with its body still coming: a
 /// command collects it, a stream reads it for as long as it lasts.
 ///
 /// The handshake and the response head are both under `deadline`; the body is
 /// the caller's, because how long a body may take is what the caller is for.
 async fn send_request(
-    stream: Box<dyn Transport>,
+    stream: UnixStream,
     request: Request<Full<Bytes>>,
     deadline: Deadline,
 ) -> Result<http::Response<hyper::body::Incoming>> {
@@ -1034,21 +1011,46 @@ async fn send_json_to<T: DeserializeOwned>(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::time::Instant;
 
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    use tokio::net::TcpListener;
+    use tokio::net::UnixListener;
     use tokio::task::JoinHandle;
 
     use super::*;
     use crate::operator::DEFAULT_TIMEOUT;
 
-    /// A spaceport reached over TCP, waiting `timeout` for a quick answer.
-    fn operator_on(addr: SocketAddr, timeout: Duration) -> Operator {
+    /// A spaceport on `path`, waiting `timeout` for a quick answer.
+    fn operator_on(path: PathBuf, timeout: Duration) -> Operator {
         Operator {
-            endpoint: OperatorEndpoint::Tcp(addr),
+            endpoint: path.into(),
             timeout,
         }
+    }
+
+    /// A socket path of this test's own.
+    ///
+    /// Short by design: a unix socket address is a little over a hundred bytes
+    /// on every platform this runs on, and a temp directory has already spent
+    /// most of them.
+    fn a_socket(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("sp-{name}-{unique}"));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        directory.join("s")
+    }
+
+    /// Bind one, and hand back the path the client will reach it on.
+    fn bound(name: &str) -> (UnixListener, PathBuf) {
+        let path = a_socket(name);
+        let listener = UnixListener::bind(&path).unwrap();
+
+        (listener, path)
     }
 
     /// A far end that accepts the connection and then says nothing at all.
@@ -1061,9 +1063,8 @@ mod tests {
     /// The handle comes back so the test holds the listener — and the accepted
     /// connections — open for its whole length. Dropping either would turn the
     /// silence into a refusal and prove nothing about the clock.
-    async fn a_silent_spaceport() -> (SocketAddr, JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    async fn a_silent_spaceport(name: &str) -> (PathBuf, JoinHandle<()>) {
+        let (listener, path) = bound(name);
         let held = tokio::spawn(async move {
             let mut accepted = Vec::new();
             loop {
@@ -1072,17 +1073,17 @@ mod tests {
             }
         });
 
-        (addr, held)
+        (path, held)
     }
 
     /// A far end that takes `delay` to answer, and then answers `body` — an
     /// apply waiting on a container that is slow to become healthy.
     async fn a_spaceport_that_answers_after(
+        name: &str,
         delay: Duration,
         body: &'static str,
-    ) -> (SocketAddr, JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    ) -> (PathBuf, JoinHandle<()>) {
+        let (listener, path) = bound(name);
         let held = tokio::spawn(async move {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -1106,15 +1107,14 @@ mod tests {
             }
         });
 
-        (addr, held)
+        (path, held)
     }
 
     /// A far end that answers `/events` and then streams nothing: an idle
     /// spaceport, which sends no keep-alive and so is byte for byte
     /// indistinguishable on the wire from one that has hung.
-    async fn a_spaceport_that_streams_nothing() -> (SocketAddr, JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    async fn a_spaceport_that_streams_nothing(name: &str) -> (PathBuf, JoinHandle<()>) {
+        let (listener, path) = bound(name);
         let held = tokio::spawn(async move {
             let mut accepted = Vec::new();
             loop {
@@ -1130,11 +1130,13 @@ mod tests {
             }
         });
 
-        (addr, held)
+        (path, held)
     }
 
-    fn nowhere() -> SocketAddr {
-        "127.0.0.1:9".parse().unwrap()
+    /// A path nothing has ever bound, for the tests that only ask what a
+    /// deadline works out to and never connect.
+    fn nowhere() -> PathBuf {
+        PathBuf::from("/nonexistent/spaceport.sock")
     }
 
     #[test]
@@ -1185,8 +1187,8 @@ mod tests {
 
     #[tokio::test]
     async fn gives_up_on_a_spaceport_that_takes_the_request_and_never_answers() {
-        let (addr, _held) = a_silent_spaceport().await;
-        let operator = operator_on(addr, Duration::from_millis(100));
+        let (path, _held) = a_silent_spaceport("silent").await;
+        let operator = operator_on(path, Duration::from_millis(100));
 
         let started = Instant::now();
         let err = list(&operator, None).await.unwrap_err().to_string();
@@ -1207,8 +1209,7 @@ mod tests {
     /// the operator set by a multiple of it.
     #[tokio::test]
     async fn spends_one_budget_across_the_whole_call_rather_than_one_per_phase() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (listener, path) = bound("dribble");
         let _held = tokio::spawn(async move {
             let mut accepted = Vec::new();
             loop {
@@ -1225,7 +1226,7 @@ mod tests {
             }
         });
 
-        let operator = operator_on(addr, Duration::from_millis(200));
+        let operator = operator_on(path, Duration::from_millis(200));
 
         let started = Instant::now();
         let err = list(&operator, None).await.unwrap_err().to_string();
@@ -1246,8 +1247,8 @@ mod tests {
     /// this test, which is the entire reason it exists.
     #[tokio::test]
     async fn a_stream_keeps_waiting_long_after_a_command_would_have_given_up() {
-        let (addr, _held) = a_spaceport_that_streams_nothing().await;
-        let operator = operator_on(addr, Duration::from_millis(50));
+        let (path, _held) = a_spaceport_that_streams_nothing("quiet").await;
+        let operator = operator_on(path, Duration::from_millis(50));
 
         let watching = tokio::time::timeout(
             Duration::from_millis(300),
@@ -1266,9 +1267,9 @@ mod tests {
     /// command that is doing work the operator is waiting on gets to finish.
     #[tokio::test]
     async fn a_patient_command_outlasts_what_a_quick_one_is_given() {
-        let (addr, _held) =
-            a_spaceport_that_answers_after(Duration::from_millis(200), "resumed").await;
-        let operator = operator_on(addr, Duration::from_millis(50));
+        let (path, _held) =
+            a_spaceport_that_answers_after("slow", Duration::from_millis(200), "resumed").await;
+        let operator = operator_on(path, Duration::from_millis(50));
 
         let quick = list(&operator, None).await;
         assert!(
@@ -1284,8 +1285,8 @@ mod tests {
     /// it than argue with a clock.
     #[tokio::test]
     async fn a_deadline_of_zero_waits_for_however_long_it_takes() {
-        let (addr, _held) = a_silent_spaceport().await;
-        let operator = operator_on(addr, Duration::ZERO);
+        let (path, _held) = a_silent_spaceport("patient").await;
+        let operator = operator_on(path, Duration::ZERO);
 
         let waiting = tokio::time::timeout(Duration::from_millis(300), list(&operator, None)).await;
 

@@ -144,12 +144,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn takes_a_tcp_operator_endpoint_too() {
-        let unit = rendered(Some("127.0.0.1:9000"));
-        assert!(unit.contains("--operator \"127.0.0.1:9000\""), "{unit}");
-    }
-
     /// A restart that killed in-flight requests would be a setup that made
     /// spaceport worse than running it by hand.
     #[test]
