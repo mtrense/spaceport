@@ -18,7 +18,8 @@
 //! test that builds the archive which would break it. The rules are: exactly
 //! one leading path component is stripped and every entry must share it; no
 //! entry may be absolute or hold a `..` anywhere; a link may not point out of
-//! the tree; nothing but regular files, directories and links exists; the
+//! the tree; nothing is written through a link this archive itself made;
+//! nothing but regular files, directories and links exists; the
 //! expansion is bounded in bytes and in entries and is stopped in the middle
 //! rather than measured at the end; and the setuid and setgid bits do not
 //! survive the journey.
@@ -28,16 +29,29 @@
 //! that can be true when it is asked and false a moment later, and the moment
 //! is exactly the one an attacker who can also write into the destination gets
 //! to choose. Link targets are therefore resolved lexically against the
-//! entry's own directory, which is sound here for a reason worth stating: no
-//! entry path may contain `..`, and every symlink written lands inside the
-//! tree, so a path traversing symlinks this module created still lands inside
-//! the tree.
+//! entry's own directory, and that arithmetic is sound only together with the
+//! rule beneath it, which is worth stating because the obvious argument for it
+//! is wrong. Lexical resolution counts every component of a path as one level
+//! down. A symlink is one component and is worth however many levels its own
+//! target says, including none: an archive that writes `d -> "."` and then
+//! `d/up -> ".."` has spent a component and climbed nothing, both links land
+//! inside the tree by the arithmetic, and on disk `d/up` now points at the
+//! tree's parent. The entry after it — `d/up/pwned`, a path holding no `..`
+//! anywhere — is written outside the tree by a `File::create` that simply
+//! follows what it was given, and more hops climb further.
+//!
+//! So this module keeps a record of every path it writes as a link, refuses
+//! any later entry whose path reaches through one, and refuses any link target
+//! whose walk passes through one. The record is of what this run wrote, not of
+//! what the filesystem says now, which is what keeps the rule off the
+//! filesystem and out of reach of anyone racing it.
 //!
 //! Refusal leaves whatever was written before the refusal where it is. That is
 //! deliberate rather than sloppy: unwinding a half-expanded tree is more
 //! deletion logic on a path an attacker influences, and the caller in
 //! [`super::dir`] destroys the whole build directory anyway.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -131,6 +145,7 @@ pub fn unpack(archive: &[u8], into: &Path, limits: &Limits) -> Result<Unpacked> 
     let mut prefix: Option<String> = None;
     let mut written = 0usize;
     let mut bytes = 0u64;
+    let mut links = Links::default();
 
     for entry in entries {
         let mut entry = entry.context("reading an entry of a source archive")?;
@@ -170,6 +185,17 @@ pub fn unpack(archive: &[u8], into: &Path, limits: &Limits) -> Result<Unpacked> 
             continue;
         }
 
+        let relative = rest.join("/");
+
+        // Before anything is created, and for every kind of entry, because
+        // `create_dir_all` and `File::create` and `hard_link` all follow a
+        // link in a path handed to them and none of them can be told not to.
+        if let Some(link) = links.crossed(rest) {
+            bail!(
+                "`{relative}` in this archive is written through `{link}`, which this archive made a link — spaceport writes nothing through a link an archive gave it, because where a link goes on disk is not what its path says"
+            );
+        }
+
         if written == limits.entries {
             bail!(
                 "this archive holds more than the {} entries a build context may have",
@@ -177,7 +203,6 @@ pub fn unpack(archive: &[u8], into: &Path, limits: &Limits) -> Result<Unpacked> 
             );
         }
 
-        let relative = rest.join("/");
         let destination = into.join(&relative);
 
         match kind {
@@ -214,13 +239,18 @@ pub fn unpack(archive: &[u8], into: &Path, limits: &Limits) -> Result<Unpacked> 
                 let target = link_target(&entry, &relative)?;
                 // Against the directory the symlink itself sits in, which is
                 // what a relative symlink means to the kernel.
-                resolve(&rest[..rest.len() - 1], &target).ok_or_else(|| {
-                    anyhow!(
+                match resolve(&rest[..rest.len() - 1], &target, Some(&links)) {
+                    Resolution::Inside(_) => {}
+                    Resolution::Outside => bail!(
                         "the symlink `{relative}` in this archive points at `{target}`, which is outside the commit — spaceport will not unpack an archive that links out of its own build context"
-                    )
-                })?;
+                    ),
+                    Resolution::Through(link) => bail!(
+                        "the symlink `{relative}` in this archive points at `{target}`, which reaches through `{link}` — a link this same archive made, so where it lands on disk is not where its path says it does"
+                    ),
+                }
 
                 symlink(&target, &destination, &relative)?;
+                links.record(rest);
             }
             EntryType::Link => {
                 // A hardlink's target is named from the root of the archive
@@ -228,12 +258,16 @@ pub fn unpack(archive: &[u8], into: &Path, limits: &Limits) -> Result<Unpacked> 
                 // wrapper directory too and has to agree about it like every
                 // other path in here.
                 let target = link_target(&entry, &relative)?;
-                let resolved = resolve(&[], &target).ok_or_else(|| {
-                    anyhow!(
+                // With no link record, because this walk counts from the
+                // archive's root while the record is kept relative to the
+                // destination. What the record has to say about a hard link is
+                // said below, once the wrapper directory is off the answer.
+                let Resolution::Inside(resolved) = resolve(&[], &target, None) else {
+                    bail!(
                         "the hard link `{relative}` in this archive points at `{target}`, which is outside the commit — spaceport will not unpack an archive that links out of its own build context"
-                    )
-                })?;
-                let Some((root, rest)) = resolved.split_first() else {
+                    );
+                };
+                let Some((root, resolved)) = resolved.split_first() else {
                     bail!("the hard link `{relative}` in this archive points at nothing");
                 };
                 if Some(root) != prefix.as_ref() {
@@ -241,10 +275,22 @@ pub fn unpack(archive: &[u8], into: &Path, limits: &Limits) -> Result<Unpacked> 
                         "the hard link `{relative}` in this archive points at `{target}`, which is outside the commit"
                     );
                 }
+                if let Some(link) = links.crossed(resolved) {
+                    bail!(
+                        "the hard link `{relative}` in this archive points at `{target}`, which reaches through `{link}` — a link this same archive made, so where it lands on disk is not where its path says it does"
+                    );
+                }
 
-                std::fs::hard_link(into.join(rest.join("/")), &destination).with_context(|| {
-                    format!("linking `{relative}` to `{target}` inside a commit")
-                })?;
+                std::fs::hard_link(into.join(resolved.join("/")), &destination).with_context(
+                    || format!("linking `{relative}` to `{target}` inside a commit"),
+                )?;
+
+                // A hard link to a symlink is a second symlink, and `link(2)`
+                // makes one without ever following the first. The check above
+                // is what stops an archive aliasing a link it already wrote;
+                // recording this name too means the rule holds without needing
+                // to know which of the two caught it.
+                links.record(rest);
             }
             other => bail!(
                 "`{relative}` in this archive is a {}, and a build context may hold only regular files, directories and links",
@@ -312,32 +358,103 @@ fn components(raw: &str) -> Result<Vec<&str>> {
     Ok(components)
 }
 
-/// Where `target` lands, as components below the destination root, or `None`
-/// when it lands outside it.
+/// Every path this run has written as a link, relative to the destination.
+///
+/// This is the module's whole answer to a symlink being worth a different
+/// number of levels on disk than it is worth in an arithmetic that counts
+/// components. It is deliberately a record of what was written rather than a
+/// question put to the filesystem: the filesystem's answer can change between
+/// the asking and the using, and this one cannot.
+#[derive(Debug, Default)]
+struct Links(HashSet<String>);
+
+impl Links {
+    /// Remember that `path` was written as a link.
+    fn record(&mut self, path: &[&str]) {
+        self.0.insert(path.join("/"));
+    }
+
+    /// The link `path` reaches through, if it reaches through one.
+    ///
+    /// The path itself counts, not only its parents. An archive naming a link
+    /// and then naming the same path again is an archive nothing legitimate
+    /// produces, and permitting it would mean reasoning about what a write
+    /// through a link chain lands on, which is the reasoning this record
+    /// exists to avoid.
+    fn crossed<S: AsRef<str>>(&self, path: &[S]) -> Option<&str> {
+        (1..=path.len()).find_map(|depth| self.holds(&path[..depth]))
+    }
+
+    /// The recorded link at exactly `path`, if there is one.
+    fn holds<S: AsRef<str>>(&self, path: &[S]) -> Option<&str> {
+        let joined = path
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>()
+            .join("/");
+
+        self.0.get(&joined).map(String::as_str)
+    }
+}
+
+/// What a link target came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Resolution {
+    /// Components below the destination root.
+    Inside(Vec<String>),
+    /// Above the destination root, or an absolute path.
+    Outside,
+    /// Through the named link this run wrote, so the arithmetic below says
+    /// nothing about where the kernel would end up.
+    Through(String),
+}
+
+/// Where `target` lands, relative to the destination root.
 ///
 /// `base` is the directory the target is relative to. Purely lexical, and
 /// deliberately so — resolving a link by asking the filesystem where it points
 /// is a check whose answer can be changed between the asking and the using.
-fn resolve(base: &[&str], target: &str) -> Option<Vec<String>> {
+///
+/// `links` is that arithmetic's guard rail: a walk may *end* on a link this
+/// run wrote, which is an ordinary link to a link, but it may not pass through
+/// one, because that is a step the kernel takes and this arithmetic does not.
+/// `None` says the caller is not resolving in the coordinates the record is
+/// kept in — the hardlink case, which counts from the archive's root rather
+/// than from the destination, and which checks the record itself once it has
+/// the wrapper directory off its answer.
+fn resolve(base: &[&str], target: &str, links: Option<&Links>) -> Resolution {
     // Absolute link targets are refused rather than reinterpreted. `/etc` in a
     // repository means `/etc` on whatever host the tree ends up on, and that
     // is precisely the thing this module exists to prevent.
     if target.starts_with('/') {
-        return None;
+        return Resolution::Outside;
     }
 
     let mut resolved: Vec<String> = base.iter().map(|name| (*name).to_owned()).collect();
-    for component in target.split('/') {
+    let mut components = target.split('/').peekable();
+    while let Some(component) = components.next() {
         match component {
             "" | "." => {}
             ".." => {
-                resolved.pop()?;
+                if resolved.pop().is_none() {
+                    return Resolution::Outside;
+                }
             }
             name => resolved.push(name.to_owned()),
         }
+
+        // Anything left to walk — a name, a `..`, or the bare `.` or trailing
+        // slash the kernel also insists on following a link for — means the
+        // path standing here would be followed rather than stood on.
+        if components.peek().is_some()
+            && let Some(links) = links
+            && let Some(link) = links.holds(&resolved)
+        {
+            return Resolution::Through(link.to_owned());
+        }
     }
 
-    Some(resolved)
+    Resolution::Inside(resolved)
 }
 
 /// What a link entry says it points at.
@@ -750,6 +867,121 @@ mod tests {
         let _ = std::fs::remove_dir_all(&into);
     }
 
+    /// Prevents the escape the lexical arithmetic cannot see on its own: two
+    /// links, neither of which leaves the tree by that arithmetic, that
+    /// together leave it on disk. `d` is one component down and zero levels
+    /// down, so `d/up`'s single `..` climbs out of the tree rather than back
+    /// to it, and the file needs no `..` in its name at all.
+    #[test]
+    fn refuses_an_entry_written_through_a_link_this_archive_made() {
+        let into = destination("unpack-symlink-chain");
+        let archive = tarball(|builder| {
+            link(builder, &format!("{PREFIX}/d"), EntryType::Symlink, ".");
+            link(builder, &format!("{PREFIX}/d/up"), EntryType::Symlink, "..");
+            file(
+                builder,
+                &format!("{PREFIX}/d/up/pwned"),
+                0o644,
+                "* * * * * root sh\n",
+            );
+        });
+
+        let error = unpack(&archive, &into, &ROOMY).unwrap_err().to_string();
+
+        assert!(error.contains("through `d`"), "{error}");
+        assert!(!into.parent().unwrap().join("pwned").exists());
+        assert!(!into.parent().unwrap().join("up").exists());
+
+        let _ = std::fs::remove_dir_all(&into);
+    }
+
+    /// The same climb spent on a link's own target rather than on an entry's
+    /// path, which the check on entry paths would let past: `d/..` is the
+    /// tree's parent on disk and the tree's own root by the arithmetic.
+    #[test]
+    fn refuses_a_symlink_whose_target_reaches_through_another_symlink() {
+        let into = destination("unpack-symlink-through");
+        let archive = tarball(|builder| {
+            link(builder, &format!("{PREFIX}/d"), EntryType::Symlink, ".");
+            link(
+                builder,
+                &format!("{PREFIX}/out"),
+                EntryType::Symlink,
+                "d/../elsewhere",
+            );
+        });
+
+        let error = unpack(&archive, &into, &ROOMY).unwrap_err().to_string();
+
+        assert!(error.contains("reaches through `d`"), "{error}");
+        assert!(!into.join("out").exists());
+
+        let _ = std::fs::remove_dir_all(&into);
+    }
+
+    /// A hard link to a symlink is a second symlink under a second name —
+    /// `link(2)` does not follow what it links to — so an archive allowed to
+    /// alias a link it wrote would have the chain back under a name the record
+    /// never heard of. The alias is refused where it is asked for, and the
+    /// entry that would have walked through it never gets that far.
+    #[test]
+    fn refuses_a_hardlink_aliasing_a_symlink_this_archive_made() {
+        let into = destination("unpack-hardlink-alias");
+        let archive = tarball(|builder| {
+            link(builder, &format!("{PREFIX}/d"), EntryType::Symlink, ".");
+            link(
+                builder,
+                &format!("{PREFIX}/e"),
+                EntryType::Link,
+                &format!("{PREFIX}/d"),
+            );
+            link(builder, &format!("{PREFIX}/e/up"), EntryType::Symlink, "..");
+        });
+
+        let error = unpack(&archive, &into, &ROOMY).unwrap_err().to_string();
+
+        assert!(error.contains("hard link `e`"), "{error}");
+        assert!(error.contains("reaches through `d`"), "{error}");
+        assert!(!into.join("e").exists());
+        assert!(!into.parent().unwrap().join("up").exists());
+
+        let _ = std::fs::remove_dir_all(&into);
+    }
+
+    /// The rule is about walking through a link, not about ending on one. A
+    /// link to a link is an ordinary thing for a repository to hold, and a
+    /// rule that refused it would refuse real commits.
+    #[test]
+    fn keeps_a_symlink_pointing_at_another_symlink() {
+        let into = destination("unpack-symlink-to-symlink");
+        let archive = tarball(|builder| {
+            file(builder, &format!("{PREFIX}/README.md"), 0o644, "a readme\n");
+            directory(builder, &format!("{PREFIX}/docs/"));
+            link(
+                builder,
+                &format!("{PREFIX}/docs/readme"),
+                EntryType::Symlink,
+                "../README.md",
+            );
+            link(
+                builder,
+                &format!("{PREFIX}/docs/alias"),
+                EntryType::Symlink,
+                "readme",
+            );
+        });
+
+        let unpacked = unpack(&archive, &into, &ROOMY).unwrap();
+
+        assert_eq!(unpacked.entries, 4);
+        assert_eq!(
+            std::fs::read_to_string(into.join("docs/alias")).unwrap(),
+            "a readme\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&into);
+    }
+
     /// Prevents an archive making a second name for a file on the host, which
     /// a later entry could then write through — the hardlink variant of the
     /// symlink escape, and one that survives a check that only looks at
@@ -997,16 +1229,66 @@ mod tests {
     /// its answers are worth pinning down on their own.
     #[test]
     fn resolves_a_link_target_without_leaving_the_tree() {
+        let inside = |names: &[&str]| {
+            Resolution::Inside(names.iter().map(|name| (*name).to_owned()).collect())
+        };
+
         assert_eq!(
-            resolve(&["docs"], "../README.md"),
-            Some(vec!["README.md".to_owned()])
+            resolve(&["docs"], "../README.md", None),
+            inside(&["README.md"])
         );
         assert_eq!(
-            resolve(&["docs"], "./guide/../intro.md"),
-            Some(vec!["docs".to_owned(), "intro.md".to_owned()])
+            resolve(&["docs"], "./guide/../intro.md", None),
+            inside(&["docs", "intro.md"])
         );
-        assert_eq!(resolve(&[], ".."), None);
-        assert_eq!(resolve(&["docs"], "../../elsewhere"), None);
-        assert_eq!(resolve(&["docs"], "/etc"), None);
+        assert_eq!(resolve(&[], "..", None), Resolution::Outside);
+        assert_eq!(
+            resolve(&["docs"], "../../elsewhere", None),
+            Resolution::Outside
+        );
+        assert_eq!(resolve(&["docs"], "/etc", None), Resolution::Outside);
+    }
+
+    /// The record is what the arithmetic above cannot work out for itself, so
+    /// where it does and does not stop a walk is worth pinning down too.
+    #[test]
+    fn refuses_to_resolve_a_target_walking_through_a_recorded_link() {
+        let mut links = Links::default();
+        links.record(&["d"]);
+        links.record(&["docs", "readme"]);
+
+        let through = |target| resolve(&[], target, Some(&links));
+        assert_eq!(through("d/.."), Resolution::Through("d".to_owned()));
+        assert_eq!(through("d/anything"), Resolution::Through("d".to_owned()));
+        // The kernel follows a link for a trailing slash or a trailing `.`
+        // just as it does for a name, so this arithmetic does too.
+        assert_eq!(through("d/"), Resolution::Through("d".to_owned()));
+        assert_eq!(through("d/."), Resolution::Through("d".to_owned()));
+        // Ending on a link is an ordinary link to a link.
+        assert_eq!(through("d"), Resolution::Inside(vec!["d".to_owned()]));
+        assert_eq!(
+            resolve(&["docs"], "readme", Some(&links)),
+            Resolution::Inside(vec!["docs".to_owned(), "readme".to_owned()])
+        );
+        // A path merely sharing a prefix with a link is not through it.
+        assert_eq!(
+            through("docs/other"),
+            Resolution::Inside(vec!["docs".to_owned(), "other".to_owned()])
+        );
+    }
+
+    /// Entry paths are judged by prefix rather than by walking, so that a
+    /// directory made from a link's name catches everything beneath it.
+    #[test]
+    fn knows_which_paths_reach_through_a_recorded_link() {
+        let mut links = Links::default();
+        links.record(&["d"]);
+
+        assert_eq!(links.crossed(&["d", "up", "pwned"]), Some("d"));
+        // The link's own path counts: an archive naming it twice is an archive
+        // asking for the second write to go through the first entry.
+        assert_eq!(links.crossed(&["d"]), Some("d"));
+        assert_eq!(links.crossed(&["docs", "readme"]), None);
+        assert_eq!(links.crossed(&["dd", "readme"]), None);
     }
 }
