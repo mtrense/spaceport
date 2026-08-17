@@ -196,17 +196,29 @@ impl Routes {
         self.by_host.keys().cloned().collect()
     }
 
-    /// What `host` leads to, if anything.
+    /// What `host` leads to and the name it matched under, if anything.
+    ///
+    /// The key comes back with the route because the edge needs it: a [`Host`]
+    /// was validated and lowercased on its way into a manifest, so it is the
+    /// one spelling of the name that carries nothing a client chose. Whatever
+    /// the request actually said is for matching and for error messages; what
+    /// crosses to an app is built from this.
     ///
     /// Case-insensitive, because `Host` headers are — but the common case is a
     /// client that already sent lowercase, and that one borrows rather than
     /// allocating.
-    pub fn lookup(&self, host: &str) -> Option<&Route> {
+    pub fn matched(&self, host: &str) -> Option<(&Host, &Route)> {
         if host.bytes().any(|b| b.is_ascii_uppercase()) {
-            self.by_host.get(host.to_ascii_lowercase().as_str())
+            self.by_host
+                .get_key_value(host.to_ascii_lowercase().as_str())
         } else {
-            self.by_host.get(host)
+            self.by_host.get_key_value(host)
         }
+    }
+
+    /// What `host` leads to, if anything.
+    pub fn lookup(&self, host: &str) -> Option<&Route> {
+        self.matched(host).map(|(_, route)| route)
     }
 
     /// The app serving `host`, if one is.

@@ -31,6 +31,7 @@ use super::gate;
 use super::service::{self, ConnInfo};
 use super::websocket;
 use crate::app::Auth;
+use crate::app::manifest::Host;
 use crate::app::store::Route;
 
 /// Headers that describe one hop and must not be passed on to the next.
@@ -98,15 +99,39 @@ pub async fn handle(
             "spaceport cannot route a request that names no host\n".into(),
         ));
     };
+    // What the client said, used to match a route and to name the host in a
+    // refusal — and for nothing else. Routing only reads up to the first `:`,
+    // so the rest of this string was never checked against anything: a
+    // `Host: alpha.test:@evil.com` matches `alpha.test` and carries userinfo
+    // that would make a browser resolve the app's own absolute URLs to
+    // somewhere else entirely. Past this point the name comes from `matched`.
     let name = service::host_name(&authority).unwrap_or(&authority);
 
-    let app = match state.apps.routes().lookup(name).cloned() {
-        Some(Route::Live(app)) => app,
+    let routes = state.apps.routes();
+    let Some((matched, route)) = routes.matched(name) else {
+        debug!(
+            host = name,
+            path = req.uri().path(),
+            "no app serves this host"
+        );
+        return Ok(refuse(
+            StatusCode::NOT_FOUND,
+            format!("spaceport has no app for {name}\n"),
+        ));
+    };
+    // Out of the routing snapshot, so it can be dropped rather than pinned for
+    // the length of an upstream request.
+    let (host, route) = (matched.clone(), route.clone());
+    drop(routes);
+    let name = host.as_str();
+
+    let app = match route {
+        Route::Live(app) => app,
         // Spaceport's own host, which is served in this process. The body is
         // boxed on the way in, as it is for every other route spaceport answers
         // itself — the cost axum's ergonomics are worth on everything that is
         // not the proxy path.
-        Some(Route::Spaceport) => {
+        Route::Spaceport => {
             let home = state.home.clone();
             return Ok(home
                 .oneshot(req.map(Body::new))
@@ -117,7 +142,7 @@ pub async fn handle(
         // service on purpose. Saying so — rather than 404, which would mean
         // spaceport has never heard of this name — is the difference between a
         // caller that retries later and one that gives up on the address.
-        Some(Route::Suspended(app)) => {
+        Route::Suspended(app) => {
             debug!(
                 app = %app,
                 host = name,
@@ -135,7 +160,7 @@ pub async fn handle(
         // second and one that waits out a connect timeout for a container that
         // is not there — and 503, not 502, because there is nothing wrong with
         // the request.
-        Some(Route::Down(app)) => {
+        Route::Down(app) => {
             debug!(
                 app = %app,
                 host = name,
@@ -145,17 +170,6 @@ pub async fn handle(
             return Ok(refuse(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("the app serving {name} is not running\n"),
-            ));
-        }
-        None => {
-            debug!(
-                host = name,
-                path = req.uri().path(),
-                "no app serves this host"
-            );
-            return Ok(refuse(
-                StatusCode::NOT_FOUND,
-                format!("spaceport has no app for {name}\n"),
             ));
         }
     };
@@ -176,9 +190,7 @@ pub async fn handle(
     // fan-out so the socket dies with the session. After the gate, so an
     // unauthenticated upgrade got its 401 above like any other fetch.
     if websocket::is_websocket_upgrade(&req) {
-        return Ok(
-            websocket::tunnel(state.clone(), app, name, &authority, conn, bearer, req).await,
-        );
+        return Ok(websocket::tunnel(state.clone(), app, &host, conn, bearer, req).await);
     }
 
     let upstream = app.upstream;
@@ -192,7 +204,7 @@ pub async fn handle(
     // Upstreams are spoken to over HTTP/1.1 whatever the client used, so an
     // HTTP/2 request must not carry its version into the pool.
     *req.version_mut() = http::Version::HTTP_11;
-    forwarded_headers(req.headers_mut(), &authority, conn);
+    forwarded_headers(req.headers_mut(), &host, state.https_port, conn);
     strip_spaceport_headers(
         req.headers_mut(),
         matches!(app.manifest.auth, Auth::Edge { .. }),
@@ -274,14 +286,29 @@ fn upstream_uri(uri: &Uri, upstream: SocketAddr) -> Uri {
 /// outermost hop, so anything a client sent under these names is a claim about
 /// itself that nothing has checked — passing it through would let any client
 /// pick its own address.
-pub(super) fn forwarded_headers(headers: &mut HeaderMap, authority: &str, conn: Option<ConnInfo>) {
+///
+/// `host` is a [`Host`] rather than a string on purpose, and the authority is
+/// rebuilt from it rather than echoed. Routing only ever matches the request's
+/// name up to its first `:`, so the `Host` header a client sent has an
+/// unchecked tail: `alpha.test:@evil.com` routes to `alpha.test` and, passed
+/// on whole, makes every absolute URL the app builds from it resolve at
+/// `evil.com` — a password-reset link poisoned through the very proxy that was
+/// meant to pin the name. A `Host` was validated and lowercased on its way
+/// into a manifest, so there is nothing in it for a client to have chosen.
+pub(super) fn forwarded_headers(
+    headers: &mut HeaderMap,
+    host: &Host,
+    https_port: u16,
+    conn: Option<ConnInfo>,
+) {
     strip_hop_by_hop(headers);
 
     // HTTP/2 requests carry the host in `:authority` and no `Host` header at
     // all. Restoring it keeps every app on one way of asking "who was I
     // addressed as?", and stops hyper filling it in with the upstream's
-    // loopback address.
-    if let Ok(value) = HeaderValue::from_str(authority) {
+    // loopback address. The port is named beside it exactly when a browser
+    // would have named it, by the same rule the edge's own redirects use.
+    if let Ok(value) = HeaderValue::from_str(&gate::authority(host.as_str(), https_port)) {
         headers.insert(header::HOST, value.clone());
         headers.insert(X_FORWARDED_HOST, value);
     }
@@ -463,13 +490,32 @@ mod tests {
             scheme: Scheme::Https,
         };
 
-        forwarded_headers(&mut headers, "alpha.test", Some(conn));
+        forwarded_headers(
+            &mut headers,
+            &"alpha.test".parse().unwrap(),
+            443,
+            Some(conn),
+        );
 
         assert_eq!(header(&headers, "host"), "alpha.test");
         assert_eq!(header(&headers, "x-forwarded-host"), "alpha.test");
         assert_eq!(header(&headers, "x-forwarded-proto"), "https");
         // The client's own claim is replaced, not appended to.
         assert_eq!(header(&headers, "x-forwarded-for"), "203.0.113.7");
+    }
+
+    /// An edge that is not on 443 names its port, because that is what the
+    /// browser put in the header it would otherwise have echoed — an app
+    /// building its own absolute URLs needs the address it is really reached
+    /// at, not one that drops the port.
+    #[test]
+    fn names_the_port_the_edge_actually_answers_on() {
+        let mut headers = HeaderMap::new();
+
+        forwarded_headers(&mut headers, &"alpha.test".parse().unwrap(), 8443, None);
+
+        assert_eq!(header(&headers, "host"), "alpha.test:8443");
+        assert_eq!(header(&headers, "x-forwarded-host"), "alpha.test:8443");
     }
 
     /// On a gated app the credentials come out — every `Authorization`, and
@@ -725,6 +771,41 @@ mod tests {
             body,
             "host=alpha.test xfh=alpha.test xff=127.0.0.1 xfp=https path=/greet?loud=1"
         );
+    }
+
+    /// What the app is told it was addressed as is built from the routing
+    /// table, never echoed from the request.
+    ///
+    /// Routing reads the request's host only as far as its first `:`, so
+    /// everything after one crosses unexamined if it is passed on whole. The
+    /// `@` spelling is the one that bites: it is a legal header byte, it makes
+    /// what follows the authority and what precedes it userinfo, and an app
+    /// that builds a password-reset link out of its own `Host` would mail a
+    /// URL every browser resolves at `evil.com` — through the very proxy whose
+    /// job was to pin the name. A matched route key cannot spell any of this:
+    /// it is lowercase letters, digits, hyphens and dots, checked on its way
+    /// into a manifest.
+    #[tokio::test]
+    async fn rebuilds_the_host_it_gives_the_app_from_the_route_it_matched() {
+        let apps = Arc::new(AppStore::new());
+        apps.insert(app("hello", "alpha.test", upstream().await))
+            .unwrap();
+        let edge = edge(apps).await;
+
+        for spelling in [
+            "alpha.test:@evil.com",
+            "alpha.test:8080",
+            "ALPHA.TEST",
+            "alpha.test:evil.com",
+        ] {
+            let (status, body) = get(edge, spelling, "/greet").await;
+
+            assert_eq!(status, StatusCode::OK, "{spelling}");
+            assert!(
+                body.starts_with("host=alpha.test xfh=alpha.test "),
+                "{spelling}: {body}"
+            );
+        }
     }
 
     #[tokio::test]

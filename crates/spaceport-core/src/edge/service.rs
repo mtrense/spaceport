@@ -15,7 +15,7 @@
 
 use std::convert::Infallible;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -28,6 +28,7 @@ use tower::{Service, ServiceExt};
 
 use super::EdgeState;
 use super::proxy;
+use crate::app::manifest::Host;
 
 /// Path prefixes spaceport claims for itself. Everything else is proxied.
 ///
@@ -132,21 +133,48 @@ pub(super) fn request_host<B>(req: &Request<B>) -> Option<&str> {
         .filter(|host| !host.is_empty())
 }
 
-/// The `https` URL matching `req`, or `None` if the request names no host —
-/// with nothing to redirect *to*, the caller falls through.
+/// The `https` URL matching `req`, or `None` if the request names no host that
+/// could be one — with nothing to redirect *to*, the caller falls through and
+/// the request is answered over plaintext as-is.
+///
+/// The name is checked before it is built into a URL, and that check is
+/// load-bearing: [`host_name`] only cuts at the first `:`, so what it hands
+/// back is otherwise entirely the client's. `Host: evil.com/x` would make
+/// `evil.com` the authority and the rest of it path, and the browser would be
+/// sent somewhere spaceport has never served. This runs before routing — it
+/// has to, since a name gets its certificate by being reachable first — so
+/// there is no matched route key to rebuild from here as there is on the
+/// proxy path, and the name is validated in place instead.
 fn https_location<B>(req: &Request<B>, https_port: u16) -> Option<HeaderValue> {
     // Drop the plaintext port, and name the https one unless it is the default.
     let name = host_name(request_host(req)?)?;
+    if !is_addressable(name) {
+        return None;
+    }
     let path = req
         .uri()
         .path_and_query()
         .map_or_else(|| req.uri().path(), PathAndQuery::as_str);
 
-    let location = match https_port {
-        443 => format!("https://{name}{path}"),
-        port => format!("https://{name}:{port}{path}"),
-    };
+    let location = format!("https://{}{path}", super::gate::authority(name, https_port));
     HeaderValue::try_from(location).ok()
+}
+
+/// Whether `name` is something spaceport can put in a URL and mean it.
+///
+/// A [`Host`] is letters, digits, hyphens and dots, so one that parses cannot
+/// carry a delimiter that means something else further along — no `/` to start
+/// a path, no `@` to turn the whole thing into userinfo, no second `:`. A
+/// bracketed IPv6 literal is the one shape that legitimately holds colons, and
+/// it is admitted only once the address inside the brackets really parses.
+fn is_addressable(name: &str) -> bool {
+    match name
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        Some(literal) => literal.parse::<Ipv6Addr>().is_ok(),
+        None => name.parse::<Host>().is_ok(),
+    }
 }
 
 /// The host without its port. Handles bracketed IPv6 literals.
@@ -220,6 +248,35 @@ mod tests {
     #[test]
     fn declines_to_redirect_without_a_host() {
         assert!(https_location(&request("", "/"), 443).is_none());
+    }
+
+    /// The redirect is built out of a name the client sent, so a name that is
+    /// not one gets no redirect at all. Everything here would otherwise put a
+    /// second host — or a whole other origin, once `@` makes the front of it
+    /// userinfo — where the browser reads the authority.
+    #[test]
+    fn declines_to_redirect_to_a_host_that_is_not_a_name() {
+        for hostile in [
+            "evil.com/x",
+            "example.com@evil.com",
+            "example.com\\@evil.com",
+            "exa mple.com",
+            "[not-an-address]",
+        ] {
+            assert!(
+                https_location(&request(hostile, "/a"), 443).is_none(),
+                "{hostile}"
+            );
+        }
+    }
+
+    /// Anything past the first `:` is the port's business and is dropped, so a
+    /// tail that was trying to be a second authority never reaches the URL —
+    /// this one redirects, and redirects to the name in front of the colon.
+    #[test]
+    fn drops_a_hostile_tail_along_with_the_port() {
+        let location = https_location(&request("example.com:@evil.com", "/a"), 443).unwrap();
+        assert_eq!(location, "https://example.com/a");
     }
 
     #[test]

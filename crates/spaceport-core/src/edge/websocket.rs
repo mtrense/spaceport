@@ -44,6 +44,7 @@ use super::gate;
 use super::proxy;
 use super::service::ConnInfo;
 use crate::app::Auth;
+use crate::app::manifest::Host;
 use crate::app::store::App;
 use crate::auth::UserId;
 use crate::secret::Secret;
@@ -86,12 +87,12 @@ struct Leash {
 pub(super) async fn tunnel(
     state: Arc<EdgeState>,
     app: Arc<App>,
-    name: &str,
-    authority: &str,
+    host: &Host,
     conn: Option<ConnInfo>,
     bearer: Option<Secret>,
     mut req: Request<Incoming>,
 ) -> Response<Body> {
+    let name = host.as_str();
     // The leash before anything irreversible. Ordering matters for the race
     // with revocation: the credential is read (user, expiry), the kill switch
     // registered, and the credential read *again* — a revoke that lands before
@@ -156,7 +157,7 @@ pub(super) async fn tunnel(
     // is the next hop asking for it.
     *req.uri_mut() = origin_form(req.uri());
     *req.version_mut() = http::Version::HTTP_11;
-    proxy::forwarded_headers(req.headers_mut(), authority, conn);
+    proxy::forwarded_headers(req.headers_mut(), host, state.https_port, conn);
     proxy::strip_spaceport_headers(
         req.headers_mut(),
         matches!(app.manifest.auth, Auth::Edge { .. }),
