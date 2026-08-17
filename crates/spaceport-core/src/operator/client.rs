@@ -6,9 +6,12 @@
 //! endpoint decides the transport; everything above that is the same HTTP.
 
 use std::fmt::Write as _;
+use std::future::Future;
+use std::net::SocketAddr;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use http::{Request, StatusCode};
 use http_body_util::{BodyExt, Full};
@@ -19,7 +22,7 @@ use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
 
-use super::{OperatorEndpoint, SecretSet, wire};
+use super::{Operator, OperatorEndpoint, PATIENT_MULTIPLE, SecretSet, wire};
 use crate::app::manifest::VarName;
 use crate::app::{AppId, Pattern};
 use crate::auth::{Condition, RevokeScope, Role, RoleAtApp, SessionId, UserId, UserRef, UserSlug};
@@ -34,7 +37,7 @@ use crate::status::Status;
 /// With `suspended`, the app is recorded and claims its hosts without being
 /// started.
 pub async fn apply(
-    endpoint: &OperatorEndpoint,
+    operator: &Operator,
     id: &AppId,
     manifest: String,
     suspended: bool,
@@ -47,7 +50,7 @@ pub async fn apply(
         .header(http::header::CONTENT_TYPE, "application/yaml")
         .body(Full::new(Bytes::from(manifest)))?;
 
-    send_to(endpoint, request).await
+    send_to(operator, Pace::Patient, request).await
 }
 
 /// Ask it to run what it built for the app named `id`.
@@ -58,41 +61,43 @@ pub async fn apply(
 /// [`list`] makes for a pattern: nothing here can carry a character a query
 /// string would swallow, and a spaceport asked for a revision that is not one
 /// answers that it has no build of it.
-pub async fn deploy(
-    endpoint: &OperatorEndpoint,
-    id: &AppId,
-    revision: Option<&str>,
-) -> Result<String> {
+pub async fn deploy(operator: &Operator, id: &AppId, revision: Option<&str>) -> Result<String> {
     let uri = match revision {
         Some(revision) => format!("/apps/{id}/deployment?revision={revision}"),
         None => format!("/apps/{id}/deployment"),
     };
 
-    send_to(endpoint, builder("POST", &uri).body(Full::default())?).await
+    send_to(
+        operator,
+        Pace::Patient,
+        builder("POST", &uri).body(Full::default())?,
+    )
+    .await
 }
 
 /// Ask it to stop serving the app named `id`, keeping everything about it.
 ///
 /// With `stop_container`, its container is stopped and kept rather than left
 /// running.
-pub async fn suspend(
-    endpoint: &OperatorEndpoint,
-    id: &AppId,
-    stop_container: bool,
-) -> Result<String> {
+pub async fn suspend(operator: &Operator, id: &AppId, stop_container: bool) -> Result<String> {
     let uri = match stop_container {
         true => format!("/apps/{id}/suspend?stop_container=true"),
         false => format!("/apps/{id}/suspend"),
     };
 
-    send_to(endpoint, builder("POST", &uri).body(Full::default())?).await
+    send_to(
+        operator,
+        Pace::Patient,
+        builder("POST", &uri).body(Full::default())?,
+    )
+    .await
 }
 
 /// Ask it to serve the app named `id` again.
-pub async fn resume(endpoint: &OperatorEndpoint, id: &AppId) -> Result<String> {
+pub async fn resume(operator: &Operator, id: &AppId) -> Result<String> {
     let request = builder("POST", &format!("/apps/{id}/resume")).body(Full::default())?;
 
-    send_to(endpoint, request).await
+    send_to(operator, Pace::Patient, request).await
 }
 
 /// Ask it to remember that the app named `id` is built from `repository`.
@@ -123,7 +128,7 @@ pub async fn resume(endpoint: &OperatorEndpoint, id: &AppId) -> Result<String> {
 /// has yet. Such a branch is refused by the spaceport as a repository or a
 /// branch it cannot find rather than silently tracking something else.
 pub async fn track(
-    endpoint: &OperatorEndpoint,
+    operator: &Operator,
     id: &AppId,
     repository: &str,
     connection: &str,
@@ -142,7 +147,12 @@ pub async fn track(
         let _ = write!(uri, "&deploy={deploy}");
     }
 
-    send_to(endpoint, builder("PUT", &uri).body(Full::default())?).await
+    send_to(
+        operator,
+        Pace::Patient,
+        builder("PUT", &uri).body(Full::default())?,
+    )
+    .await
 }
 
 /// Ask for the apps it is running, optionally only those matching `pattern`.
@@ -150,10 +160,7 @@ pub async fn track(
 /// The rows, not the columns: how wide they are and which cell is worth
 /// colouring is the caller's to decide, and an empty answer is an empty list
 /// rather than a sentence about it.
-pub async fn list(
-    endpoint: &OperatorEndpoint,
-    pattern: Option<&Pattern>,
-) -> Result<Vec<wire::AppRow>> {
+pub async fn list(operator: &Operator, pattern: Option<&Pattern>) -> Result<Vec<wire::AppRow>> {
     // A pattern is lowercase letters, digits, hyphens and `*`, all of which a
     // query string carries as they are.
     let uri = match pattern {
@@ -161,20 +168,30 @@ pub async fn list(
         None => "/apps".to_owned(),
     };
 
-    send_json_to(endpoint, builder("GET", &uri).body(Full::default())?).await
+    send_json_to(
+        operator,
+        Pace::Quick,
+        builder("GET", &uri).body(Full::default())?,
+    )
+    .await
 }
 
 /// Ask for everything it knows about the app named `id`.
 ///
 /// With `manifest`, the document that was applied comes back verbatim and on
 /// its own, rather than a report about it.
-pub async fn show(endpoint: &OperatorEndpoint, id: &AppId, manifest: bool) -> Result<String> {
+pub async fn show(operator: &Operator, id: &AppId, manifest: bool) -> Result<String> {
     let uri = match manifest {
         true => format!("/apps/{id}?manifest=true"),
         false => format!("/apps/{id}"),
     };
 
-    send_to(endpoint, builder("GET", &uri).body(Full::default())?).await
+    send_to(
+        operator,
+        Pace::Quick,
+        builder("GET", &uri).body(Full::default())?,
+    )
+    .await
 }
 
 /// Ask for the names of the secrets set for the app named `id`, optionally only
@@ -182,11 +199,7 @@ pub async fn show(endpoint: &OperatorEndpoint, id: &AppId, manifest: bool) -> Re
 ///
 /// Names, one per line, and never a value: the route behind this cannot answer
 /// with one.
-pub async fn secrets(
-    endpoint: &OperatorEndpoint,
-    id: &AppId,
-    pattern: Option<&Pattern>,
-) -> Result<String> {
+pub async fn secrets(operator: &Operator, id: &AppId, pattern: Option<&Pattern>) -> Result<String> {
     // A pattern over secret names is letters, digits, underscores and `*`,
     // which a query string carries as they are — the argument [`list`] makes.
     let uri = match pattern {
@@ -194,7 +207,12 @@ pub async fn secrets(
         None => format!("/apps/{id}/secrets"),
     };
 
-    send_to(endpoint, builder("GET", &uri).body(Full::default())?).await
+    send_to(
+        operator,
+        Pace::Quick,
+        builder("GET", &uri).body(Full::default())?,
+    )
+    .await
 }
 
 /// Ask it to set the secret `name` of the app named `id` to `value`.
@@ -209,7 +227,7 @@ pub async fn secrets(
 /// value can leave an app untouched, resume it, or replace its container, and
 /// only this side knows how to say that to a person.
 pub async fn set_secret(
-    endpoint: &OperatorEndpoint,
+    operator: &Operator,
     id: &AppId,
     name: &VarName,
     value: &Secret,
@@ -220,21 +238,17 @@ pub async fn set_secret(
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(Full::new(Bytes::from(value.expose().to_owned())))?;
 
-    let body = send_to(endpoint, request).await?;
+    let body = send_to(operator, Pace::Patient, request).await?;
 
     serde_json::from_str(&body)
         .context("the operator interface sent something that is not what setting a secret did")
 }
 
 /// Ask it to forget the secret `name` of the app named `id`.
-pub async fn delete_secret(
-    endpoint: &OperatorEndpoint,
-    id: &AppId,
-    name: &VarName,
-) -> Result<String> {
+pub async fn delete_secret(operator: &Operator, id: &AppId, name: &VarName) -> Result<String> {
     let request = builder("DELETE", &format!("/apps/{id}/secrets/{name}")).body(Full::default())?;
 
-    send_to(endpoint, request).await
+    send_to(operator, Pace::Quick, request).await
 }
 
 /// Ask what this spaceport is and how it is doing.
@@ -242,18 +256,23 @@ pub async fn delete_secret(
 /// The one call that comes back as data rather than as prose: what a status
 /// should look like depends on whether a person is reading it, and only this
 /// side knows that.
-pub async fn status(endpoint: &OperatorEndpoint) -> Result<Status> {
-    let body = send_to(endpoint, builder("GET", "/status").body(Full::default())?).await?;
+pub async fn status(operator: &Operator) -> Result<Status> {
+    let body = send_to(
+        operator,
+        Pace::Quick,
+        builder("GET", "/status").body(Full::default())?,
+    )
+    .await?;
 
     serde_json::from_str(&body)
         .context("the operator interface sent something that is not a status")
 }
 
 /// Ask it to stop the app named `id` and forget it.
-pub async fn destroy(endpoint: &OperatorEndpoint, id: &AppId) -> Result<String> {
+pub async fn destroy(operator: &Operator, id: &AppId) -> Result<String> {
     let request = builder("DELETE", &format!("/apps/{id}")).body(Full::default())?;
 
-    send_to(endpoint, request).await
+    send_to(operator, Pace::Patient, request).await
 }
 
 /// Ask it to hold a GitHub App an operator registered by hand.
@@ -262,7 +281,7 @@ pub async fn destroy(endpoint: &OperatorEndpoint, id: &AppId) -> Result<String> 
 /// handful of typed fields and three of them are secrets that should not have
 /// to touch a file on the way.
 pub async fn connect_github(
-    endpoint: &OperatorEndpoint,
+    operator: &Operator,
     registration: &GithubRegistration,
 ) -> Result<String> {
     let body = serde_json::to_vec(registration).context("writing the github app registration")?;
@@ -270,7 +289,7 @@ pub async fn connect_github(
         .header(http::header::CONTENT_TYPE, "application/json")
         .body(Full::new(Bytes::from(body)))?;
 
-    send_to(endpoint, request).await
+    send_to(operator, Pace::Patient, request).await
 }
 
 /// Ask it to begin the flow that has GitHub create the app.
@@ -279,16 +298,13 @@ pub async fn connect_github(
 /// over: the app is created by a browser posting a manifest to github.com, and
 /// nothing this side can do that. The command prints the url and exits — it
 /// does not wait, because what it would be waiting on is a person.
-pub async fn register_github(
-    endpoint: &OperatorEndpoint,
-    request: &GithubAppRequest,
-) -> Result<String> {
+pub async fn register_github(operator: &Operator, request: &GithubAppRequest) -> Result<String> {
     let body = serde_json::to_vec(request).context("writing the github app request")?;
     let request = builder("POST", "/connections/github/register")
         .header(http::header::CONTENT_TYPE, "application/json")
         .body(Full::new(Bytes::from(body)))?;
 
-    send_to(endpoint, request).await
+    send_to(operator, Pace::Patient, request).await
 }
 
 /// What GitHub should be asked to create.
@@ -303,33 +319,34 @@ pub struct GithubAppRequest {
 }
 
 /// Ask for the connections it holds.
-pub async fn connections(endpoint: &OperatorEndpoint) -> Result<Vec<wire::ConnectionRow>> {
+pub async fn connections(operator: &Operator) -> Result<Vec<wire::ConnectionRow>> {
     send_json_to(
-        endpoint,
+        operator,
+        Pace::Quick,
         builder("GET", "/connections").body(Full::default())?,
     )
     .await
 }
 
 /// Ask for everything it knows about the connection named `slug`.
-pub async fn connection(endpoint: &OperatorEndpoint, slug: &str) -> Result<wire::Connection> {
+pub async fn connection(operator: &Operator, slug: &str) -> Result<wire::Connection> {
     let request = builder("GET", &format!("/connections/{slug}")).body(Full::default())?;
 
-    send_json_to(endpoint, request).await
+    send_json_to(operator, Pace::Quick, request).await
 }
 
 /// Ask it to forget the connection named `slug`, and everything cached under
 /// it.
-pub async fn forget_connection(endpoint: &OperatorEndpoint, slug: &str) -> Result<String> {
+pub async fn forget_connection(operator: &Operator, slug: &str) -> Result<String> {
     let request = builder("DELETE", &format!("/connections/{slug}")).body(Full::default())?;
 
-    send_to(endpoint, request).await
+    send_to(operator, Pace::Quick, request).await
 }
 
 /// Ask for the users it knows, optionally only those whose slug matches
 /// `pattern`.
 pub async fn auth_user_list(
-    endpoint: &OperatorEndpoint,
+    operator: &Operator,
     pattern: Option<&Pattern>,
 ) -> Result<Vec<wire::UserRow>> {
     // A pattern over slugs is lowercase letters, digits, hyphens and `*`,
@@ -339,7 +356,12 @@ pub async fn auth_user_list(
         None => "/auth/users".to_owned(),
     };
 
-    send_json_to(endpoint, builder("GET", &uri).body(Full::default())?).await
+    send_json_to(
+        operator,
+        Pace::Quick,
+        builder("GET", &uri).body(Full::default())?,
+    )
+    .await
 }
 
 /// Ask it to create a user under `slug`, minting the id it keeps for life.
@@ -349,7 +371,7 @@ pub async fn auth_user_list(
 /// absent address is an empty body. The slug is safe in the path: its alphabet
 /// is the app id's.
 pub async fn auth_user_create(
-    endpoint: &OperatorEndpoint,
+    operator: &Operator,
     slug: &UserSlug,
     email: Option<&str>,
 ) -> Result<String> {
@@ -357,30 +379,30 @@ pub async fn auth_user_create(
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(Full::new(Bytes::from(email.unwrap_or("").to_owned())))?;
 
-    send_to(endpoint, request).await
+    send_to(operator, Pace::Quick, request).await
 }
 
 /// Ask it to suspend the user `user` names — a slug or a user id, and the far
 /// end resolves which. Resolution lives there rather than here because the far
 /// end holds the pool the answer is about.
-pub async fn auth_user_suspend(endpoint: &OperatorEndpoint, user: &UserRef) -> Result<String> {
+pub async fn auth_user_suspend(operator: &Operator, user: &UserRef) -> Result<String> {
     let request = builder("POST", &format!("/auth/users/{user}/suspend")).body(Full::default())?;
 
-    send_to(endpoint, request).await
+    send_to(operator, Pace::Quick, request).await
 }
 
 /// Ask it to let the user `user` names back in.
-pub async fn auth_user_resume(endpoint: &OperatorEndpoint, user: &UserRef) -> Result<String> {
+pub async fn auth_user_resume(operator: &Operator, user: &UserRef) -> Result<String> {
     let request = builder("POST", &format!("/auth/users/{user}/resume")).body(Full::default())?;
 
-    send_to(endpoint, request).await
+    send_to(operator, Pace::Quick, request).await
 }
 
 /// Ask it to drop the user `user` names, keeping only the auth log's memory.
-pub async fn auth_user_drop(endpoint: &OperatorEndpoint, user: &UserRef) -> Result<String> {
+pub async fn auth_user_drop(operator: &Operator, user: &UserRef) -> Result<String> {
     let request = builder("DELETE", &format!("/auth/users/{user}")).body(Full::default())?;
 
-    send_to(endpoint, request).await
+    send_to(operator, Pace::Quick, request).await
 }
 
 /// Ask it to grant `entitlement` to the user `user` names.
@@ -389,7 +411,7 @@ pub async fn auth_user_drop(endpoint: &OperatorEndpoint, user: &UserRef) -> Resu
 /// share one alphabet with nothing a url reserves, a UUID is hex and hyphens,
 /// and the `@` between role and app is an ordinary path character.
 pub async fn auth_grant(
-    endpoint: &OperatorEndpoint,
+    operator: &Operator,
     user: &UserRef,
     entitlement: &RoleAtApp,
 ) -> Result<String> {
@@ -399,7 +421,7 @@ pub async fn auth_grant(
     )
     .body(Full::default())?;
 
-    send_to(endpoint, request).await
+    send_to(operator, Pace::Quick, request).await
 }
 
 /// Ask it to revoke what `scope` names of the user's entitlements — one role
@@ -410,7 +432,7 @@ pub async fn auth_grant(
 /// than a magic value, so nothing an operator could type can accidentally mean
 /// "everything".
 pub async fn auth_revoke(
-    endpoint: &OperatorEndpoint,
+    operator: &Operator,
     user: &UserRef,
     scope: Option<&RevokeScope>,
 ) -> Result<String> {
@@ -419,18 +441,20 @@ pub async fn auth_revoke(
         None => format!("/auth/users/{user}/entitlements"),
     };
 
-    send_to(endpoint, builder("DELETE", &uri).body(Full::default())?).await
+    send_to(
+        operator,
+        Pace::Quick,
+        builder("DELETE", &uri).body(Full::default())?,
+    )
+    .await
 }
 
 /// Ask for the sessions and API keys of the user `user` names — one listing,
 /// told apart by its KIND column.
-pub async fn auth_session_list(
-    endpoint: &OperatorEndpoint,
-    user: &UserRef,
-) -> Result<wire::Sessions> {
+pub async fn auth_session_list(operator: &Operator, user: &UserRef) -> Result<wire::Sessions> {
     let request = builder("GET", &format!("/auth/users/{user}/sessions")).body(Full::default())?;
 
-    send_json_to(endpoint, request).await
+    send_json_to(operator, Pace::Quick, request).await
 }
 
 /// Ask it to mint an API key for the user `user` names, granting exactly
@@ -442,7 +466,7 @@ pub async fn auth_session_list(
 /// a path as a grant's arguments are — one shared alphabet, and an `@` is an
 /// ordinary path character.
 pub async fn auth_api_key_mint(
-    endpoint: &OperatorEndpoint,
+    operator: &Operator,
     user: &UserRef,
     grants: &RoleAtApp,
     expires: Option<&str>,
@@ -452,7 +476,12 @@ pub async fn auth_api_key_mint(
         None => format!("/auth/users/{user}/api-keys/{grants}"),
     };
 
-    send_to(endpoint, builder("POST", &uri).body(Full::default())?).await
+    send_to(
+        operator,
+        Pace::Quick,
+        builder("POST", &uri).body(Full::default())?,
+    )
+    .await
 }
 
 /// Ask it to mint a one-time code for the user `user` names, redeeming into a
@@ -464,7 +493,7 @@ pub async fn auth_api_key_mint(
 /// through — two parsers would be two opinions about what `90m` means. Its
 /// alphabet is digits and letters, which a query string carries as they are.
 pub async fn auth_session_mint(
-    endpoint: &OperatorEndpoint,
+    operator: &Operator,
     user: &UserRef,
     expires: Option<&str>,
 ) -> Result<String> {
@@ -473,7 +502,12 @@ pub async fn auth_session_mint(
         None => format!("/auth/users/{user}/sessions"),
     };
 
-    send_to(endpoint, builder("POST", &uri).body(Full::default())?).await
+    send_to(
+        operator,
+        Pace::Quick,
+        builder("POST", &uri).body(Full::default())?,
+    )
+    .await
 }
 
 /// Ask it to drop one session of the user's, or (`None`) every one they hold.
@@ -482,7 +516,7 @@ pub async fn auth_session_mint(
 /// spells it, so nothing an operator could type can accidentally mean
 /// "everything".
 pub async fn auth_session_drop(
-    endpoint: &OperatorEndpoint,
+    operator: &Operator,
     user: &UserRef,
     session: Option<&SessionId>,
 ) -> Result<String> {
@@ -491,15 +525,20 @@ pub async fn auth_session_drop(
         None => format!("/auth/users/{user}/sessions"),
     };
 
-    send_to(endpoint, builder("DELETE", &uri).body(Full::default())?).await
+    send_to(
+        operator,
+        Pace::Quick,
+        builder("DELETE", &uri).body(Full::default())?,
+    )
+    .await
 }
 
 /// Ask for one user's whole standing: the record, the SSO connection, every
 /// entitlement with its origin, and the apps they actually reach.
-pub async fn auth_audit(endpoint: &OperatorEndpoint, user: &UserRef) -> Result<wire::Audit> {
+pub async fn auth_audit(operator: &Operator, user: &UserRef) -> Result<wire::Audit> {
     let request = builder("GET", &format!("/auth/users/{user}/audit")).body(Full::default())?;
 
-    send_json_to(endpoint, request).await
+    send_json_to(operator, Pace::Quick, request).await
 }
 
 /// A mapping rule on its way to a spaceport: the parts of `spaceport auth
@@ -519,18 +558,18 @@ pub struct MappingAdd {
 
 /// Ask it to add an SSO mapping rule. What comes back names the stable rule
 /// id, which this response is the operator's first sight of.
-pub async fn auth_mapping_add(endpoint: &OperatorEndpoint, add: &MappingAdd) -> Result<String> {
+pub async fn auth_mapping_add(operator: &Operator, add: &MappingAdd) -> Result<String> {
     let body = serde_json::to_vec(add).context("writing the mapping")?;
     let request = builder("POST", "/auth/mappings")
         .header(http::header::CONTENT_TYPE, "application/json")
         .body(Full::new(Bytes::from(body)))?;
 
-    send_to(endpoint, request).await
+    send_to(operator, Pace::Quick, request).await
 }
 
 /// Ask for the mapping rules it holds, optionally only those about one app.
 pub async fn auth_mapping_list(
-    endpoint: &OperatorEndpoint,
+    operator: &Operator,
     app: Option<&AppId>,
 ) -> Result<Vec<wire::MappingRow>> {
     // An app id is the shared lowercase alphabet, which a query string
@@ -540,16 +579,21 @@ pub async fn auth_mapping_list(
         None => "/auth/mappings".to_owned(),
     };
 
-    send_json_to(endpoint, builder("GET", &uri).body(Full::default())?).await
+    send_json_to(
+        operator,
+        Pace::Quick,
+        builder("GET", &uri).body(Full::default())?,
+    )
+    .await
 }
 
 /// Ask it to replay every mapping against the attributes stored from the
 /// user's last IdP login — a dry run that changes nothing at the far end.
-pub async fn auth_mapping_test(endpoint: &OperatorEndpoint, user: &UserRef) -> Result<String> {
+pub async fn auth_mapping_test(operator: &Operator, user: &UserRef) -> Result<String> {
     let request =
         builder("GET", &format!("/auth/users/{user}/mapping-test")).body(Full::default())?;
 
-    send_to(endpoint, request).await
+    send_to(operator, Pace::Quick, request).await
 }
 
 /// Ask it to drop the mapping rule `rule` names, and with it every
@@ -559,7 +603,7 @@ pub async fn auth_mapping_test(endpoint: &OperatorEndpoint, user: &UserRef) -> R
 /// is hex and hyphens, and anything else could carry a character the URI
 /// would swallow — the far end would then 404 about a string the operator
 /// never typed.
-pub async fn auth_mapping_drop(endpoint: &OperatorEndpoint, rule: &str) -> Result<String> {
+pub async fn auth_mapping_drop(operator: &Operator, rule: &str) -> Result<String> {
     if rule.is_empty()
         || !rule
             .bytes()
@@ -571,37 +615,39 @@ pub async fn auth_mapping_drop(endpoint: &OperatorEndpoint, rule: &str) -> Resul
     }
     let request = builder("DELETE", &format!("/auth/mappings/{rule}")).body(Full::default())?;
 
-    send_to(endpoint, request).await
+    send_to(operator, Pace::Quick, request).await
 }
 
 /// Ask it to rotate the JWT signing key now — the compromise-response lever;
 /// the ninety-day clock rotates on its own.
-pub async fn auth_key_rotate(endpoint: &OperatorEndpoint) -> Result<String> {
+pub async fn auth_key_rotate(operator: &Operator) -> Result<String> {
     let request = builder("POST", "/auth/keys/rotate").body(Full::default())?;
 
-    send_to(endpoint, request).await
+    send_to(operator, Pace::Quick, request).await
 }
 
 /// Ask for the signing keys still in the store: the current one, and any
 /// retired key the JWKS is still serving out its grace.
-pub async fn auth_key_list(endpoint: &OperatorEndpoint) -> Result<Vec<wire::SigningKeyRow>> {
+pub async fn auth_key_list(operator: &Operator) -> Result<Vec<wire::SigningKeyRow>> {
     let request = builder("GET", "/auth/keys").body(Full::default())?;
 
-    send_json_to(endpoint, request).await
+    send_json_to(operator, Pace::Quick, request).await
 }
 
 /// Ask for the auth event log, optionally only what happened to one user.
-pub async fn auth_log(
-    endpoint: &OperatorEndpoint,
-    user: Option<&UserId>,
-) -> Result<Vec<wire::LogRow>> {
+pub async fn auth_log(operator: &Operator, user: Option<&UserId>) -> Result<Vec<wire::LogRow>> {
     // A user id is hex and hyphens, which a query string carries as they are.
     let uri = match user {
         Some(user) => format!("/auth/log?user={user}"),
         None => "/auth/log".to_owned(),
     };
 
-    send_json_to(endpoint, builder("GET", &uri).body(Full::default())?).await
+    send_json_to(
+        operator,
+        Pace::Quick,
+        builder("GET", &uri).body(Full::default())?,
+    )
+    .await
 }
 
 /// A GitHub App registration on its way to a spaceport.
@@ -671,12 +717,16 @@ impl Watch {
 /// down, and otherwise not at all. A caller that wants to stop before then
 /// drops the future.
 pub async fn stream(
-    endpoint: &OperatorEndpoint,
+    operator: &Operator,
     watch: &Watch,
     mut on_event: impl FnMut(Event),
 ) -> Result<()> {
+    // The deadline covers getting connected and hearing the response head, and
+    // stops there: reaching a spaceport is as quick here as anywhere. One clock
+    // across both phases, as everywhere else.
+    let deadline = Deadline::starting_now(Pace::Quick.deadline(operator));
     let request = builder("GET", &format!("/events{}", watch.query())).body(Full::default())?;
-    let mut response = send_request(connect(endpoint).await?, request).await?;
+    let mut response = send_request(connect(operator, deadline).await?, request, deadline).await?;
 
     let status = response.status();
     if !status.is_success() {
@@ -684,6 +734,11 @@ pub async fn stream(
         bail!("{}", String::from_utf8_lossy(&body).trim_end());
     }
 
+    // Deliberately unbounded, and it must stay that way: the server sends no
+    // keep-alive on `/events`, so an idle spaceport sends zero bytes for as
+    // long as nothing happens. Any deadline on this loop would kill a stream
+    // that is working perfectly, on the grounds that nothing was going wrong.
+    //
     // Lines, not frames: what arrives is whatever the network chose to deliver,
     // and one read can hold half an event or three of them.
     let mut pending = Vec::new();
@@ -727,19 +782,153 @@ trait Transport: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Transport for T {}
 
+/// How long a call is willing to wait, which depends on what it asked for.
+///
+/// The two tiers are [`super::PATIENT_MULTIPLE`]'s subject: an ordinary route
+/// answers from state, while an apply or a github command is work the far end
+/// does while the operator waits.
+#[derive(Debug, Clone, Copy)]
+enum Pace {
+    Quick,
+    Patient,
+}
+
+impl Pace {
+    /// What this pace comes to for `operator`, whose `timeout` is the quick
+    /// tier by definition and the patient tier by multiplication.
+    ///
+    /// [`Duration::ZERO`] survives the multiplication as itself, which is the
+    /// escape hatch behaving the same at both tiers.
+    fn deadline(self, operator: &Operator) -> Duration {
+        match self {
+            Self::Quick => operator.timeout,
+            Self::Patient => operator.timeout * PATIENT_MULTIPLE,
+        }
+    }
+}
+
+/// One budget spanning a whole request, from the first connect to the last
+/// byte of the body.
+///
+/// A request is several waits in a row — connecting, the http handshake, the
+/// response head, then the body — and the budget belongs to the request rather
+/// than to any of them. Handing each phase the full number would let a far end
+/// that stalls a little at every step take several times the deadline the
+/// operator set, and the whole point of the number is that they can predict it.
+///
+/// So the clock starts once and every phase races what is left of it.
+#[derive(Debug, Clone, Copy)]
+struct Deadline {
+    /// What was in force, kept for the message: [`Instant`] arithmetic would
+    /// otherwise report whatever fraction happened to be left when it ran out.
+    budget: Duration,
+    /// When the budget runs out, or `None` for the operator who asked for no
+    /// deadline at all.
+    until: Option<Instant>,
+}
+
+impl Deadline {
+    /// Start the clock. Called once per request, never per phase.
+    fn starting_now(budget: Duration) -> Self {
+        Self {
+            budget,
+            until: (!budget.is_zero()).then(|| Instant::now() + budget),
+        }
+    }
+
+    /// What is left, in the form [`within`] reads.
+    ///
+    /// An exhausted budget comes back as the smallest non-zero duration rather
+    /// than as zero, because zero is how "no deadline" is spelled and a request
+    /// that has run out of time is the one case that must not be granted it.
+    fn remaining(self) -> Duration {
+        match self.until {
+            None => Duration::ZERO,
+            Some(until) => until
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_nanos(1)),
+        }
+    }
+
+    /// The number to quote at whoever set it.
+    fn budget(self) -> Duration {
+        self.budget
+    }
+}
+
+/// Run `work` under `deadline`, calling `elapsed` for the message if it runs
+/// out.
+///
+/// A `deadline` of [`Duration::ZERO`] is not a deadline of no time at all — it
+/// is no deadline, and `work` is awaited for however long it takes.
+///
+/// The failure is the timeout's own and nothing to do with what `work` was
+/// trying to say, so `work`'s own result comes back untouched inside.
+async fn within<T>(
+    deadline: Duration,
+    elapsed: impl FnOnce() -> String,
+    work: impl Future<Output = T>,
+) -> Result<T> {
+    if deadline.is_zero() {
+        return Ok(work.await);
+    }
+
+    match tokio::time::timeout(deadline, work).await {
+        Ok(done) => Ok(done),
+        Err(_) => Err(anyhow!(elapsed())),
+    }
+}
+
+/// What to say when the far end took the request and never answered.
+///
+/// It names the deadline that was actually in force, not the one that was
+/// configured: a patient command is ten times the number the operator set, and
+/// telling them `30s` when they waited five minutes would be a lie.
+fn no_answer_within(deadline: Duration) -> String {
+    format!(
+        "spaceport did not answer within {} — it may still be working; set `SPACEPORT_TIMEOUT` higher (`SPACEPORT_TIMEOUT=2m`) to wait longer",
+        spelled(deadline),
+    )
+}
+
+/// A duration as an operator would have typed it, so that what comes back is
+/// something they can put straight back into `SPACEPORT_TIMEOUT`.
+fn spelled(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    match millis {
+        _ if millis.is_multiple_of(3_600_000) => format!("{}h", millis / 3_600_000),
+        _ if millis.is_multiple_of(60_000) => format!("{}m", millis / 60_000),
+        _ if millis.is_multiple_of(1_000) => format!("{}s", millis / 1_000),
+        _ => format!("{millis}ms"),
+    }
+}
+
 /// Make the one connection a request needs, over whichever transport the
 /// endpoint names.
-async fn connect(endpoint: &OperatorEndpoint) -> Result<Box<dyn Transport>> {
-    Ok(match endpoint {
+///
+/// A connection that times out is reported as one that was refused. The
+/// distinction between nothing listening and something listening that never
+/// accepts is real, and it is not the concern of the person who typed the
+/// command: either way no spaceport is answering there.
+async fn connect(operator: &Operator, deadline: Deadline) -> Result<Box<dyn Transport>> {
+    Ok(match &operator.endpoint {
         OperatorEndpoint::Unix(path) => Box::new(
-            UnixStream::connect(path)
-                .await
-                .with_context(|| unreachable_at(path))?,
+            within(
+                deadline.remaining(),
+                || unreachable_at(path),
+                UnixStream::connect(path),
+            )
+            .await?
+            .with_context(|| unreachable_at(path))?,
         ),
         OperatorEndpoint::Tcp(addr) => Box::new(
-            TcpStream::connect(addr)
-                .await
-                .with_context(|| format!("no spaceport is listening on {addr}"))?,
+            within(
+                deadline.remaining(),
+                || unreachable_on(addr),
+                TcpStream::connect(addr),
+            )
+            .await?
+            .with_context(|| unreachable_on(addr))?,
         ),
     })
 }
@@ -752,31 +941,60 @@ fn unreachable_at(path: &Path) -> String {
     )
 }
 
+fn unreachable_on(addr: &SocketAddr) -> String {
+    format!("no spaceport is listening on {addr}")
+}
+
 /// Send `request` and hand back the response with its body still coming: a
 /// command collects it, a stream reads it for as long as it lasts.
+///
+/// The handshake and the response head are both under `deadline`; the body is
+/// the caller's, because how long a body may take is what the caller is for.
 async fn send_request(
     stream: Box<dyn Transport>,
     request: Request<Full<Bytes>>,
+    deadline: Deadline,
 ) -> Result<http::Response<hyper::body::Incoming>> {
-    let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
-        .await
-        .context("speaking http to the operator interface")?;
+    let (mut sender, connection) = within(
+        deadline.remaining(),
+        || no_answer_within(deadline.budget()),
+        http1::handshake(TokioIo::new(stream)),
+    )
+    .await?
+    .context("speaking http to the operator interface")?;
 
     // The connection has to be driven for the request to make progress, and it
     // finishes on its own once the response is done with.
+    //
+    // It outlives a future that times out, since nothing here cancels it. That
+    // costs nothing where this is used — the CLI makes one request per process
+    // and then exits — but it is not a seam a long-lived caller should reuse
+    // without giving the driver something to be cancelled by.
     tokio::spawn(connection);
 
-    sender
-        .send_request(request)
-        .await
-        .context("sending the request to the operator interface")
+    within(
+        deadline.remaining(),
+        || no_answer_within(deadline.budget()),
+        sender.send_request(request),
+    )
+    .await?
+    .context("sending the request to the operator interface")
 }
 
-async fn send_to(endpoint: &OperatorEndpoint, request: Request<Full<Bytes>>) -> Result<String> {
-    let response = send_request(connect(endpoint).await?, request).await?;
+async fn send_to(operator: &Operator, pace: Pace, request: Request<Full<Bytes>>) -> Result<String> {
+    // One clock for the whole call: connecting, the head and the body share it
+    // rather than each starting it again.
+    let deadline = Deadline::starting_now(pace.deadline(operator));
+    let response = send_request(connect(operator, deadline).await?, request, deadline).await?;
 
     let status = response.status();
-    let body = response.into_body().collect().await?.to_bytes();
+    let body = within(
+        deadline.remaining(),
+        || no_answer_within(deadline.budget()),
+        response.into_body().collect(),
+    )
+    .await??
+    .to_bytes();
     let body = String::from_utf8_lossy(&body).into_owned();
 
     if !status.is_success() {
@@ -799,7 +1017,8 @@ async fn send_to(endpoint: &OperatorEndpoint, request: Request<Full<Bytes>>) -> 
 /// the request was framed — so the failure path is [`send_to`]'s exactly: the
 /// body is the message.
 async fn send_json_to<T: DeserializeOwned>(
-    endpoint: &OperatorEndpoint,
+    operator: &Operator,
+    pace: Pace,
     mut request: Request<Full<Bytes>>,
 ) -> Result<T> {
     request.headers_mut().insert(
@@ -807,8 +1026,271 @@ async fn send_json_to<T: DeserializeOwned>(
         http::HeaderValue::from_static(wire::JSON),
     );
 
-    let body = send_to(endpoint, request).await?;
+    let body = send_to(operator, pace, request).await?;
 
     serde_json::from_str(&body)
         .context("the operator interface sent something this version cannot read")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
+
+    use super::*;
+    use crate::operator::DEFAULT_TIMEOUT;
+
+    /// A spaceport reached over TCP, waiting `timeout` for a quick answer.
+    fn operator_on(addr: SocketAddr, timeout: Duration) -> Operator {
+        Operator {
+            endpoint: OperatorEndpoint::Tcp(addr),
+            timeout,
+        }
+    }
+
+    /// A far end that accepts the connection and then says nothing at all.
+    ///
+    /// The case a deadline exists for, and the only one the transport cannot
+    /// report on its own: a spaceport that is gone refuses the connection at
+    /// once, while one that has wedged looks from here exactly like one that is
+    /// thinking.
+    ///
+    /// The handle comes back so the test holds the listener — and the accepted
+    /// connections — open for its whole length. Dropping either would turn the
+    /// silence into a refusal and prove nothing about the clock.
+    async fn a_silent_spaceport() -> (SocketAddr, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                accepted.push(stream);
+            }
+        });
+
+        (addr, held)
+    }
+
+    /// A far end that takes `delay` to answer, and then answers `body` — an
+    /// apply waiting on a container that is slow to become healthy.
+    async fn a_spaceport_that_answers_after(
+        delay: Duration,
+        body: &'static str,
+    ) -> (SocketAddr, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    // One read is the whole request here: every call under test
+                    // sends a head and at most a few bytes of body, which
+                    // arrive together.
+                    let _ = stream.read(&mut [0_u8; 1024]).await;
+                    tokio::time::sleep(delay).await;
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                                body.len(),
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        (addr, held)
+    }
+
+    /// A far end that answers `/events` and then streams nothing: an idle
+    /// spaceport, which sends no keep-alive and so is byte for byte
+    /// indistinguishable on the wire from one that has hung.
+    async fn a_spaceport_that_streams_nothing() -> (SocketAddr, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let _ = stream.read(&mut [0_u8; 1024]).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\n\r\n",
+                    )
+                    .await;
+                // And not one byte more, for the rest of the test.
+                accepted.push(stream);
+            }
+        });
+
+        (addr, held)
+    }
+
+    fn nowhere() -> SocketAddr {
+        "127.0.0.1:9".parse().unwrap()
+    }
+
+    #[test]
+    fn a_quick_call_waits_exactly_what_the_operator_asked_for() {
+        let operator = operator_on(nowhere(), Duration::from_secs(30));
+
+        assert_eq!(Pace::Quick.deadline(&operator), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_patient_call_waits_ten_times_it() {
+        let operator = operator_on(nowhere(), Duration::from_secs(30));
+
+        assert_eq!(Pace::Patient.deadline(&operator), Duration::from_secs(300));
+    }
+
+    /// The escape hatch has to survive the multiplication, or the operator who
+    /// asked for no deadline would get one on every patient command.
+    #[test]
+    fn neither_pace_invents_a_deadline_for_an_operator_who_asked_for_none() {
+        let operator = operator_on(nowhere(), Duration::ZERO);
+
+        assert_eq!(Pace::Quick.deadline(&operator), Duration::ZERO);
+        assert_eq!(Pace::Patient.deadline(&operator), Duration::ZERO);
+    }
+
+    /// What comes back has to be something an operator can put straight back
+    /// into `SPACEPORT_TIMEOUT`, which rules out `300s` and `Duration { .. }`
+    /// alike.
+    #[test]
+    fn spells_a_deadline_the_way_an_operator_would_have_typed_it() {
+        assert_eq!(spelled(DEFAULT_TIMEOUT), "30s");
+        assert_eq!(spelled(DEFAULT_TIMEOUT * PATIENT_MULTIPLE), "5m");
+        assert_eq!(spelled(Duration::from_millis(500)), "500ms");
+        assert_eq!(spelled(Duration::from_secs(3600)), "1h");
+        assert_eq!(spelled(Duration::from_millis(1500)), "1500ms");
+    }
+
+    /// The deadline names itself in the message, because the number in force is
+    /// not always the number that was configured.
+    #[test]
+    fn says_what_to_set_when_nothing_came_back() {
+        let message = no_answer_within(Duration::from_secs(300));
+
+        assert!(message.contains("5m"), "{message}");
+        assert!(message.contains("SPACEPORT_TIMEOUT"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn gives_up_on_a_spaceport_that_takes_the_request_and_never_answers() {
+        let (addr, _held) = a_silent_spaceport().await;
+        let operator = operator_on(addr, Duration::from_millis(100));
+
+        let started = Instant::now();
+        let err = list(&operator, None).await.unwrap_err().to_string();
+        let waited = started.elapsed();
+
+        assert!(err.contains("SPACEPORT_TIMEOUT"), "{err}");
+        assert!(err.contains("100ms"), "{err}");
+        // The clock is what ended this, not the test being slow: the whole
+        // budget was a tenth of a second, and anything near a second means
+        // nothing was enforcing it.
+        assert!(waited < Duration::from_millis(500), "waited {waited:?}");
+    }
+
+    /// A far end that stalls at every phase must not get the budget afresh at
+    /// each one. This one answers the head promptly and then dribbles the body
+    /// forever: connecting, the handshake and the head each cost a little, and
+    /// if every phase started its own clock the call would outlive the number
+    /// the operator set by a multiple of it.
+    #[tokio::test]
+    async fn spends_one_budget_across_the_whole_call_rather_than_one_per_phase() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _held = tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let _ = stream.read(&mut [0_u8; 1024]).await;
+                // Most of the budget spent before the head, so that a clock
+                // starting again for the body would be visibly generous. Then a
+                // head promising a body that never comes.
+                tokio::time::sleep(Duration::from_millis(160)).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n")
+                    .await;
+                accepted.push(stream);
+            }
+        });
+
+        let operator = operator_on(addr, Duration::from_millis(200));
+
+        let started = Instant::now();
+        let err = list(&operator, None).await.unwrap_err().to_string();
+        let waited = started.elapsed();
+
+        assert!(err.contains("SPACEPORT_TIMEOUT"), "{err}");
+        // One budget ends this at ~200ms. A clock restarting for the body would
+        // spend 160ms reaching the head and then grant a further 200ms — ~360ms
+        // — so the bound has to sit between the two rather than merely under
+        // the sum.
+        assert!(waited < Duration::from_millis(280), "waited {waited:?}");
+    }
+
+    /// THE REGRESSION GUARD. `/events` sends nothing while nothing is
+    /// happening, so a spaceport that is working perfectly and one that has
+    /// hung look identical from here — and only one of them should be hung up
+    /// on. Anybody who later puts a uniform deadline over the frame loop breaks
+    /// this test, which is the entire reason it exists.
+    #[tokio::test]
+    async fn a_stream_keeps_waiting_long_after_a_command_would_have_given_up() {
+        let (addr, _held) = a_spaceport_that_streams_nothing().await;
+        let operator = operator_on(addr, Duration::from_millis(50));
+
+        let watching = tokio::time::timeout(
+            Duration::from_millis(300),
+            stream(&operator, &Watch::default(), |_| {
+                unreachable!("the far end sent no events")
+            }),
+        )
+        .await;
+
+        let Err(_still_waiting) = watching else {
+            panic!("the stream returned instead of waiting on events that had not happened yet");
+        };
+    }
+
+    /// The two tiers earning their keep: one server, one deadline, and the
+    /// command that is doing work the operator is waiting on gets to finish.
+    #[tokio::test]
+    async fn a_patient_command_outlasts_what_a_quick_one_is_given() {
+        let (addr, _held) =
+            a_spaceport_that_answers_after(Duration::from_millis(200), "resumed").await;
+        let operator = operator_on(addr, Duration::from_millis(50));
+
+        let quick = list(&operator, None).await;
+        assert!(
+            quick.is_err(),
+            "fifty milliseconds should not have outlasted an answer two hundred away",
+        );
+
+        let patient = resume(&operator, &"web".parse().unwrap()).await.unwrap();
+        assert_eq!(patient, "resumed");
+    }
+
+    /// The operator who knows their apply takes an hour, and would rather watch
+    /// it than argue with a clock.
+    #[tokio::test]
+    async fn a_deadline_of_zero_waits_for_however_long_it_takes() {
+        let (addr, _held) = a_silent_spaceport().await;
+        let operator = operator_on(addr, Duration::ZERO);
+
+        let waiting = tokio::time::timeout(Duration::from_millis(300), list(&operator, None)).await;
+
+        let Err(_still_waiting) = waiting else {
+            panic!("a command with no deadline should not have given up on a silent spaceport");
+        };
+    }
 }

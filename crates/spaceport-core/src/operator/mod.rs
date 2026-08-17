@@ -14,6 +14,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -110,6 +111,39 @@ impl FromStr for OperatorEndpoint {
             .map(Self::Tcp)
             .map_err(|e| anyhow!("`{s}` is neither a unix socket path nor a socket address: {e}"))
     }
+}
+
+/// How long a command waits for an answer before it decides nothing is coming.
+///
+/// Thirty seconds is far longer than any ordinary route takes and far shorter
+/// than a person will sit in front of a terminal wondering.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What the patient tier multiplies a deadline by.
+///
+/// Two tiers exist because two kinds of request live behind one interface.
+/// Ordinary routes read state and answer at once. Apply, deploy, resume and
+/// setting a secret block server-side while the [`crate::app::Applier`] waits
+/// for the new container to become healthy — a wait the manifest spells, and
+/// manifests spell minutes (see [`crate::app::health`]). The github commands
+/// page outbound to github.com, up to five hundred requests deep. A thirty
+/// second deadline on those would not catch a spaceport that has stopped
+/// answering; it would abort work that is succeeding, and leave the operator
+/// with a half-applied app and an error saying nothing happened.
+const PATIENT_MULTIPLE: u32 = 10;
+
+/// A spaceport to talk to, and how long to wait for it.
+///
+/// The two travel together because neither is any use alone: every call in
+/// [`client`] needs an address to reach and a point at which to stop hoping.
+///
+/// A `timeout` of [`Duration::ZERO`] is the escape hatch — no deadline at all,
+/// for the operator who knows their apply takes an hour and would rather watch
+/// it than argue with a clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Operator {
+    pub endpoint: OperatorEndpoint,
+    pub timeout: Duration,
 }
 
 impl fmt::Display for OperatorEndpoint {

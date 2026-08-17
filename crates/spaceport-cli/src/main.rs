@@ -4,6 +4,7 @@ use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -27,7 +28,7 @@ use spaceport_core::connections::github::{self, ConnectionRepository};
 use spaceport_core::events::{self, Category, Event, EventBus, Level};
 use spaceport_core::operator::client::Watch;
 use spaceport_core::operator::{
-    DEFAULT_OPERATOR_ENDPOINT, SecretOutcome, SecretSet, client, server,
+    DEFAULT_OPERATOR_ENDPOINT, DEFAULT_TIMEOUT, Operator, SecretOutcome, SecretSet, client, server,
 };
 use spaceport_core::runtime::DockerRuntime;
 use spaceport_core::secret::Secret;
@@ -47,6 +48,10 @@ const DEFAULT_LOG_FILTER: &str = "spaceport=info,warn";
 
 /// What `spaceport stream` carries, unless this names something else.
 const STREAM_FILTER_VAR: &str = "SPACEPORT_STREAM";
+
+/// How long a command waits for the spaceport it is talking to, unless this
+/// names something else.
+const TIMEOUT_VAR: &str = "SPACEPORT_TIMEOUT";
 
 /// Spaceport's own events, down to debug, and nothing else.
 ///
@@ -956,6 +961,39 @@ struct ServerArgs {
     server: OperatorEndpoint,
 }
 
+impl ServerArgs {
+    /// The spaceport to talk to and how long to wait for it.
+    ///
+    /// The deadline is read from the environment and has no flag, because it is
+    /// not a decision anybody makes per command: it belongs to the shell of an
+    /// operator whose spaceport is far away or slow, and a flag on forty
+    /// subcommands would be forty places to forget it.
+    ///
+    /// A value that is not a duration stops the command before it connects,
+    /// with the parser's own complaint. Falling back to the default would leave
+    /// an operator who set `SPACEPORT_TIMEOUT=300` waiting thirty seconds and
+    /// blaming the server.
+    fn operator(&self) -> Result<Operator> {
+        Ok(Operator {
+            endpoint: self.server.clone(),
+            timeout: timeout_from(std::env::var(TIMEOUT_VAR))?,
+        })
+    }
+}
+
+/// The deadline `SPACEPORT_TIMEOUT` names, taking what [`std::env::var`] said
+/// about it rather than reading it here: the environment is process-wide, and a
+/// test that set the variable would be deciding what every other test in the
+/// binary read.
+fn timeout_from(read: Result<String, std::env::VarError>) -> Result<Duration> {
+    match read {
+        Ok(raw) => spaceport_core::duration::parse(&raw)
+            .with_context(|| format!("reading `{TIMEOUT_VAR}`")),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_TIMEOUT),
+        Err(error) => Err(error).with_context(|| format!("reading `{TIMEOUT_VAR}`")),
+    }
+}
+
 #[derive(Debug, Args)]
 struct ConfigArgs {
     /// Path to the config file.
@@ -1032,7 +1070,7 @@ async fn main() -> Result<()> {
 
 /// Ask a running spaceport what it is, and lay the answer out.
 async fn status(args: StatusArgs, colour: Colour) -> Result<()> {
-    let status = client::status(&args.server.server).await?;
+    let status = client::status(&args.server.operator()?).await?;
 
     if args.json {
         // What arrived, indented rather than reshaped: anything reading this
@@ -1437,7 +1475,13 @@ async fn apply(args: ApplyArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
         render::prose::block(
-            &client::apply(&args.server.server, &args.app_id, manifest, args.suspended).await?,
+            &client::apply(
+                &args.server.operator()?,
+                &args.app_id,
+                manifest,
+                args.suspended
+            )
+            .await?,
             colour
         )
     );
@@ -1446,7 +1490,7 @@ async fn apply(args: ApplyArgs, colour: Colour) -> Result<()> {
 }
 
 async fn list(args: ListArgs, colour: Colour) -> Result<()> {
-    let rows = client::list(&args.server.server, args.pattern.as_ref()).await?;
+    let rows = client::list(&args.server.operator()?, args.pattern.as_ref()).await?;
 
     print!(
         "{}",
@@ -1457,7 +1501,7 @@ async fn list(args: ListArgs, colour: Colour) -> Result<()> {
 }
 
 async fn show(args: ShowArgs, colour: Colour) -> Result<()> {
-    let shown = client::show(&args.server.server, &args.app_id, args.manifest).await?;
+    let shown = client::show(&args.server.operator()?, &args.app_id, args.manifest).await?;
 
     // `--manifest` is the document itself, handed back the way it was applied.
     // It is somebody's file on its way to a pipe or an editor, not a report
@@ -1475,7 +1519,7 @@ async fn track(args: TrackArgs, colour: Colour) -> Result<()> {
         "{}",
         render::prose::block(
             &client::track(
-                &args.server.server,
+                &args.server.operator()?,
                 &args.app_id,
                 &args.repository,
                 &args.connection,
@@ -1495,7 +1539,12 @@ async fn deploy(args: DeployArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
         render::prose::block(
-            &client::deploy(&args.server.server, &args.app_id, args.revision.as_deref()).await?,
+            &client::deploy(
+                &args.server.operator()?,
+                &args.app_id,
+                args.revision.as_deref()
+            )
+            .await?,
             colour
         )
     );
@@ -1507,7 +1556,7 @@ async fn suspend(args: SuspendArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
         render::prose::block(
-            &client::suspend(&args.server.server, &args.app_id, args.stop_container).await?,
+            &client::suspend(&args.server.operator()?, &args.app_id, args.stop_container).await?,
             colour
         )
     );
@@ -1519,7 +1568,7 @@ async fn resume(args: ResumeArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
         render::prose::block(
-            &client::resume(&args.server.server, &args.app_id).await?,
+            &client::resume(&args.server.operator()?, &args.app_id).await?,
             colour
         )
     );
@@ -1538,7 +1587,12 @@ async fn resume(args: ResumeArgs, colour: Colour) -> Result<()> {
 async fn secret_list(args: SecretListArgs) -> Result<()> {
     print!(
         "{}",
-        client::secrets(&args.server.server, &args.app_id, args.pattern.as_ref()).await?
+        client::secrets(
+            &args.server.operator()?,
+            &args.app_id,
+            args.pattern.as_ref()
+        )
+        .await?
     );
 
     Ok(())
@@ -1546,7 +1600,8 @@ async fn secret_list(args: SecretListArgs) -> Result<()> {
 
 async fn secret_set(args: SecretSetArgs) -> Result<()> {
     let value = value_of(&args.value)?;
-    let set = client::set_secret(&args.server.server, &args.app_id, &args.name, &value).await?;
+    let set =
+        client::set_secret(&args.server.operator()?, &args.app_id, &args.name, &value).await?;
 
     println!("{}", set_line(&args.app_id, &args.name, &set));
 
@@ -1557,7 +1612,7 @@ async fn secret_delete(args: SecretDeleteArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
         render::prose::block(
-            &client::delete_secret(&args.server.server, &args.app_id, &args.name).await?,
+            &client::delete_secret(&args.server.operator()?, &args.app_id, &args.name).await?,
             colour
         )
     );
@@ -1566,7 +1621,7 @@ async fn secret_delete(args: SecretDeleteArgs, colour: Colour) -> Result<()> {
 }
 
 async fn user_list(args: UserListArgs, colour: Colour) -> Result<()> {
-    let rows = client::auth_user_list(&args.server.server, args.pattern.as_ref()).await?;
+    let rows = client::auth_user_list(&args.server.operator()?, args.pattern.as_ref()).await?;
 
     print!(
         "{}",
@@ -1580,7 +1635,7 @@ async fn user_create(args: UserCreateArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
         render::prose::block(
-            &client::auth_user_create(&args.server.server, &args.slug, args.email.as_deref())
+            &client::auth_user_create(&args.server.operator()?, &args.slug, args.email.as_deref())
                 .await?,
             colour
         )
@@ -1593,7 +1648,7 @@ async fn user_suspend(args: UserRefArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
         render::prose::block(
-            &client::auth_user_suspend(&args.server.server, &args.user).await?,
+            &client::auth_user_suspend(&args.server.operator()?, &args.user).await?,
             colour
         )
     );
@@ -1605,7 +1660,7 @@ async fn user_resume(args: UserRefArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
         render::prose::block(
-            &client::auth_user_resume(&args.server.server, &args.user).await?,
+            &client::auth_user_resume(&args.server.operator()?, &args.user).await?,
             colour
         )
     );
@@ -1617,7 +1672,7 @@ async fn user_drop(args: UserRefArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
         render::prose::block(
-            &client::auth_user_drop(&args.server.server, &args.user).await?,
+            &client::auth_user_drop(&args.server.operator()?, &args.user).await?,
             colour
         )
     );
@@ -1626,7 +1681,7 @@ async fn user_drop(args: UserRefArgs, colour: Colour) -> Result<()> {
 }
 
 async fn session_list(args: UserRefArgs, colour: Colour) -> Result<()> {
-    let listed = client::auth_session_list(&args.server.server, &args.user).await?;
+    let listed = client::auth_session_list(&args.server.operator()?, &args.user).await?;
 
     print!("{}", render::table::sessions(&listed, colour));
 
@@ -1644,8 +1699,12 @@ async fn session_mint(args: SessionMintArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
         render::prose::block(
-            &client::auth_session_mint(&args.server.server, &args.user, args.expires.as_deref())
-                .await?,
+            &client::auth_session_mint(
+                &args.server.operator()?,
+                &args.user,
+                args.expires.as_deref()
+            )
+            .await?,
             colour
         )
     );
@@ -1665,7 +1724,7 @@ async fn session_api_key(args: SessionApiKeyArgs, colour: Colour) -> Result<()> 
         "{}",
         render::prose::block(
             &client::auth_api_key_mint(
-                &args.server.server,
+                &args.server.operator()?,
                 &args.user,
                 &args.grants,
                 args.expires.as_deref()
@@ -1682,7 +1741,7 @@ async fn session_drop(args: SessionDropArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
         render::prose::block(
-            &client::auth_session_drop(&args.server.server, &args.user, args.session.as_ref())
+            &client::auth_session_drop(&args.server.operator()?, &args.user, args.session.as_ref())
                 .await?,
             colour
         )
@@ -1695,7 +1754,7 @@ async fn grant(args: GrantArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
         render::prose::block(
-            &client::auth_grant(&args.server.server, &args.user, &args.entitlement).await?,
+            &client::auth_grant(&args.server.operator()?, &args.user, &args.entitlement).await?,
             colour
         )
     );
@@ -1709,7 +1768,7 @@ async fn revoke(args: RevokeArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
         render::prose::block(
-            &client::auth_revoke(&args.server.server, &args.user, args.scope.as_ref()).await?,
+            &client::auth_revoke(&args.server.operator()?, &args.user, args.scope.as_ref()).await?,
             colour
         )
     );
@@ -1718,7 +1777,7 @@ async fn revoke(args: RevokeArgs, colour: Colour) -> Result<()> {
 }
 
 async fn audit(args: UserRefArgs, colour: Colour) -> Result<()> {
-    let audited = client::auth_audit(&args.server.server, &args.user).await?;
+    let audited = client::auth_audit(&args.server.operator()?, &args.user).await?;
 
     print!("{}", render::report::audit(&audited, colour));
 
@@ -1726,7 +1785,7 @@ async fn audit(args: UserRefArgs, colour: Colour) -> Result<()> {
 }
 
 async fn mapping_list(args: MappingListArgs, colour: Colour) -> Result<()> {
-    let rows = client::auth_mapping_list(&args.server.server, args.app.as_ref()).await?;
+    let rows = client::auth_mapping_list(&args.server.operator()?, args.app.as_ref()).await?;
 
     print!(
         "{}",
@@ -1746,7 +1805,7 @@ async fn mapping_add(args: MappingAddArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
         render::prose::block(
-            &client::auth_mapping_add(&args.server.server, &add).await?,
+            &client::auth_mapping_add(&args.server.operator()?, &add).await?,
             colour
         )
     );
@@ -1758,7 +1817,7 @@ async fn mapping_test(args: UserRefArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
         render::prose::block(
-            &client::auth_mapping_test(&args.server.server, &args.user).await?,
+            &client::auth_mapping_test(&args.server.operator()?, &args.user).await?,
             colour
         )
     );
@@ -1770,7 +1829,7 @@ async fn mapping_drop(args: MappingDropArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
         render::prose::block(
-            &client::auth_mapping_drop(&args.server.server, &args.rule).await?,
+            &client::auth_mapping_drop(&args.server.operator()?, &args.rule).await?,
             colour
         )
     );
@@ -1779,7 +1838,7 @@ async fn mapping_drop(args: MappingDropArgs, colour: Colour) -> Result<()> {
 }
 
 async fn auth_log(args: AuthLogArgs, colour: Colour) -> Result<()> {
-    let rows = client::auth_log(&args.server.server, args.user.as_ref()).await?;
+    let rows = client::auth_log(&args.server.operator()?, args.user.as_ref()).await?;
 
     print!("{}", render::table::log(&rows, args.user.as_ref(), colour));
 
@@ -1789,14 +1848,17 @@ async fn auth_log(args: AuthLogArgs, colour: Colour) -> Result<()> {
 async fn auth_key_rotate(args: KeyServerArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
-        render::prose::block(&client::auth_key_rotate(&args.server.server).await?, colour)
+        render::prose::block(
+            &client::auth_key_rotate(&args.server.operator()?).await?,
+            colour
+        )
     );
 
     Ok(())
 }
 
 async fn auth_key_list(args: KeyServerArgs, colour: Colour) -> Result<()> {
-    let rows = client::auth_key_list(&args.server.server).await?;
+    let rows = client::auth_key_list(&args.server.operator()?).await?;
 
     print!("{}", render::table::keys(&rows, colour));
 
@@ -1921,8 +1983,10 @@ async fn stream(args: StreamArgs, colour: Colour) -> Result<()> {
         }
     };
 
+    let operator = args.server.operator()?;
+
     tokio::select! {
-        result = client::stream(&args.server.server, &watch, print) => result,
+        result = client::stream(&operator, &watch, print) => result,
         _ = tokio::signal::ctrl_c() => Ok(()),
     }
 }
@@ -1942,7 +2006,7 @@ async fn connect_github(args: ConnectGithubArgs, colour: Colour) -> Result<()> {
         print!(
             "{}",
             render::prose::block(
-                &client::register_github(&args.server.server, &request).await?,
+                &client::register_github(&args.server.operator()?, &request).await?,
                 colour
             )
         );
@@ -1973,7 +2037,7 @@ async fn connect_github(args: ConnectGithubArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
         render::prose::block(
-            &client::connect_github(&args.server.server, &registration).await?,
+            &client::connect_github(&args.server.operator()?, &registration).await?,
             colour
         )
     );
@@ -1991,7 +2055,7 @@ fn required<T>(value: Option<T>, flag: &str) -> Result<T> {
 }
 
 async fn connections(args: ConnectListArgs, colour: Colour) -> Result<()> {
-    let rows = client::connections(&args.server.server).await?;
+    let rows = client::connections(&args.server.operator()?).await?;
 
     print!("{}", render::table::connections(&rows, colour));
 
@@ -1999,7 +2063,7 @@ async fn connections(args: ConnectListArgs, colour: Colour) -> Result<()> {
 }
 
 async fn connection(args: ConnectShowArgs, colour: Colour) -> Result<()> {
-    let shown = client::connection(&args.server.server, &args.slug).await?;
+    let shown = client::connection(&args.server.operator()?, &args.slug).await?;
 
     print!("{}", render::report::connection(&shown, colour));
 
@@ -2010,7 +2074,7 @@ async fn forget_connection(args: ConnectForgetArgs, colour: Colour) -> Result<()
     print!(
         "{}",
         render::prose::block(
-            &client::forget_connection(&args.server.server, &args.slug).await?,
+            &client::forget_connection(&args.server.operator()?, &args.slug).await?,
             colour
         )
     );
@@ -2022,7 +2086,7 @@ async fn destroy(args: DestroyArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
         render::prose::block(
-            &client::destroy(&args.server.server, &args.app_id).await?,
+            &client::destroy(&args.server.operator()?, &args.app_id).await?,
             colour
         )
     );
@@ -2227,5 +2291,36 @@ mod tests {
             )
             .contains("replaced for app")
         );
+    }
+
+    /// The shell nobody has touched, which is every operator on their own
+    /// machine.
+    #[test]
+    fn waits_the_default_when_nothing_says_otherwise() {
+        assert_eq!(
+            timeout_from(Err(std::env::VarError::NotPresent)).unwrap(),
+            DEFAULT_TIMEOUT,
+        );
+    }
+
+    /// The operator whose spaceport is across an ocean, spelling the wait the
+    /// way every other duration in this system is spelled.
+    #[test]
+    fn waits_as_long_as_the_environment_says() {
+        assert_eq!(
+            timeout_from(Ok("2m".to_owned())).unwrap(),
+            Duration::from_secs(120),
+        );
+    }
+
+    /// A bare number is refused rather than quietly replaced by the default:
+    /// an operator who set `SPACEPORT_TIMEOUT=30` meaning five minutes would
+    /// otherwise wait thirty seconds and blame the server.
+    #[test]
+    fn refuses_a_deadline_that_does_not_say_what_unit_it_is_in() {
+        let err = timeout_from(Ok("30".to_owned())).unwrap_err();
+
+        assert!(format!("{:#}", err).contains("needs a unit"), "{err:#}",);
+        assert!(format!("{err:#}").contains(TIMEOUT_VAR), "{err:#}");
     }
 }
