@@ -457,7 +457,13 @@ impl EventQuery {
     }
 }
 
-/// `GET /apps?pattern=…`: what is running, as a table.
+/// `GET /apps?pattern=…`: what spaceport has, as a table.
+///
+/// Every app spaceport knows a name for, whether or not it is serving: an app
+/// that is down is the one an operator is most urgently asking after, and
+/// answering that there is nothing here for a host full of broken ones is the
+/// worst possible reading of the question. The status column carries the
+/// difference.
 ///
 /// An app that is only tracked is listed with the rest, under a status of its
 /// own. Leaving it out would mean `spaceport apps track` accepting a name and
@@ -486,10 +492,17 @@ async fn list(State(instance): State<Arc<Instance>>, Query(query): Query<ListQue
         .into_iter()
         .filter(|app| matches(&app.id))
         .collect();
+    let down: Vec<_> = store
+        .down_apps()
+        .into_iter()
+        .filter(|app| matches(&app.id))
+        .collect();
 
-    // Suspended apps are listed with the rest, in with them rather than after:
-    // an operator asking what spaceport has wants the whole answer, and the
-    // status column is where the difference belongs.
+    // Suspended and down apps are listed with the rest, in with them rather
+    // than after: an operator asking what spaceport has wants the whole answer,
+    // and the status column is where the difference belongs. Why an app is down
+    // is not in here — a reason is a sentence and this is a column — and is one
+    // `spaceport apps show` away.
     let mut rows: Vec<Listed> = running
         .iter()
         .zip(statuses(&running).await)
@@ -505,13 +518,23 @@ async fn list(State(instance): State<Arc<Instance>>, Query(query): Query<ListQue
             status: "suspended",
             hosts: app.hosts().to_vec(),
         }))
+        .chain(down.iter().map(|app| Listed {
+            id: app.id.clone(),
+            source: app.manifest.source.to_string(),
+            status: DOWN,
+            hosts: app.hosts().to_vec(),
+        }))
         .collect();
+    rows.extend(recorded_only(&instance, &matches).await);
     rows.extend(tracked_only(&instance, &matches).await);
 
     if rows.is_empty() {
         let body = match &pattern {
             Some(pattern) => format!("no app matches `{pattern}`\n"),
-            None => "no apps are running\n".to_owned(),
+            // Not "nothing is running": an empty table here means spaceport has
+            // no app under any name at all, running or otherwise, and now that
+            // the down ones are listed the difference is worth the words.
+            None => "spaceport has no apps\n".to_owned(),
         };
 
         return (StatusCode::OK, body).into_response();
@@ -521,6 +544,81 @@ async fn list(State(instance): State<Arc<Instance>>, Query(query): Query<ListQue
 
     (StatusCode::OK, table(&rows)).into_response()
 }
+
+/// The apps that are recorded and that the store is not holding at all, as
+/// listing lines.
+///
+/// The hole this fills is an app spaceport was told to run and never got as far
+/// as failing to start: one whose recorded manifest this version cannot read,
+/// which reconciliation leaves out of the store entirely, and one whose hosts
+/// another app had taken by the time it tried to claim them. Without this they
+/// are in no listing at all — `spaceport apps list` says there is nothing here
+/// while the log says an app was left down, which is the one answer an operator
+/// cannot act on.
+///
+/// A manifest that will not parse costs the line its source and its hosts and
+/// nothing else: the name is what an operator needs to go and ask
+/// `spaceport apps show` about it, and guessing at the rest of a document this
+/// version does not understand would be inventing it.
+///
+/// A store that will not answer costs these apps their lines rather than the
+/// whole listing, for the same reason as the tracked ones below.
+async fn recorded_only(instance: &Instance, matches: &impl Fn(&AppId) -> bool) -> Vec<Listed> {
+    let store = instance.applier.store();
+    let recorded = AppRepository::new(instance.db.clone())
+        .desired()
+        .await
+        .unwrap_or_default();
+
+    recorded
+        .into_iter()
+        .filter(|record| matches(&record.id))
+        .filter(|record| {
+            store.get(&record.id).is_none()
+                && store.suspended(&record.id).is_none()
+                && store.downed(&record.id).is_none()
+        })
+        .map(|record| match AppManifest::parse(&record.manifest) {
+            Ok(manifest) => Listed {
+                id: record.id,
+                source: manifest.source.to_string(),
+                status: NOT_RUNNING,
+                hosts: manifest.routing.hosts.clone(),
+            },
+            Err(_) => Listed {
+                id: record.id,
+                source: UNREADABLE_SOURCE.to_owned(),
+                status: UNREADABLE,
+                hosts: Vec::new(),
+            },
+        })
+        .collect()
+}
+
+/// What an app that spaceport is not running is called in the status column.
+///
+/// The same word for one whose container died and one that never started: from
+/// where an operator sits those are the same thing — the app is not serving —
+/// and the difference is a sentence, which `spaceport apps show` has room for
+/// and a column does not.
+const DOWN: &str = "down";
+
+/// What an app is called that is recorded, is claiming nothing, and is not
+/// running — the word `spaceport apps show` already uses for it.
+///
+/// Apart from `down` because a down app holds its hosts and is being tried
+/// again, and this one is in the store's hands not at all.
+const NOT_RUNNING: &str = "not running";
+
+/// And what one is called whose recorded manifest this spaceport cannot read.
+///
+/// Apart from `down` because the remedy is: no restart will fix it, and the
+/// version of spaceport that wrote the manifest is the thing to go and look at.
+const UNREADABLE: &str = "unreadable";
+
+/// The source column for that app, which cannot be read out of a manifest that
+/// would not parse.
+const UNREADABLE_SOURCE: &str = "unknown";
 
 /// The apps that are tracked and have no manifest applied, as listing lines.
 ///
@@ -5512,6 +5610,108 @@ container:
         assert!(lines[2].ends_with("beta.test"), "{body}");
     }
 
+    /// An app whose container has gone is still an app, and the listing is
+    /// where an operator looks first when a site stops answering. Leaving it
+    /// out would have `spaceport apps list` deny there is an app by that name
+    /// at exactly the moment somebody is asking about it.
+    #[tokio::test]
+    async fn lists_an_app_that_is_down_with_the_rest() {
+        let (store, router) = store_and_router();
+        put_app(&router, "hello", MANIFEST).await;
+        put_app(&router, "other", &manifest_for("beta.test")).await;
+        store.take_down(&app_id("hello"), "the container exited");
+
+        let (status, body) = get_apps(&router, "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(lines[1].starts_with("hello"), "{body}");
+        assert!(lines[1].contains("down"), "{body}");
+        // With everything it was applied with: its source is still its source,
+        // and the hosts are still claimed for it.
+        assert!(
+            lines[1].contains("image strm/helloworld-http:latest"),
+            "{body}"
+        );
+        assert!(lines[1].ends_with("alpha.test"), "{body}");
+        assert!(lines[2].starts_with("other"), "{body}");
+    }
+
+    /// And it is listed even when it is the only app there is — the report an
+    /// operator gets on a host where nothing came back up.
+    #[tokio::test]
+    async fn a_down_app_is_not_nothing() {
+        let (store, router) = store_and_router();
+        put_app(&router, "hello", MANIFEST).await;
+        store.take_down(&app_id("hello"), "the container exited");
+
+        let (_, body) = get_apps(&router, "").await;
+
+        assert!(body.starts_with("APP"), "{body}");
+        assert!(body.contains("hello"), "{body}");
+    }
+
+    /// The app reconciliation could not read at startup: recorded, not in the
+    /// store at all, and previously in no listing anywhere. The name is the
+    /// whole point — it is what an operator needs to go and ask
+    /// `spaceport apps show` why.
+    #[tokio::test]
+    async fn lists_an_app_whose_recorded_manifest_cannot_be_read() {
+        let ((_, router, ..), db, _) = parts_with_state(OneContainer::default(), CONFIG);
+        AppRepository::new(db)
+            .record_applied(&app_id("echo"), "schema_version: 99\n", None, false)
+            .await
+            .unwrap();
+
+        let (status, body) = get_apps(&router, "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(lines[1].starts_with("echo"), "{body}");
+        assert!(lines[1].contains("unreadable"), "{body}");
+    }
+
+    /// A record the store is not holding for any other reason — its hosts were
+    /// taken by the time it tried to claim them, say — is listed too, and as
+    /// what `spaceport apps show` already calls it.
+    #[tokio::test]
+    async fn lists_a_recorded_app_the_store_is_not_holding() {
+        let ((_, router, ..), db, _) = parts_with_state(OneContainer::default(), CONFIG);
+        AppRepository::new(db)
+            .record_applied(&app_id("echo"), MANIFEST, None, false)
+            .await
+            .unwrap();
+
+        let (_, body) = get_apps(&router, "").await;
+
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(lines[1].starts_with("echo"), "{body}");
+        assert!(lines[1].contains("not running"), "{body}");
+        assert!(
+            lines[1].contains("image strm/helloworld-http:latest"),
+            "{body}"
+        );
+        assert!(lines[1].ends_with("alpha.test"), "{body}");
+    }
+
+    /// And an app that *is* held is listed once, from the store, rather than a
+    /// second time from the record behind it.
+    #[tokio::test]
+    async fn does_not_list_a_running_app_twice() {
+        let (_, router) = store_and_router();
+        put_app(&router, "hello", MANIFEST).await;
+
+        let (_, body) = get_apps(&router, "").await;
+
+        assert_eq!(
+            body.lines()
+                .filter(|line| line.starts_with("hello"))
+                .count(),
+            1,
+            "{body}"
+        );
+    }
+
     /// Columns only pay for themselves if they line up.
     #[tokio::test]
     async fn lines_the_columns_up() {
@@ -5532,13 +5732,13 @@ container:
     }
 
     #[tokio::test]
-    async fn says_when_nothing_is_running() {
+    async fn says_when_there_is_nothing_at_all() {
         let (_, router) = store_and_router();
 
         let (status, body) = get_apps(&router, "").await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, "no apps are running\n");
+        assert_eq!(body, "spaceport has no apps\n");
     }
 
     #[tokio::test]
