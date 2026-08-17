@@ -387,11 +387,7 @@ impl Links {
 
     /// The recorded link at exactly `path`, if there is one.
     fn holds<S: AsRef<str>>(&self, path: &[S]) -> Option<&str> {
-        let joined = path
-            .iter()
-            .map(AsRef::as_ref)
-            .collect::<Vec<_>>()
-            .join("/");
+        let joined = path.iter().map(AsRef::as_ref).collect::<Vec<_>>().join("/");
 
         self.0.get(&joined).map(String::as_str)
     }
