@@ -25,7 +25,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use super::{OperatorEndpoint, SecretOutcome, SecretSet};
+use super::{OperatorEndpoint, SecretOutcome, SecretSet, wire};
 use crate::app::apply::{Applied, Applier, ApplyError, DestroyError, ResumeError, SuspendError};
 use crate::app::manifest::VarName;
 use crate::app::secrets::Set;
@@ -33,8 +33,8 @@ use crate::app::{App, AppId, AppManifest, AppRecord, AppRepository, DataDir, Pat
 use crate::auth::{
     AuthLogRepository, Condition, EntitlementError, EntitlementRepository, Granted,
     IdentityRepository, JwtSigner, MappingError, MappingRepository, RevokeScope, Revoked, Role,
-    RoleAtApp, RolesAtApp, SessionError, SessionId, SessionRepository, UserError, UserId,
-    UserRecord, UserRef, UserRepository, evaluate,
+    RoleAtApp, RolesAtApp, SessionError, SessionId, SessionRepository, UserError, UserId, UserRef,
+    UserRepository, evaluate,
 };
 use crate::build::repository::{Build, BuildRepository, BuildState};
 use crate::connections::github::{
@@ -469,7 +469,11 @@ impl EventQuery {
 /// own. Leaving it out would mean `spaceport apps track` accepting a name and
 /// this then denying there is an app by it — and the name is the one thing an
 /// operator has to go on until a manifest arrives.
-async fn list(State(instance): State<Arc<Instance>>, Query(query): Query<ListQuery>) -> Response {
+async fn list(
+    State(instance): State<Arc<Instance>>,
+    Query(query): Query<ListQuery>,
+    headers: http::HeaderMap,
+) -> Response {
     let pattern = match query
         .pattern
         .as_deref()
@@ -503,30 +507,38 @@ async fn list(State(instance): State<Arc<Instance>>, Query(query): Query<ListQue
     // and the status column is where the difference belongs. Why an app is down
     // is not in here — a reason is a sentence and this is a column — and is one
     // `spaceport apps show` away.
-    let mut rows: Vec<Listed> = running
+    let mut rows: Vec<wire::AppRow> = running
         .iter()
         .zip(statuses(&running).await)
-        .map(|(app, status)| Listed {
+        .map(|(app, state)| wire::AppRow {
             id: app.id.clone(),
             source: app.manifest.source.to_string(),
-            status,
-            hosts: app.hosts().to_vec(),
+            state,
+            hosts: hostnames(app.hosts()),
         })
-        .chain(suspended.iter().map(|app| Listed {
+        .chain(suspended.iter().map(|app| wire::AppRow {
             id: app.id.clone(),
             source: app.manifest.source.to_string(),
-            status: "suspended",
-            hosts: app.hosts().to_vec(),
+            state: wire::AppState::Suspended,
+            hosts: hostnames(app.hosts()),
         }))
-        .chain(down.iter().map(|app| Listed {
+        .chain(down.iter().map(|app| wire::AppRow {
             id: app.id.clone(),
             source: app.manifest.source.to_string(),
-            status: DOWN,
-            hosts: app.hosts().to_vec(),
+            state: wire::AppState::Down { reason: None },
+            hosts: hostnames(app.hosts()),
         }))
         .collect();
     rows.extend(recorded_only(&instance, &matches).await);
     rows.extend(tracked_only(&instance, &matches).await);
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+
+    // Above the empty case on purpose: a caller that asked for the data gets
+    // an empty list, because the sentence names a command only whoever typed
+    // one knows.
+    if wants_json(&headers) {
+        return answered_in_json("app listing", &rows);
+    }
 
     if rows.is_empty() {
         let body = match &pattern {
@@ -540,9 +552,13 @@ async fn list(State(instance): State<Arc<Instance>>, Query(query): Query<ListQue
         return (StatusCode::OK, body).into_response();
     }
 
-    rows.sort_by(|a, b| a.id.cmp(&b.id));
-
     (StatusCode::OK, table(&rows)).into_response()
+}
+
+/// The hosts of an app as a listing carries them: the names, without the type
+/// that knows they are legal.
+fn hostnames(hosts: &[crate::app::manifest::Host]) -> Vec<String> {
+    hosts.iter().map(|host| host.as_str().to_owned()).collect()
 }
 
 /// The apps that are recorded and that the store is not holding at all, as
@@ -563,7 +579,10 @@ async fn list(State(instance): State<Arc<Instance>>, Query(query): Query<ListQue
 ///
 /// A store that will not answer costs these apps their lines rather than the
 /// whole listing, for the same reason as the tracked ones below.
-async fn recorded_only(instance: &Instance, matches: &impl Fn(&AppId) -> bool) -> Vec<Listed> {
+async fn recorded_only(
+    instance: &Instance,
+    matches: &impl Fn(&AppId) -> bool,
+) -> Vec<wire::AppRow> {
     let store = instance.applier.store();
     let recorded = AppRepository::new(instance.db.clone())
         .desired()
@@ -579,42 +598,26 @@ async fn recorded_only(instance: &Instance, matches: &impl Fn(&AppId) -> bool) -
                 && store.downed(&record.id).is_none()
         })
         .map(|record| match AppManifest::parse(&record.manifest) {
-            Ok(manifest) => Listed {
+            // Not down: a down app holds its hosts and is being tried again,
+            // and this one is in the store's hands not at all. And not down
+            // either for the manifest that would not read, because the remedy
+            // differs — no restart will fix it, and the version of spaceport
+            // that wrote the manifest is the thing to go and look at.
+            Ok(manifest) => wire::AppRow {
                 id: record.id,
                 source: manifest.source.to_string(),
-                status: NOT_RUNNING,
-                hosts: manifest.routing.hosts.clone(),
+                state: wire::AppState::NotRunning,
+                hosts: hostnames(&manifest.routing.hosts),
             },
-            Err(_) => Listed {
+            Err(_) => wire::AppRow {
                 id: record.id,
                 source: UNREADABLE_SOURCE.to_owned(),
-                status: UNREADABLE,
+                state: wire::AppState::Unreadable,
                 hosts: Vec::new(),
             },
         })
         .collect()
 }
-
-/// What an app that spaceport is not running is called in the status column.
-///
-/// The same word for one whose container died and one that never started: from
-/// where an operator sits those are the same thing — the app is not serving —
-/// and the difference is a sentence, which `spaceport apps show` has room for
-/// and a column does not.
-const DOWN: &str = "down";
-
-/// What an app is called that is recorded, is claiming nothing, and is not
-/// running — the word `spaceport apps show` already uses for it.
-///
-/// Apart from `down` because a down app holds its hosts and is being tried
-/// again, and this one is in the store's hands not at all.
-const NOT_RUNNING: &str = "not running";
-
-/// And what one is called whose recorded manifest this spaceport cannot read.
-///
-/// Apart from `down` because the remedy is: no restart will fix it, and the
-/// version of spaceport that wrote the manifest is the thing to go and look at.
-const UNREADABLE: &str = "unreadable";
 
 /// The source column for that app, which cannot be read out of a manifest that
 /// would not parse.
@@ -630,7 +633,7 @@ const UNREADABLE_SOURCE: &str = "unknown";
 /// A store that will not answer costs these apps their lines rather than the
 /// whole listing: the apps that *are* running are the ones an operator is most
 /// often asking after, and half a table beats a refusal.
-async fn tracked_only(instance: &Instance, matches: &impl Fn(&AppId) -> bool) -> Vec<Listed> {
+async fn tracked_only(instance: &Instance, matches: &impl Fn(&AppId) -> bool) -> Vec<wire::AppRow> {
     let mut listed = Vec::new();
 
     for tracking in instance.tracking.all().await.unwrap_or_default() {
@@ -641,10 +644,10 @@ async fn tracked_only(instance: &Instance, matches: &impl Fn(&AppId) -> bool) ->
             continue;
         }
 
-        listed.push(Listed {
+        listed.push(wire::AppRow {
             id: tracking.app,
             source: format!("repository {}@{}", tracking.repository, tracking.branch),
-            status: TRACKED,
+            state: wire::AppState::Tracked,
             hosts: Vec::new(),
         });
     }
@@ -771,7 +774,9 @@ async fn show(
     let applied_at = record.as_ref().map(|record| record.applied_at.clone());
 
     let status = match &held {
-        Held::Running(app) => statuses(std::slice::from_ref(app)).await[0].to_owned(),
+        Held::Running(app) => statuses(std::slice::from_ref(app)).await[0]
+            .as_str()
+            .to_owned(),
         Held::Suspended(_) => "suspended".to_owned(),
         Held::Down(downed) => format!("down ({})", downed.reason),
         Held::Recorded(_) => "not running".to_owned(),
@@ -1372,14 +1377,6 @@ impl Report {
     }
 }
 
-/// One line of what `spaceport apps list` prints.
-struct Listed {
-    id: AppId,
-    source: String,
-    status: &'static str,
-    hosts: Vec<crate::app::manifest::Host>,
-}
-
 #[derive(Debug, Deserialize)]
 struct ListQuery {
     pattern: Option<String>,
@@ -1414,26 +1411,65 @@ async fn status(State(instance): State<Arc<Instance>>) -> Response {
 }
 
 /// Where each app stands right now, in the order it was given.
-async fn statuses(apps: &[Arc<App>]) -> Vec<&'static str> {
+async fn statuses(apps: &[Arc<App>]) -> Vec<wire::AppState> {
     health::probe_all(apps)
         .await
         .into_iter()
-        .map(|ready| if ready { "ready" } else { "unreachable" })
+        .map(|ready| match ready {
+            true => wire::AppState::Ready,
+            false => wire::AppState::Unreachable,
+        })
         .collect()
 }
 
+/// Whether whoever asked would rather have the data than a rendering of it.
+///
+/// A substring of the raw header rather than a parse of it: a client that names
+/// the type at all has said which of the two it wants, and
+/// `application/json, */*` is not a different request from `application/json`.
+/// Anything that does not name it — `curl` with nothing set, a script written
+/// against the columns years ago — still gets the columns.
+fn wants_json(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(http::header::ACCEPT)
+        .and_then(|accept| accept.to_str().ok())
+        .is_some_and(|accept| accept.contains(wire::JSON))
+}
+
+/// One of the [`wire`] types as the body, or a refusal saying why not.
+///
+/// Written once rather than at each of the routes that negotiate, for the
+/// reason `status` gives: nothing that goes out of here can fail to serialise,
+/// and if one ever does the operator should hear about it rather than get half
+/// a listing. `what` names the listing, so the refusal says which one.
+fn answered_in_json<T: serde::Serialize>(what: &str, value: &T) -> Response {
+    match serde_json::to_vec(value) {
+        Ok(body) => (
+            StatusCode::OK,
+            [(http::header::CONTENT_TYPE, wire::JSON)],
+            body,
+        )
+            .into_response(),
+        Err(error) => {
+            warn!(%error, "could not serialise the {what}");
+            refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not serialise the {what}: {error}"),
+            )
+        }
+    }
+}
+
 /// Render the apps as columns, wide enough for what is in them.
-fn table(apps: &[Listed]) -> String {
+fn table(apps: &[wire::AppRow]) -> String {
     let rows: Vec<Vec<String>> = apps
         .iter()
         .map(|app| {
-            let hosts: Vec<&str> = app.hosts.iter().map(|host| host.as_str()).collect();
-
             vec![
                 app.id.to_string(),
                 app.source.clone(),
-                app.status.to_owned(),
-                hosts.join(", "),
+                app.state.as_str().to_owned(),
+                app.hosts.join(", "),
             ]
         })
         .collect();
@@ -1443,10 +1479,16 @@ fn table(apps: &[Listed]) -> String {
 
 /// A header row and its rows, each column as wide as the widest thing in it.
 fn columns(headers: &[&str], rows: &[Vec<String>]) -> String {
-    let mut widths: Vec<usize> = headers.iter().map(|header| header.len()).collect();
+    // Counted in characters and not in bytes: the only cell here that is not
+    // ascii is the mark setting a derived session in under its parent, and
+    // measuring that as the three bytes it is spelled with would drag every
+    // column after it two places left on exactly those rows.
+    let width_of = |cell: &str| cell.chars().count();
+
+    let mut widths: Vec<usize> = headers.iter().map(|header| width_of(header)).collect();
     for row in rows {
         for (width, cell) in widths.iter_mut().zip(row) {
-            *width = (*width).max(cell.len());
+            *width = (*width).max(width_of(cell));
         }
     }
 
@@ -1461,7 +1503,7 @@ fn columns(headers: &[&str], rows: &[Vec<String>]) -> String {
                 line.push_str("  ");
             }
             line.push_str(cell);
-            line.push_str(&" ".repeat(width - cell.len()));
+            line.push_str(&" ".repeat(width - width_of(cell)));
         }
         out.push_str(line.trim_end());
         out.push('\n');
@@ -3347,7 +3389,10 @@ struct RegisterRequest {
 /// Never a secret, not even a redacted one: a listing is the response most
 /// likely to be pasted somewhere, and a column of `Secret(…)` would say nothing
 /// an operator did not already know.
-async fn connections(State(connections): State<Arc<ConnectionRepository>>) -> Response {
+async fn connections(
+    State(connections): State<Arc<ConnectionRepository>>,
+    headers: http::HeaderMap,
+) -> Response {
     let held = match connections.all().await {
         Ok(held) => held,
         Err(error) => {
@@ -3358,7 +3403,21 @@ async fn connections(State(connections): State<Arc<ConnectionRepository>>) -> Re
         }
     };
 
-    if held.is_empty() {
+    let listed: Vec<wire::ConnectionRow> = held
+        .iter()
+        .map(|connection| wire::ConnectionRow {
+            slug: connection.slug.clone(),
+            app_id: connection.app_id,
+            owner: connection.owner.clone(),
+            connected_at: connection.connected_at.clone(),
+        })
+        .collect();
+
+    if wants_json(&headers) {
+        return answered_in_json("connection listing", &listed);
+    }
+
+    if listed.is_empty() {
         return (
             StatusCode::OK,
             "no github apps are connected — connect one with `spaceport connect github --manual`\n",
@@ -3366,7 +3425,7 @@ async fn connections(State(connections): State<Arc<ConnectionRepository>>) -> Re
             .into_response();
     }
 
-    let rows: Vec<Vec<String>> = held
+    let rows: Vec<Vec<String>> = listed
         .iter()
         .map(|connection| {
             vec![
@@ -3394,6 +3453,7 @@ async fn connections(State(connections): State<Arc<ConnectionRepository>>) -> Re
 async fn connection(
     State(connections): State<Arc<ConnectionRepository>>,
     UrlPath(slug): UrlPath<String>,
+    headers: http::HeaderMap,
 ) -> Response {
     let held = match connections.by_slug(&slug).await {
         Ok(Some(held)) => held,
@@ -3406,30 +3466,87 @@ async fn connection(
         }
     };
 
+    // What GitHub last said, which is a cache and is empty until the first
+    // reconciliation has run — so an app nobody has installed says so rather
+    // than saying nothing.
+    let installations = match connections.installations(held.app_id).await {
+        Ok(installations) if installations.is_empty() => wire::Installations::Nowhere,
+        Ok(installations) => wire::Installations::Somewhere {
+            installations: installations
+                .iter()
+                .map(|installation| wire::Installation {
+                    account: installation.account.clone(),
+                    account_type: installation.account_type.clone(),
+                    // Named rather than counted, because the count answers a
+                    // question nobody has. What an operator wants off this
+                    // command is whether one particular repository is in
+                    // reach, and a number cannot answer that — and the names
+                    // are already in hand, cached by the same pass that
+                    // counted them.
+                    //
+                    // Every one of them, however many there are. Sending the
+                    // first few and a "and 40 more" reads as an answer while
+                    // being one only when the repository being looked for
+                    // happens to sort early, which is the worst of both.
+                    repositories: installation.repositories.clone(),
+                })
+                .collect(),
+        },
+        Err(error) => wire::Installations::Unreadable {
+            error: format!("{error:#}"),
+        },
+    };
+
+    // How old that answer is, which is the question behind "why is my
+    // repository not here" — a cache nothing has refreshed yet and a cache
+    // refreshed a minute ago call for quite different next steps.
+    let refreshed = match connections.last_reconciled(held.app_id).await {
+        Ok(Some(reconciled)) => wire::Refreshed::At { at: reconciled },
+        Ok(None) => wire::Refreshed::Never,
+        Err(error) => wire::Refreshed::Unreadable {
+            error: format!("{error:#}"),
+        },
+    };
+
+    let connection = wire::Connection {
+        slug: held.slug.clone(),
+        name: held.name.clone(),
+        app_id: held.app_id,
+        owner: held.owner.clone(),
+        client_id: held.client_id.clone(),
+        connected_at: held.connected_at.clone(),
+        installations,
+        refreshed,
+    };
+
+    if wants_json(&headers) {
+        return answered_in_json("connection", &connection);
+    }
+
     let mut out = Report::default();
-    out.field("app", held.slug.clone());
-    out.field("name", held.name.clone());
-    out.field("app id", held.app_id.to_string());
-    out.field("owner", held.owner.clone());
-    out.field("client id", held.client_id.clone());
-    out.field("connected", held.connected_at.clone());
+    out.field("app", connection.slug.clone());
+    out.field("name", connection.name.clone());
+    out.field("app id", connection.app_id.to_string());
+    out.field("owner", connection.owner.clone());
+    out.field("client id", connection.client_id.clone());
+    out.field("connected", connection.connected_at.clone());
+    // Said here and not on the wire: it is the same sentence on every
+    // connection, so it names no data — the three secrets are set or the
+    // connection would not be here.
     out.field(
         "secrets",
         "client secret, webhook secret, private key (not shown)".to_owned(),
     );
 
-    // What GitHub last said, which is a cache and is empty until the first
-    // reconciliation has run — so an app nobody has installed says so rather
-    // than saying nothing.
-    match connections.installations(held.app_id).await {
-        Ok(installations) if installations.is_empty() => out.field(
+    match &connection.installations {
+        wire::Installations::Nowhere => out.field(
             "installed",
             format!(
                 "nowhere yet — install it at {INSTALL_URL}/{}/installations/new",
-                held.slug
+                connection.slug
             ),
         ),
-        Ok(installations) => {
+        wire::Installations::Somewhere { installations } => {
             for (index, installation) in installations.iter().enumerate() {
                 out.field(
                     if index == 0 { "installed" } else { "" },
@@ -3441,35 +3558,26 @@ async fn connection(
                     ),
                 );
 
-                // Named rather than counted, because the count answers a
-                // question nobody has. What an operator wants off this command
-                // is whether one particular repository is in reach, and a
-                // number cannot answer that — and the names are already in
-                // hand, cached by the same pass that counted them.
-                //
-                // Every one of them, however many there are. Printing the
-                // first few and a "and 40 more" reads as an answer while being
-                // one only when the repository being looked for happens to
-                // sort early, which is the worst of both.
                 for repository in &installation.repositories {
                     out.field("", format!("  {repository}"));
                 }
             }
         }
-        Err(error) => out.field("installed", format!("could not be read: {error:#}")),
+        wire::Installations::Unreadable { error } => {
+            out.field("installed", format!("could not be read: {error}"));
+        }
     }
 
-    // How old that answer is, which is the question behind "why is my
-    // repository not here" — a cache nothing has refreshed yet and a cache
-    // refreshed a minute ago call for quite different next steps.
-    match connections.last_reconciled(held.app_id).await {
-        Ok(Some(reconciled)) => out.field("refreshed", reconciled),
-        Ok(None) => out.field(
+    match &connection.refreshed {
+        wire::Refreshed::At { at } => out.field("refreshed", at.clone()),
+        wire::Refreshed::Never => out.field(
             "refreshed",
             "not yet — a pass is due within seconds of connecting, and hourly after that"
                 .to_owned(),
         ),
-        Err(error) => out.field("refreshed", format!("could not be read: {error:#}")),
+        wire::Refreshed::Unreadable { error } => {
+            out.field("refreshed", format!("could not be read: {error}"));
+        }
     }
 
     (StatusCode::OK, out.render()).into_response()
@@ -3533,6 +3641,7 @@ fn unconnected(slug: &str) -> String {
 async fn list_users(
     State(users): State<Arc<UserRepository>>,
     Query(query): Query<ListQuery>,
+    headers: http::HeaderMap,
 ) -> Response {
     let pattern = match query
         .pattern
@@ -3554,6 +3663,21 @@ async fn list_users(
         }
     };
 
+    let listed: Vec<wire::UserRow> = listed
+        .iter()
+        .map(|user| wire::UserRow {
+            slug: user.slug.clone(),
+            id: user.id.clone(),
+            suspended: user.suspended,
+            email: user.email.clone(),
+            created_at: user.created_at.clone(),
+        })
+        .collect();
+
+    if wants_json(&headers) {
+        return answered_in_json("user listing", &listed);
+    }
+
     if listed.is_empty() {
         let body = match &pattern {
             Some(pattern) => format!("no user matches `{pattern}`\n"),
@@ -3571,7 +3695,7 @@ async fn list_users(
             vec![
                 user.slug.to_string(),
                 user.id.to_string(),
-                user_status(user).to_owned(),
+                user_status(user.suspended).to_owned(),
                 user.email.clone().unwrap_or_default(),
                 user.created_at.clone(),
             ]
@@ -3586,8 +3710,12 @@ async fn list_users(
 }
 
 /// The one word a listing and a report say about a user's standing.
-fn user_status(user: &UserRecord) -> &'static str {
-    match user.suspended {
+///
+/// A rendering of the flag rather than something stored beside it, so that the
+/// listing and the report can never disagree about which word a suspension
+/// deserves.
+fn user_status(suspended: bool) -> &'static str {
+    match suspended {
         true => "suspended",
         false => "active",
     }
@@ -3738,6 +3866,7 @@ fn refuse_user(error: UserError) -> Response {
 async fn list_sessions(
     State(sessions): State<Arc<SessionRepository>>,
     UrlPath(user): UrlPath<String>,
+    headers: http::HeaderMap,
 ) -> Response {
     let user: UserRef = match user.parse() {
         Ok(user) => user,
@@ -3749,7 +3878,53 @@ async fn list_sessions(
         Err(error) => return refuse_session(error),
     };
 
-    if listed.is_empty() && keys.is_empty() {
+    // Nested rather than flat, because the belonging is the point: a derived
+    // session was minted from the one above it and dies with it. The rows come
+    // back out of this below, in the order they went in.
+    //
+    // A stored app id or role goes out as the text it was stored as, which is
+    // what the tables keep it as: a row written by a newer build has to list
+    // here even when this build would refuse the id in it, and a listing is the
+    // one place that is true of.
+    let mut held = wire::Sessions {
+        user: user.slug.clone(),
+        sessions: Vec::new(),
+        keys: Vec::new(),
+    };
+    for session in &listed {
+        let derived = session
+            .derived
+            .iter()
+            .map(|derived| wire::DerivedRow {
+                app: derived.app.clone(),
+                created_at: derived.created_at.clone(),
+                expires_at: derived.expires_at.clone(),
+            })
+            .collect();
+
+        held.sessions.push(wire::SessionRow {
+            id: session.id.to_string(),
+            created_at: session.created_at.clone(),
+            expires_at: session.expires_at.clone(),
+            derived,
+        });
+    }
+    for key in &keys {
+        held.keys.push(wire::ApiKeyRow {
+            id: key.id.to_string(),
+            prefix_tail: key.prefix_tail.clone(),
+            role: key.role.clone(),
+            app: key.app.clone(),
+            created_at: key.created_at.clone(),
+            expires_at: key.expires_at.clone(),
+        });
+    }
+
+    if wants_json(&headers) {
+        return answered_in_json("session listing", &held);
+    }
+
+    if held.is_empty() {
         return (
             StatusCode::OK,
             format!(
@@ -3765,10 +3940,10 @@ async fn list_sessions(
     // ordering is what says "this one dies with the row above", which is the
     // one thing an operator deciding what to drop needs to read.
     let mut rows: Vec<Vec<String>> = Vec::new();
-    for session in &listed {
+    for session in &held.sessions {
         rows.push(vec![
             "session".to_owned(),
-            session.id.to_string(),
+            session.id.clone(),
             String::new(),
             String::new(),
             session.created_at.clone(),
@@ -3785,10 +3960,10 @@ async fn list_sessions(
             ]);
         }
     }
-    for key in &keys {
+    for key in &held.keys {
         rows.push(vec![
             "key".to_owned(),
-            key.id.to_string(),
+            key.id.clone(),
             key.prefix_tail.clone(),
             format!("{}@{}", key.role, key.app),
             key.created_at.clone(),
@@ -4017,6 +4192,7 @@ fn refuse_session(error: SessionError) -> Response {
 async fn auth_log(
     State(log): State<Arc<AuthLogRepository>>,
     Query(query): Query<AuthLogQuery>,
+    headers: http::HeaderMap,
 ) -> Response {
     let user = match query.user.as_deref().map(str::parse::<UserId>).transpose() {
         Ok(user) => user,
@@ -4032,6 +4208,21 @@ async fn auth_log(
             );
         }
     };
+
+    let entries: Vec<wire::LogRow> = entries
+        .iter()
+        .map(|entry| wire::LogRow {
+            at: entry.at.clone(),
+            kind: entry.kind.clone(),
+            user: entry.user.clone(),
+            origin: entry.origin.clone(),
+            detail: entry.detail.clone(),
+        })
+        .collect();
+
+    if wants_json(&headers) {
+        return answered_in_json("auth log", &entries);
+    }
 
     if entries.is_empty() {
         let body = match &user {
@@ -4109,7 +4300,10 @@ async fn rotate_signing_key(State(signer): State<Arc<JwtSigner>>) -> Response {
 
 /// `GET /auth/keys`: every signing key still in the store — the current one,
 /// and any retired key whose tokens have not all expired out of the JWKS yet.
-async fn list_signing_keys(State(signer): State<Arc<JwtSigner>>) -> Response {
+async fn list_signing_keys(
+    State(signer): State<Arc<JwtSigner>>,
+    headers: http::HeaderMap,
+) -> Response {
     let keys = match signer.keys().await {
         Ok(keys) => keys,
         Err(error) => {
@@ -4119,6 +4313,20 @@ async fn list_signing_keys(State(signer): State<Arc<JwtSigner>>) -> Response {
             );
         }
     };
+
+    let keys: Vec<wire::SigningKeyRow> = keys
+        .iter()
+        .map(|key| wire::SigningKeyRow {
+            kid: key.kid.clone(),
+            current: key.current,
+            created_at: key.created_at.clone(),
+            retired_at: key.retired_at.clone(),
+        })
+        .collect();
+
+    if wants_json(&headers) {
+        return answered_in_json("signing key listing", &keys);
+    }
 
     if keys.is_empty() {
         return (
@@ -4357,6 +4565,7 @@ async fn audit_user(
     State(identities): State<Arc<IdentityRepository>>,
     State(instance): State<Arc<Instance>>,
     UrlPath(user): UrlPath<String>,
+    headers: http::HeaderMap,
 ) -> Response {
     let user: UserRef = match user.parse() {
         Ok(user) => user,
@@ -4368,16 +4577,10 @@ async fn audit_user(
         Err(error) => return refuse_entitlement(error),
     };
 
-    let mut out = Report::default();
-    out.field("user", user.slug.to_string());
-    out.field("id", user.id.to_string());
-    out.field("status", user_status(&user).to_owned());
-    if let Some(email) = &user.email {
-        out.field("email", email.clone());
-    }
-    // The SSO connection the spec promises the audit shows. Said rather than
-    // omitted when there is none: an auditor looking for it should read that
-    // no IdP has vouched for this user, not wonder whether the report forgot.
+    // The SSO connection the spec promises the audit shows. Carried rather
+    // than omitted when there is none: an auditor looking for it should read
+    // that no IdP has vouched for this user, not wonder whether the report
+    // forgot — which in the columns is a sentence and here is an empty list.
     let linked = match identities.for_user(&user.id).await {
         Ok(linked) => linked,
         Err(error) => {
@@ -4387,7 +4590,70 @@ async fn audit_user(
             );
         }
     };
-    match linked.as_slice() {
+
+    // What each app's manifest declares, asked once per app rather than once
+    // per entitlement: an audit of a user with twelve roles at one app is
+    // still one read of that app's record.
+    let mut declared: std::collections::BTreeMap<AppId, DeclaredRoles> = Default::default();
+    for entitlement in &held {
+        if !declared.contains_key(&entitlement.app) {
+            declared.insert(
+                entitlement.app.clone(),
+                DeclaredRoles::of(instance.applier.repository(), &entitlement.app).await,
+            );
+        }
+    }
+
+    let audit = wire::Audit {
+        user: user.slug.clone(),
+        id: user.id.clone(),
+        suspended: user.suspended,
+        email: user.email.clone(),
+        sso: linked
+            .iter()
+            .map(|identity| wire::IdentityRow {
+                connection: identity.connection.clone(),
+                external_id: identity.external_id.clone(),
+                external_login: identity.external_login.clone(),
+                last_login_at: identity.last_login_at.clone(),
+            })
+            .collect(),
+        access: declared
+            .iter()
+            .filter(|(app, roles)| {
+                held.iter().any(|entitlement| {
+                    &&entitlement.app == app && roles.declares(&entitlement.role)
+                })
+            })
+            .map(|(app, _)| app.clone())
+            .collect(),
+        entitlements: held
+            .iter()
+            .map(|entitlement| wire::EntitlementRow {
+                role: entitlement.role.clone(),
+                app: entitlement.app.clone(),
+                mapped_rule: entitlement.mapped_rule.clone(),
+                grants_access: declared[&entitlement.app].declares(&entitlement.role),
+                granted_at: entitlement.granted_at.clone(),
+            })
+            .collect(),
+    };
+
+    // Above the empty case on purpose, exactly as the listings do it: a caller
+    // that asked for the data gets an empty list where the columns get the
+    // sentence naming the command to type next.
+    if wants_json(&headers) {
+        return answered_in_json("audit", &audit);
+    }
+
+    let mut out = Report::default();
+    out.field("user", audit.user.to_string());
+    out.field("id", audit.id.to_string());
+    out.field("status", user_status(audit.suspended).to_owned());
+    if let Some(email) = &audit.email {
+        out.field("email", email.clone());
+    }
+    match audit.sso.as_slice() {
         [] => out.field("sso", "none — no IdP login recorded".to_owned()),
         linked => {
             for identity in linked {
@@ -4405,37 +4671,21 @@ async fn audit_user(
         }
     }
 
-    // What each app's manifest declares, asked once per app rather than once
-    // per entitlement: an audit of a user with twelve roles at one app is
-    // still one read of that app's record.
-    let mut declared: std::collections::BTreeMap<AppId, DeclaredRoles> = Default::default();
-    for entitlement in &held {
-        if !declared.contains_key(&entitlement.app) {
-            declared.insert(
-                entitlement.app.clone(),
-                DeclaredRoles::of(instance.applier.repository(), &entitlement.app).await,
-            );
-        }
-    }
-
-    let access: Vec<String> = declared
-        .iter()
-        .filter(|(app, roles)| {
-            held.iter()
-                .any(|entitlement| &&entitlement.app == app && roles.declares(&entitlement.role))
-        })
-        .map(|(app, _)| app.to_string())
-        .collect();
     out.field(
         "access",
-        match access.is_empty() {
+        match audit.access.is_empty() {
             true => "no app — no entitled role is declared by a deployed manifest".to_owned(),
-            false => access.join(", "),
+            false => audit
+                .access
+                .iter()
+                .map(AppId::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
         },
     );
 
     let mut body = out.render();
-    if held.is_empty() {
+    if audit.entitlements.is_empty() {
         body.push_str(
             "\nno entitlements — `spaceport auth grant` is what hands out the first one\n",
         );
@@ -4443,7 +4693,8 @@ async fn audit_user(
         return (StatusCode::OK, body).into_response();
     }
 
-    let rows: Vec<Vec<String>> = held
+    let rows: Vec<Vec<String>> = audit
+        .entitlements
         .iter()
         .map(|entitlement| {
             vec![
@@ -4452,7 +4703,7 @@ async fn audit_user(
                     Some(rule) => format!("mapped by rule `{rule}`"),
                     None => "manual".to_owned(),
                 },
-                match declared[&entitlement.app].declares(&entitlement.role) {
+                match entitlement.grants_access {
                     true => "yes".to_owned(),
                     false => "no — role not declared by the app".to_owned(),
                 },
@@ -4614,6 +4865,7 @@ struct MappingQuery {
 async fn list_mappings(
     State(mappings): State<Arc<MappingRepository>>,
     Query(query): Query<MappingQuery>,
+    headers: http::HeaderMap,
 ) -> Response {
     let app: Option<AppId> = match query.app.as_deref().map(str::parse).transpose() {
         Ok(app) => app,
@@ -4629,6 +4881,24 @@ async fn list_mappings(
             );
         }
     };
+
+    let listed: Vec<wire::MappingRow> = listed
+        .iter()
+        .map(|mapping| wire::MappingRow {
+            rule_id: mapping.rule_id.clone(),
+            grants: mapping.grants().to_string(),
+            connection: mapping.connection.clone(),
+            // One entry per condition rather than the sentence they make: they
+            // are ANDed, and whoever renders them decides what stands between
+            // two of them.
+            conditions: mapping.conditions.iter().map(ToString::to_string).collect(),
+            created_at: mapping.created_at.clone(),
+        })
+        .collect();
+
+    if wants_json(&headers) {
+        return answered_in_json("mapping listing", &listed);
+    }
 
     if listed.is_empty() {
         let body = match &app {
@@ -4648,14 +4918,9 @@ async fn list_mappings(
         .map(|mapping| {
             vec![
                 mapping.rule_id.clone(),
-                mapping.grants().to_string(),
+                mapping.grants.clone(),
                 mapping.connection.clone(),
-                mapping
-                    .conditions
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", "),
+                mapping.conditions.join(", "),
                 mapping.created_at.clone(),
             ]
         })
@@ -5170,6 +5435,28 @@ container:
             .unwrap();
 
         call(router, request).await
+    }
+
+    /// The same GET a client that renders the listing itself makes, with what
+    /// came back said to be: the content type is half of what these routes
+    /// negotiate, so a test that only read the body would pass on a server
+    /// that sent JSON as `text/plain`.
+    async fn get_json(router: &Router, uri: &str) -> (StatusCode, String, String) {
+        let request = Request::builder()
+            .uri(uri)
+            .header(http::header::ACCEPT, wire::JSON)
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let kind = response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .map(|kind| kind.to_str().unwrap().to_owned())
+            .unwrap_or_default();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+
+        (status, kind, String::from_utf8(body.to_vec()).unwrap())
     }
 
     async fn show_app(router: &Router, id: &str, query: &str) -> (StatusCode, String) {
@@ -5767,6 +6054,66 @@ container:
         assert_eq!(body, "no app matches `web-*`\n");
     }
 
+    /// The listing as a client that lays it out itself asks for it: the same
+    /// rows, with the state as a value rather than a word — the down one
+    /// without its reason, which is a sentence this route has never had.
+    #[tokio::test]
+    async fn answers_the_app_listing_as_data_when_the_request_asks_for_it() {
+        let (store, router) = store_and_router();
+        put_app(&router, "hello", MANIFEST).await;
+        put_app(&router, "other", &manifest_for("beta.test")).await;
+        store.take_down(&app_id("hello"), "the container exited");
+
+        let (status, kind, body) = get_json(&router, "/apps").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(kind, wire::JSON);
+        let listed: Vec<wire::AppRow> =
+            serde_json::from_str(&body).expect("the listing is a list of rows");
+        assert_eq!(listed.len(), 2, "{body}");
+        assert_eq!(listed[0].id, app_id("hello"));
+        assert_eq!(listed[0].state, wire::AppState::Down { reason: None });
+        assert_eq!(listed[0].hosts, ["alpha.test"]);
+        assert!(
+            listed[0]
+                .source
+                .contains("image strm/helloworld-http:latest"),
+            "{body}"
+        );
+        assert_eq!(listed[1].id, app_id("other"));
+    }
+
+    /// And where the columns have a sentence, the data has an empty list: the
+    /// sentence names a command, and only whoever typed one knows which.
+    #[tokio::test]
+    async fn answers_an_empty_app_listing_with_an_empty_list() {
+        let (_, router) = store_and_router();
+
+        let (status, kind, body) = get_json(&router, "/apps").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(kind, wire::JSON);
+        assert_eq!(body, "[]");
+    }
+
+    /// Everything written against the columns goes on reading them: a request
+    /// that does not name the type by name has not asked for the other half.
+    #[tokio::test]
+    async fn a_request_that_asks_for_anything_still_gets_the_columns() {
+        let (_, router) = store_and_router();
+        put_app(&router, "hello", MANIFEST).await;
+
+        let request = Request::builder()
+            .uri("/apps")
+            .header(http::header::ACCEPT, "*/*")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(&router, request).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.starts_with("APP"), "{body}");
+    }
+
     #[tokio::test]
     async fn rejects_an_empty_pattern() {
         let (_, router) = store_and_router();
@@ -6359,6 +6706,89 @@ container:
         let (_, body) = get_connections(&router, "/spaceport-acme").await;
 
         assert!(body.contains("mtrense (user), no repositories"), "{body}");
+    }
+
+    /// The connection as a client that lays it out itself asks for it: the
+    /// accounts and their repositories as values, without the English about
+    /// how many there are — and without the sentence about the secrets, which
+    /// is the same on every connection and so says nothing.
+    #[tokio::test]
+    async fn answers_a_connection_as_data_when_the_request_asks_for_it() {
+        let (_, router, _, _, _, connections, _, _, _, _) = parts_on(OneContainer::default());
+        post_connection(&router, registration("spaceport-acme", 42)).await;
+        connections
+            .record_installations(
+                42,
+                &[Installation {
+                    installation_id: 100,
+                    account: "acme-inc".to_owned(),
+                    account_type: "Organization".to_owned(),
+                    repositories: vec!["acme-inc/the-only-one".to_owned()],
+                }],
+            )
+            .await
+            .unwrap();
+
+        let (status, kind, body) = get_json(&router, "/connections/spaceport-acme").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(kind, wire::JSON);
+        let held: wire::Connection = serde_json::from_str(&body).expect("a connection");
+        assert_eq!(held.slug, "spaceport-acme");
+        assert_eq!(held.app_id, 42);
+        assert_eq!(held.owner, "an-organisation");
+        assert_eq!(held.client_id, "Iv1.0123456789abcdef");
+        assert_eq!(
+            held.installations,
+            wire::Installations::Somewhere {
+                installations: vec![wire::Installation {
+                    account: "acme-inc".to_owned(),
+                    // GitHub's own spelling, not the lowercased rendering.
+                    account_type: "Organization".to_owned(),
+                    repositories: vec!["acme-inc/the-only-one".to_owned()],
+                }],
+            }
+        );
+        // Recording installations is a reconciliation pass, so the cache has
+        // an age — a case of its own, and not a field left absent.
+        assert!(
+            matches!(held.refreshed, wire::Refreshed::At { .. }),
+            "{body}"
+        );
+        assert!(!body.contains("not shown"), "{body}");
+    }
+
+    /// An app installed nowhere is a case rather than an empty list, because
+    /// the answer to it is an install URL the client builds from the slug.
+    #[tokio::test]
+    async fn answers_an_uninstalled_connection_with_the_nowhere_case() {
+        let (router, _) = router_and_events();
+        post_connection(&router, registration("spaceport-acme", 42)).await;
+
+        let (status, _, body) = get_json(&router, "/connections/spaceport-acme").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let held: wire::Connection = serde_json::from_str(&body).expect("a connection");
+        assert_eq!(held.installations, wire::Installations::Nowhere);
+        assert!(!body.contains("installations/new"), "{body}");
+    }
+
+    /// Everything written against the report goes on reading it.
+    #[tokio::test]
+    async fn a_connection_asked_for_as_anything_still_gets_the_report() {
+        let (router, _) = router_and_events();
+        post_connection(&router, registration("spaceport-acme", 42)).await;
+
+        let request = Request::builder()
+            .uri("/connections/spaceport-acme")
+            .header(http::header::ACCEPT, "*/*")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(&router, request).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.starts_with("app        spaceport-acme"), "{body}");
+        assert!(body.contains("nowhere yet"), "{body}");
     }
 
     /// The one thing a connection must never do: an operator asking what is
@@ -9013,6 +9443,81 @@ container:
         .unwrap();
     }
 
+    /// Exchange a session for an app session on `app`, as the redirect does.
+    /// Nothing over HTTP mints one, and the listing has a row shape for it.
+    async fn derive(db: &Db, user: &UserId, app: &str, parent: &SessionId) {
+        let sessions = crate::auth::SessionRepository::new(db.clone());
+        let app = app_id(app);
+        let nonce = sessions.mint_nonce(user, &app, parent).await.unwrap();
+
+        sessions
+            .redeem_nonce(&nonce, &app)
+            .await
+            .unwrap()
+            .expect("the nonce redeemed into an app session");
+    }
+
+    /// The one row shape that is not its own line: an app session prints
+    /// under the session it was minted from, indented, and the keys come after
+    /// every session. An operator reads that ordering as "this dies with the
+    /// row above", so it is the ordering that is asserted, not just the cells.
+    #[tokio::test]
+    async fn lists_a_derived_app_session_under_the_session_it_came_from() {
+        let (router, db) = router_with_alice_and_blog().await;
+        let (_, minted) = user_command(&router, "POST", "/auth/users/alice/sessions").await;
+        let parent = redeem(&db, &minted).await;
+        derive(&db, &parent.user, "blog", &parent.id).await;
+        user_command(&router, "POST", "/auth/users/alice/api-keys/reader@blog").await;
+
+        let (status, listed) = user_command(&router, "GET", "/auth/users/alice/sessions").await;
+
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        let lines: Vec<&str> = listed.lines().collect();
+        assert!(lines[0].starts_with("KIND"), "{listed}");
+        assert!(lines[1].starts_with("session"), "{listed}");
+        assert!(lines[1].contains(parent.id.as_str()), "{listed}");
+        assert!(lines[2].starts_with("app"), "{listed}");
+        assert!(lines[2].contains("↳ blog"), "{listed}");
+        assert!(lines[3].starts_with("key"), "{listed}");
+        assert!(lines[3].contains("reader@blog"), "{listed}");
+    }
+
+    /// The same listing as data, where the belonging is the structure rather
+    /// than an indent — and with nothing to list, two empty lists rather than
+    /// the sentence about how to start a session.
+    #[tokio::test]
+    async fn answers_the_session_listing_as_data_with_the_derived_ones_nested() {
+        let (router, db) = router_with_alice_and_blog().await;
+
+        let (status, kind, body) = get_json(&router, "/auth/users/alice/sessions").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(kind, wire::JSON);
+        let empty: wire::Sessions =
+            serde_json::from_str(&body).expect("an empty listing still reads");
+        assert_eq!(empty.user.to_string(), "alice");
+        assert!(empty.sessions.is_empty() && empty.keys.is_empty(), "{body}");
+
+        let (_, minted) = user_command(&router, "POST", "/auth/users/alice/sessions").await;
+        let parent = redeem(&db, &minted).await;
+        derive(&db, &parent.user, "blog", &parent.id).await;
+        user_command(&router, "POST", "/auth/users/alice/api-keys/reader@blog").await;
+
+        let (status, kind, body) = get_json(&router, "/auth/users/alice/sessions").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(kind, wire::JSON);
+        let held: wire::Sessions =
+            serde_json::from_str(&body).expect("the listing is sessions and keys");
+        assert_eq!(held.sessions.len(), 1, "{body}");
+        assert_eq!(held.sessions[0].id, parent.id.to_string());
+        assert_eq!(held.sessions[0].derived.len(), 1, "{body}");
+        assert_eq!(held.sessions[0].derived[0].app, "blog");
+        assert_eq!(held.keys.len(), 1, "{body}");
+        assert_eq!(held.keys[0].app, "blog");
+        assert_eq!(held.keys[0].role, "reader");
+        assert!(held.keys[0].prefix_tail.starts_with("spk_"), "{body}");
+    }
+
     /// The key out of a mint response — the one place it is ever printed.
     fn key_in(body: &str) -> String {
         body.lines()
@@ -9198,6 +9703,79 @@ container:
         assert!(audit.contains("editor@blog"), "{audit}");
         assert!(audit.contains("role not declared"), "{audit}");
         assert!(audit.contains("no app"), "{audit}");
+    }
+
+    /// The audit as a client that lays it out itself asks for it: the flags
+    /// where the report has words — suspended rather than "active", whether
+    /// the role is declared rather than the sentence saying it is not.
+    #[tokio::test]
+    async fn answers_an_audit_as_data_when_the_request_asks_for_it() {
+        let (router, _) = router_with_alice_and_blog().await;
+        user_command(&router, "PUT", "/auth/users/alice/entitlements/reader@blog").await;
+        user_command(&router, "PUT", "/auth/users/alice/entitlements/editor@blog").await;
+
+        let (status, kind, body) = get_json(&router, "/auth/users/alice/audit").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(kind, wire::JSON);
+        let audit: wire::Audit = serde_json::from_str(&body).expect("an audit");
+        assert_eq!(audit.user.to_string(), "alice");
+        assert!(!audit.suspended);
+        assert!(audit.sso.is_empty(), "{body}");
+        // `blog` declares `reader` and not `editor`, so it is reachable once
+        // and listed once.
+        assert_eq!(audit.access, [app_id("blog")]);
+        assert_eq!(audit.entitlements.len(), 2, "{body}");
+        let reader = audit
+            .entitlements
+            .iter()
+            .find(|held| held.role.to_string() == "reader")
+            .expect("the granted reader role");
+        assert_eq!(reader.app, app_id("blog"));
+        assert_eq!(reader.mapped_rule, None);
+        assert!(reader.grants_access);
+        let editor = audit
+            .entitlements
+            .iter()
+            .find(|held| held.role.to_string() == "editor")
+            .expect("the granted editor role");
+        assert!(!editor.grants_access);
+        assert!(!body.contains("role not declared"), "{body}");
+    }
+
+    /// And where the report has the sentence naming the command that hands out
+    /// a first entitlement, the data has an empty list.
+    #[tokio::test]
+    async fn answers_an_audit_of_a_user_holding_nothing_with_an_empty_list() {
+        let (router, _) = router_with_alice_and_blog().await;
+
+        let (status, kind, body) = get_json(&router, "/auth/users/alice/audit").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(kind, wire::JSON);
+        let audit: wire::Audit = serde_json::from_str(&body).expect("an audit");
+        assert!(audit.entitlements.is_empty(), "{body}");
+        assert!(audit.access.is_empty(), "{body}");
+        assert!(!body.contains("spaceport auth grant"), "{body}");
+    }
+
+    /// Everything written against the report goes on reading it.
+    #[tokio::test]
+    async fn an_audit_asked_for_as_anything_still_gets_the_report() {
+        let (router, _) = router_with_alice_and_blog().await;
+        user_command(&router, "PUT", "/auth/users/alice/entitlements/reader@blog").await;
+
+        let request = Request::builder()
+            .uri("/auth/users/alice/audit")
+            .header(http::header::ACCEPT, "*/*")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(&router, request).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.starts_with("user    alice"), "{body}");
+        assert!(body.contains("ENTITLEMENT"), "{body}");
+        assert!(body.contains("reader@blog"), "{body}");
     }
 
     /// Granting for an app spaceport has never heard of is the same story one

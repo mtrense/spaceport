@@ -15,10 +15,11 @@ use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
 
-use super::{OperatorEndpoint, SecretSet};
+use super::{OperatorEndpoint, SecretSet, wire};
 use crate::app::manifest::VarName;
 use crate::app::{AppId, Pattern};
 use crate::auth::{Condition, RevokeScope, Role, RoleAtApp, SessionId, UserId, UserRef, UserSlug};
@@ -145,7 +146,14 @@ pub async fn track(
 }
 
 /// Ask for the apps it is running, optionally only those matching `pattern`.
-pub async fn list(endpoint: &OperatorEndpoint, pattern: Option<&Pattern>) -> Result<String> {
+///
+/// The rows, not the columns: how wide they are and which cell is worth
+/// colouring is the caller's to decide, and an empty answer is an empty list
+/// rather than a sentence about it.
+pub async fn list(
+    endpoint: &OperatorEndpoint,
+    pattern: Option<&Pattern>,
+) -> Result<Vec<wire::AppRow>> {
     // A pattern is lowercase letters, digits, hyphens and `*`, all of which a
     // query string carries as they are.
     let uri = match pattern {
@@ -153,7 +161,7 @@ pub async fn list(endpoint: &OperatorEndpoint, pattern: Option<&Pattern>) -> Res
         None => "/apps".to_owned(),
     };
 
-    send_to(endpoint, builder("GET", &uri).body(Full::default())?).await
+    send_json_to(endpoint, builder("GET", &uri).body(Full::default())?).await
 }
 
 /// Ask for everything it knows about the app named `id`.
@@ -295,8 +303,8 @@ pub struct GithubAppRequest {
 }
 
 /// Ask for the connections it holds.
-pub async fn connections(endpoint: &OperatorEndpoint) -> Result<String> {
-    send_to(
+pub async fn connections(endpoint: &OperatorEndpoint) -> Result<Vec<wire::ConnectionRow>> {
+    send_json_to(
         endpoint,
         builder("GET", "/connections").body(Full::default())?,
     )
@@ -304,10 +312,10 @@ pub async fn connections(endpoint: &OperatorEndpoint) -> Result<String> {
 }
 
 /// Ask for everything it knows about the connection named `slug`.
-pub async fn connection(endpoint: &OperatorEndpoint, slug: &str) -> Result<String> {
+pub async fn connection(endpoint: &OperatorEndpoint, slug: &str) -> Result<wire::Connection> {
     let request = builder("GET", &format!("/connections/{slug}")).body(Full::default())?;
 
-    send_to(endpoint, request).await
+    send_json_to(endpoint, request).await
 }
 
 /// Ask it to forget the connection named `slug`, and everything cached under
@@ -323,7 +331,7 @@ pub async fn forget_connection(endpoint: &OperatorEndpoint, slug: &str) -> Resul
 pub async fn auth_user_list(
     endpoint: &OperatorEndpoint,
     pattern: Option<&Pattern>,
-) -> Result<String> {
+) -> Result<Vec<wire::UserRow>> {
     // A pattern over slugs is lowercase letters, digits, hyphens and `*`,
     // which a query string carries as they are — the argument [`list`] makes.
     let uri = match pattern {
@@ -331,7 +339,7 @@ pub async fn auth_user_list(
         None => "/auth/users".to_owned(),
     };
 
-    send_to(endpoint, builder("GET", &uri).body(Full::default())?).await
+    send_json_to(endpoint, builder("GET", &uri).body(Full::default())?).await
 }
 
 /// Ask it to create a user under `slug`, minting the id it keeps for life.
@@ -416,10 +424,13 @@ pub async fn auth_revoke(
 
 /// Ask for the sessions and API keys of the user `user` names — one listing,
 /// told apart by its KIND column.
-pub async fn auth_session_list(endpoint: &OperatorEndpoint, user: &UserRef) -> Result<String> {
+pub async fn auth_session_list(
+    endpoint: &OperatorEndpoint,
+    user: &UserRef,
+) -> Result<wire::Sessions> {
     let request = builder("GET", &format!("/auth/users/{user}/sessions")).body(Full::default())?;
 
-    send_to(endpoint, request).await
+    send_json_to(endpoint, request).await
 }
 
 /// Ask it to mint an API key for the user `user` names, granting exactly
@@ -485,10 +496,10 @@ pub async fn auth_session_drop(
 
 /// Ask for one user's whole standing: the record, the SSO connection, every
 /// entitlement with its origin, and the apps they actually reach.
-pub async fn auth_audit(endpoint: &OperatorEndpoint, user: &UserRef) -> Result<String> {
+pub async fn auth_audit(endpoint: &OperatorEndpoint, user: &UserRef) -> Result<wire::Audit> {
     let request = builder("GET", &format!("/auth/users/{user}/audit")).body(Full::default())?;
 
-    send_to(endpoint, request).await
+    send_json_to(endpoint, request).await
 }
 
 /// A mapping rule on its way to a spaceport: the parts of `spaceport auth
@@ -518,7 +529,10 @@ pub async fn auth_mapping_add(endpoint: &OperatorEndpoint, add: &MappingAdd) -> 
 }
 
 /// Ask for the mapping rules it holds, optionally only those about one app.
-pub async fn auth_mapping_list(endpoint: &OperatorEndpoint, app: Option<&AppId>) -> Result<String> {
+pub async fn auth_mapping_list(
+    endpoint: &OperatorEndpoint,
+    app: Option<&AppId>,
+) -> Result<Vec<wire::MappingRow>> {
     // An app id is the shared lowercase alphabet, which a query string
     // carries as it is — the argument [`list`] makes.
     let uri = match app {
@@ -526,7 +540,7 @@ pub async fn auth_mapping_list(endpoint: &OperatorEndpoint, app: Option<&AppId>)
         None => "/auth/mappings".to_owned(),
     };
 
-    send_to(endpoint, builder("GET", &uri).body(Full::default())?).await
+    send_json_to(endpoint, builder("GET", &uri).body(Full::default())?).await
 }
 
 /// Ask it to replay every mapping against the attributes stored from the
@@ -570,21 +584,24 @@ pub async fn auth_key_rotate(endpoint: &OperatorEndpoint) -> Result<String> {
 
 /// Ask for the signing keys still in the store: the current one, and any
 /// retired key the JWKS is still serving out its grace.
-pub async fn auth_key_list(endpoint: &OperatorEndpoint) -> Result<String> {
+pub async fn auth_key_list(endpoint: &OperatorEndpoint) -> Result<Vec<wire::SigningKeyRow>> {
     let request = builder("GET", "/auth/keys").body(Full::default())?;
 
-    send_to(endpoint, request).await
+    send_json_to(endpoint, request).await
 }
 
 /// Ask for the auth event log, optionally only what happened to one user.
-pub async fn auth_log(endpoint: &OperatorEndpoint, user: Option<&UserId>) -> Result<String> {
+pub async fn auth_log(
+    endpoint: &OperatorEndpoint,
+    user: Option<&UserId>,
+) -> Result<Vec<wire::LogRow>> {
     // A user id is hex and hyphens, which a query string carries as they are.
     let uri = match user {
         Some(user) => format!("/auth/log?user={user}"),
         None => "/auth/log".to_owned(),
     };
 
-    send_to(endpoint, builder("GET", &uri).body(Full::default())?).await
+    send_json_to(endpoint, builder("GET", &uri).body(Full::default())?).await
 }
 
 /// A GitHub App registration on its way to a spaceport.
@@ -773,4 +790,25 @@ async fn send_to(endpoint: &OperatorEndpoint, request: Request<Full<Bytes>>) -> 
     }
 
     Ok(body)
+}
+
+/// Send `request` asking to be answered in [`wire`] rather than in columns,
+/// and read back what it sent.
+///
+/// A refusal is still prose — an error message is written for a person however
+/// the request was framed — so the failure path is [`send_to`]'s exactly: the
+/// body is the message.
+async fn send_json_to<T: DeserializeOwned>(
+    endpoint: &OperatorEndpoint,
+    mut request: Request<Full<Bytes>>,
+) -> Result<T> {
+    request.headers_mut().insert(
+        http::header::ACCEPT,
+        http::HeaderValue::from_static(wire::JSON),
+    );
+
+    let body = send_to(endpoint, request).await?;
+
+    serde_json::from_str(&body)
+        .context("the operator interface sent something this version cannot read")
 }

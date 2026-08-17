@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use render::Colour;
+use render::{Colour, When};
 use spaceport_core::acme::account::{AcmeCa, Transport};
 use spaceport_core::acme::{CertificateRepository, Certificates, Challenges};
 use spaceport_core::app::{
@@ -62,6 +62,33 @@ const DEFAULT_STREAM_FILTER: &str = "spaceport=debug";
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    /// When to colour the output: auto (a terminal is there and `NO_COLOR` is
+    /// unset), always, or never.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = When::Auto,
+        global = true,
+        value_name = "WHEN"
+    )]
+    color: When,
+
+    /// What `--color=always` used to be called, kept working for the operators
+    /// and scripts that already type it.
+    #[arg(short = 'p', long, hide = true, global = true)]
+    pretty: bool,
+}
+
+impl Cli {
+    /// What the output is coloured with, with the old spelling of the flag
+    /// answered first.
+    fn colour(&self) -> Colour {
+        match self.pretty {
+            true => Colour::resolve(When::Always),
+            false => Colour::resolve(self.color),
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -895,15 +922,9 @@ struct StreamArgs {
     #[arg(long, default_value_t = 20, value_name = "COUNT")]
     history: usize,
 
-    /// Colour the events, even when this is not writing to a terminal.
-    /// Without it, colour is used when a terminal is there to show it and
-    /// `NO_COLOR` is not set.
-    #[arg(short, long)]
-    pretty: bool,
-
     /// Print the events as the JSON they arrive as, one per line. Never
     /// coloured: whatever reads this is not looking at it.
-    #[arg(long, conflicts_with = "pretty")]
+    #[arg(long)]
     json: bool,
 
     #[command(flatten)]
@@ -912,15 +933,9 @@ struct StreamArgs {
 
 #[derive(Debug, Args)]
 struct StatusArgs {
-    /// Colour the report, even when this is not writing to a terminal.
-    /// Without it, colour is used when a terminal is there to show it and
-    /// `NO_COLOR` is not set.
-    #[arg(short, long)]
-    pretty: bool,
-
     /// Print the status as the JSON it arrives as. Never coloured: whatever
     /// reads this is not looking at it.
-    #[arg(long, conflicts_with = "pretty")]
+    #[arg(long)]
     json: bool,
 
     #[command(flatten)]
@@ -950,7 +965,10 @@ struct ConfigArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let colour = cli.colour();
+
+    match cli.command {
         Command::Run(args) => run(args).await,
         Command::Setup(args) => setup(args),
         Command::Check { command } => match command {
@@ -958,62 +976,62 @@ async fn main() -> Result<()> {
             CheckCommand::State(args) => check_state(args).await,
         },
         Command::Apps { command } => match command {
-            AppsCommand::Apply(args) => apply(args).await,
-            AppsCommand::List(args) => list(args).await,
-            AppsCommand::Show(args) => show(args).await,
-            AppsCommand::Track(args) => track(args).await,
-            AppsCommand::Deploy(args) => deploy(args).await,
-            AppsCommand::Suspend(args) => suspend(args).await,
-            AppsCommand::Resume(args) => resume(args).await,
-            AppsCommand::Destroy(args) => destroy(args).await,
+            AppsCommand::Apply(args) => apply(args, colour).await,
+            AppsCommand::List(args) => list(args, colour).await,
+            AppsCommand::Show(args) => show(args, colour).await,
+            AppsCommand::Track(args) => track(args, colour).await,
+            AppsCommand::Deploy(args) => deploy(args, colour).await,
+            AppsCommand::Suspend(args) => suspend(args, colour).await,
+            AppsCommand::Resume(args) => resume(args, colour).await,
+            AppsCommand::Destroy(args) => destroy(args, colour).await,
             AppsCommand::Secret(args) => match args.command {
                 SecretCommand::List(args) => secret_list(args).await,
                 SecretCommand::Set(args) => secret_set(args).await,
-                SecretCommand::Delete(args) => secret_delete(args).await,
+                SecretCommand::Delete(args) => secret_delete(args, colour).await,
             },
         },
         Command::Auth { command } => match command {
             AuthCommand::User(args) => match args.command {
-                UserCommand::List(args) => user_list(args).await,
-                UserCommand::Create(args) => user_create(args).await,
-                UserCommand::Suspend(args) => user_suspend(args).await,
-                UserCommand::Resume(args) => user_resume(args).await,
-                UserCommand::Drop(args) => user_drop(args).await,
+                UserCommand::List(args) => user_list(args, colour).await,
+                UserCommand::Create(args) => user_create(args, colour).await,
+                UserCommand::Suspend(args) => user_suspend(args, colour).await,
+                UserCommand::Resume(args) => user_resume(args, colour).await,
+                UserCommand::Drop(args) => user_drop(args, colour).await,
             },
             AuthCommand::Session(args) => match args.command {
-                SessionCommand::List(args) => session_list(args).await,
-                SessionCommand::Mint(args) => session_mint(args).await,
-                SessionCommand::ApiKey(args) => session_api_key(args).await,
-                SessionCommand::Drop(args) => session_drop(args).await,
+                SessionCommand::List(args) => session_list(args, colour).await,
+                SessionCommand::Mint(args) => session_mint(args, colour).await,
+                SessionCommand::ApiKey(args) => session_api_key(args, colour).await,
+                SessionCommand::Drop(args) => session_drop(args, colour).await,
             },
-            AuthCommand::Grant(args) => grant(args).await,
-            AuthCommand::Revoke(args) => revoke(args).await,
-            AuthCommand::Audit(args) => audit(args).await,
+            AuthCommand::Grant(args) => grant(args, colour).await,
+            AuthCommand::Revoke(args) => revoke(args, colour).await,
+            AuthCommand::Audit(args) => audit(args, colour).await,
             AuthCommand::Mapping(args) => match args.command {
-                MappingCommand::List(args) => mapping_list(args).await,
-                MappingCommand::Add(args) => mapping_add(args).await,
-                MappingCommand::Test(args) => mapping_test(args).await,
-                MappingCommand::Drop(args) => mapping_drop(args).await,
+                MappingCommand::List(args) => mapping_list(args, colour).await,
+                MappingCommand::Add(args) => mapping_add(args, colour).await,
+                MappingCommand::Test(args) => mapping_test(args, colour).await,
+                MappingCommand::Drop(args) => mapping_drop(args, colour).await,
             },
             AuthCommand::Key(args) => match args.command {
-                KeyCommand::Rotate(args) => auth_key_rotate(args).await,
-                KeyCommand::List(args) => auth_key_list(args).await,
+                KeyCommand::Rotate(args) => auth_key_rotate(args, colour).await,
+                KeyCommand::List(args) => auth_key_list(args, colour).await,
             },
-            AuthCommand::Log(args) => auth_log(args).await,
+            AuthCommand::Log(args) => auth_log(args, colour).await,
         },
         Command::Connect { command } => match command {
-            ConnectCommand::Github(args) => connect_github(args).await,
-            ConnectCommand::List(args) => connections(args).await,
-            ConnectCommand::Show(args) => connection(args).await,
-            ConnectCommand::Forget(args) => forget_connection(args).await,
+            ConnectCommand::Github(args) => connect_github(args, colour).await,
+            ConnectCommand::List(args) => connections(args, colour).await,
+            ConnectCommand::Show(args) => connection(args, colour).await,
+            ConnectCommand::Forget(args) => forget_connection(args, colour).await,
         },
-        Command::Stream(args) => stream(args).await,
-        Command::Status(args) => status(args).await,
+        Command::Stream(args) => stream(args, colour).await,
+        Command::Status(args) => status(args, colour).await,
     }
 }
 
 /// Ask a running spaceport what it is, and lay the answer out.
-async fn status(args: StatusArgs) -> Result<()> {
+async fn status(args: StatusArgs, colour: Colour) -> Result<()> {
     let status = client::status(&args.server.server).await?;
 
     if args.json {
@@ -1024,7 +1042,7 @@ async fn status(args: StatusArgs) -> Result<()> {
         return Ok(());
     }
 
-    print!("{}", render::status(&status, Colour::detect(args.pretty)));
+    print!("{}", render::status(&status, colour));
 
     Ok(())
 }
@@ -1412,76 +1430,98 @@ fn setup(args: SetupArgs) -> Result<()> {
     Ok(())
 }
 
-async fn apply(args: ApplyArgs) -> Result<()> {
+async fn apply(args: ApplyArgs, colour: Colour) -> Result<()> {
     let manifest = std::fs::read_to_string(&args.manifest)
         .with_context(|| format!("reading app manifest `{}`", args.manifest.display()))?;
 
     print!(
         "{}",
-        client::apply(&args.server.server, &args.app_id, manifest, args.suspended).await?
-    );
-
-    Ok(())
-}
-
-async fn list(args: ListArgs) -> Result<()> {
-    print!(
-        "{}",
-        client::list(&args.server.server, args.pattern.as_ref()).await?
-    );
-
-    Ok(())
-}
-
-async fn show(args: ShowArgs) -> Result<()> {
-    print!(
-        "{}",
-        client::show(&args.server.server, &args.app_id, args.manifest).await?
-    );
-
-    Ok(())
-}
-
-async fn track(args: TrackArgs) -> Result<()> {
-    print!(
-        "{}",
-        client::track(
-            &args.server.server,
-            &args.app_id,
-            &args.repository,
-            &args.connection,
-            args.branch.as_deref(),
-            Some(&args.manifest_path),
-            args.deploy(),
+        render::prose::block(
+            &client::apply(&args.server.server, &args.app_id, manifest, args.suspended).await?,
+            colour
         )
-        .await?
     );
 
     Ok(())
 }
 
-async fn deploy(args: DeployArgs) -> Result<()> {
+async fn list(args: ListArgs, colour: Colour) -> Result<()> {
+    let rows = client::list(&args.server.server, args.pattern.as_ref()).await?;
+
     print!(
         "{}",
-        client::deploy(&args.server.server, &args.app_id, args.revision.as_deref()).await?
+        render::table::apps(&rows, args.pattern.as_ref(), colour)
     );
 
     Ok(())
 }
 
-async fn suspend(args: SuspendArgs) -> Result<()> {
+async fn show(args: ShowArgs, colour: Colour) -> Result<()> {
+    let shown = client::show(&args.server.server, &args.app_id, args.manifest).await?;
+
+    // `--manifest` is the document itself, handed back the way it was applied.
+    // It is somebody's file on its way to a pipe or an editor, not a report
+    // about an app, and nothing here has any business marking it up.
+    match args.manifest {
+        true => print!("{shown}"),
+        false => print!("{}", render::prose::block(&shown, colour)),
+    }
+
+    Ok(())
+}
+
+async fn track(args: TrackArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
-        client::suspend(&args.server.server, &args.app_id, args.stop_container).await?
+        render::prose::block(
+            &client::track(
+                &args.server.server,
+                &args.app_id,
+                &args.repository,
+                &args.connection,
+                args.branch.as_deref(),
+                Some(&args.manifest_path),
+                args.deploy(),
+            )
+            .await?,
+            colour
+        )
     );
 
     Ok(())
 }
 
-async fn resume(args: ResumeArgs) -> Result<()> {
+async fn deploy(args: DeployArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
-        client::resume(&args.server.server, &args.app_id).await?
+        render::prose::block(
+            &client::deploy(&args.server.server, &args.app_id, args.revision.as_deref()).await?,
+            colour
+        )
+    );
+
+    Ok(())
+}
+
+async fn suspend(args: SuspendArgs, colour: Colour) -> Result<()> {
+    print!(
+        "{}",
+        render::prose::block(
+            &client::suspend(&args.server.server, &args.app_id, args.stop_container).await?,
+            colour
+        )
+    );
+
+    Ok(())
+}
+
+async fn resume(args: ResumeArgs, colour: Colour) -> Result<()> {
+    print!(
+        "{}",
+        render::prose::block(
+            &client::resume(&args.server.server, &args.app_id).await?,
+            colour
+        )
     );
 
     Ok(())
@@ -1513,65 +1553,82 @@ async fn secret_set(args: SecretSetArgs) -> Result<()> {
     Ok(())
 }
 
-async fn secret_delete(args: SecretDeleteArgs) -> Result<()> {
+async fn secret_delete(args: SecretDeleteArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
-        client::delete_secret(&args.server.server, &args.app_id, &args.name).await?
+        render::prose::block(
+            &client::delete_secret(&args.server.server, &args.app_id, &args.name).await?,
+            colour
+        )
     );
 
     Ok(())
 }
 
-async fn user_list(args: UserListArgs) -> Result<()> {
+async fn user_list(args: UserListArgs, colour: Colour) -> Result<()> {
+    let rows = client::auth_user_list(&args.server.server, args.pattern.as_ref()).await?;
+
     print!(
         "{}",
-        client::auth_user_list(&args.server.server, args.pattern.as_ref()).await?
+        render::table::users(&rows, args.pattern.as_ref(), colour)
     );
 
     Ok(())
 }
 
-async fn user_create(args: UserCreateArgs) -> Result<()> {
+async fn user_create(args: UserCreateArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
-        client::auth_user_create(&args.server.server, &args.slug, args.email.as_deref()).await?
+        render::prose::block(
+            &client::auth_user_create(&args.server.server, &args.slug, args.email.as_deref())
+                .await?,
+            colour
+        )
     );
 
     Ok(())
 }
 
-async fn user_suspend(args: UserRefArgs) -> Result<()> {
+async fn user_suspend(args: UserRefArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
-        client::auth_user_suspend(&args.server.server, &args.user).await?
+        render::prose::block(
+            &client::auth_user_suspend(&args.server.server, &args.user).await?,
+            colour
+        )
     );
 
     Ok(())
 }
 
-async fn user_resume(args: UserRefArgs) -> Result<()> {
+async fn user_resume(args: UserRefArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
-        client::auth_user_resume(&args.server.server, &args.user).await?
+        render::prose::block(
+            &client::auth_user_resume(&args.server.server, &args.user).await?,
+            colour
+        )
     );
 
     Ok(())
 }
 
-async fn user_drop(args: UserRefArgs) -> Result<()> {
+async fn user_drop(args: UserRefArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
-        client::auth_user_drop(&args.server.server, &args.user).await?
+        render::prose::block(
+            &client::auth_user_drop(&args.server.server, &args.user).await?,
+            colour
+        )
     );
 
     Ok(())
 }
 
-async fn session_list(args: UserRefArgs) -> Result<()> {
-    print!(
-        "{}",
-        client::auth_session_list(&args.server.server, &args.user).await?
-    );
+async fn session_list(args: UserRefArgs, colour: Colour) -> Result<()> {
+    let listed = client::auth_session_list(&args.server.server, &args.user).await?;
+
+    print!("{}", render::table::sessions(&listed, colour));
 
     Ok(())
 }
@@ -1579,14 +1636,18 @@ async fn session_list(args: UserRefArgs) -> Result<()> {
 /// The duration is validated here as well as at the far end, so a typo is a
 /// refusal before anything crosses the socket — but what travels is the
 /// operator's own spelling, and the server's parser stays the authority.
-async fn session_mint(args: SessionMintArgs) -> Result<()> {
+async fn session_mint(args: SessionMintArgs, colour: Colour) -> Result<()> {
     if let Some(expires) = args.expires.as_deref() {
         spaceport_core::duration::parse(expires)?;
     }
 
     print!(
         "{}",
-        client::auth_session_mint(&args.server.server, &args.user, args.expires.as_deref()).await?
+        render::prose::block(
+            &client::auth_session_mint(&args.server.server, &args.user, args.expires.as_deref())
+                .await?,
+            colour
+        )
     );
 
     Ok(())
@@ -1595,38 +1656,48 @@ async fn session_mint(args: SessionMintArgs) -> Result<()> {
 /// The duration is validated here as well as at the far end, for
 /// [`session_mint`]'s reason: a typo is a refusal before anything crosses the
 /// socket, and the server's parser stays the authority.
-async fn session_api_key(args: SessionApiKeyArgs) -> Result<()> {
+async fn session_api_key(args: SessionApiKeyArgs, colour: Colour) -> Result<()> {
     if let Some(expires) = args.expires.as_deref() {
         spaceport_core::duration::parse(expires)?;
     }
 
     print!(
         "{}",
-        client::auth_api_key_mint(
-            &args.server.server,
-            &args.user,
-            &args.grants,
-            args.expires.as_deref()
+        render::prose::block(
+            &client::auth_api_key_mint(
+                &args.server.server,
+                &args.user,
+                &args.grants,
+                args.expires.as_deref()
+            )
+            .await?,
+            colour
         )
-        .await?
     );
 
     Ok(())
 }
 
-async fn session_drop(args: SessionDropArgs) -> Result<()> {
+async fn session_drop(args: SessionDropArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
-        client::auth_session_drop(&args.server.server, &args.user, args.session.as_ref()).await?
+        render::prose::block(
+            &client::auth_session_drop(&args.server.server, &args.user, args.session.as_ref())
+                .await?,
+            colour
+        )
     );
 
     Ok(())
 }
 
-async fn grant(args: GrantArgs) -> Result<()> {
+async fn grant(args: GrantArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
-        client::auth_grant(&args.server.server, &args.user, &args.entitlement).await?
+        render::prose::block(
+            &client::auth_grant(&args.server.server, &args.user, &args.entitlement).await?,
+            colour
+        )
     );
 
     Ok(())
@@ -1634,34 +1705,38 @@ async fn grant(args: GrantArgs) -> Result<()> {
 
 /// Clap has already enforced that exactly one of `scope` and `--all` was
 /// given, so an absent scope *is* `--all` by the time it gets here.
-async fn revoke(args: RevokeArgs) -> Result<()> {
+async fn revoke(args: RevokeArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
-        client::auth_revoke(&args.server.server, &args.user, args.scope.as_ref()).await?
+        render::prose::block(
+            &client::auth_revoke(&args.server.server, &args.user, args.scope.as_ref()).await?,
+            colour
+        )
     );
 
     Ok(())
 }
 
-async fn audit(args: UserRefArgs) -> Result<()> {
+async fn audit(args: UserRefArgs, colour: Colour) -> Result<()> {
+    let audited = client::auth_audit(&args.server.server, &args.user).await?;
+
+    print!("{}", render::report::audit(&audited, colour));
+
+    Ok(())
+}
+
+async fn mapping_list(args: MappingListArgs, colour: Colour) -> Result<()> {
+    let rows = client::auth_mapping_list(&args.server.server, args.app.as_ref()).await?;
+
     print!(
         "{}",
-        client::auth_audit(&args.server.server, &args.user).await?
+        render::table::mappings(&rows, args.app.as_ref(), colour)
     );
 
     Ok(())
 }
 
-async fn mapping_list(args: MappingListArgs) -> Result<()> {
-    print!(
-        "{}",
-        client::auth_mapping_list(&args.server.server, args.app.as_ref()).await?
-    );
-
-    Ok(())
-}
-
-async fn mapping_add(args: MappingAddArgs) -> Result<()> {
+async fn mapping_add(args: MappingAddArgs, colour: Colour) -> Result<()> {
     let add = client::MappingAdd {
         via: args.via,
         app: args.grants.app,
@@ -1670,47 +1745,60 @@ async fn mapping_add(args: MappingAddArgs) -> Result<()> {
     };
     print!(
         "{}",
-        client::auth_mapping_add(&args.server.server, &add).await?
+        render::prose::block(
+            &client::auth_mapping_add(&args.server.server, &add).await?,
+            colour
+        )
     );
 
     Ok(())
 }
 
-async fn mapping_test(args: UserRefArgs) -> Result<()> {
+async fn mapping_test(args: UserRefArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
-        client::auth_mapping_test(&args.server.server, &args.user).await?
+        render::prose::block(
+            &client::auth_mapping_test(&args.server.server, &args.user).await?,
+            colour
+        )
     );
 
     Ok(())
 }
 
-async fn mapping_drop(args: MappingDropArgs) -> Result<()> {
+async fn mapping_drop(args: MappingDropArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
-        client::auth_mapping_drop(&args.server.server, &args.rule).await?
+        render::prose::block(
+            &client::auth_mapping_drop(&args.server.server, &args.rule).await?,
+            colour
+        )
     );
 
     Ok(())
 }
 
-async fn auth_log(args: AuthLogArgs) -> Result<()> {
+async fn auth_log(args: AuthLogArgs, colour: Colour) -> Result<()> {
+    let rows = client::auth_log(&args.server.server, args.user.as_ref()).await?;
+
+    print!("{}", render::table::log(&rows, args.user.as_ref(), colour));
+
+    Ok(())
+}
+
+async fn auth_key_rotate(args: KeyServerArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
-        client::auth_log(&args.server.server, args.user.as_ref()).await?
+        render::prose::block(&client::auth_key_rotate(&args.server.server).await?, colour)
     );
 
     Ok(())
 }
 
-async fn auth_key_rotate(args: KeyServerArgs) -> Result<()> {
-    print!("{}", client::auth_key_rotate(&args.server.server).await?);
+async fn auth_key_list(args: KeyServerArgs, colour: Colour) -> Result<()> {
+    let rows = client::auth_key_list(&args.server.server).await?;
 
-    Ok(())
-}
-
-async fn auth_key_list(args: KeyServerArgs) -> Result<()> {
-    print!("{}", client::auth_key_list(&args.server.server).await?);
+    print!("{}", render::table::keys(&rows, colour));
 
     Ok(())
 }
@@ -1812,14 +1900,13 @@ fn set_line(id: &AppId, name: &VarName, set: &SecretSet) -> String {
 ///
 /// Ends on ctrl-c, which is the only way it ends while spaceport is up — and
 /// that is not a failure, so it says nothing about it.
-async fn stream(args: StreamArgs) -> Result<()> {
+async fn stream(args: StreamArgs, colour: Colour) -> Result<()> {
     let watch = Watch {
         app: args.app,
         category: args.category,
         level: Some(args.level),
         history: args.history,
     };
-    let colour = Colour::detect(args.pretty);
 
     let print = |event: Event| {
         if args.json {
@@ -1845,7 +1932,7 @@ async fn stream(args: StreamArgs) -> Result<()> {
 /// The private key is read here rather than sent as a path: the spaceport being
 /// talked to may be on another host, where the file an operator just downloaded
 /// does not exist.
-async fn connect_github(args: ConnectGithubArgs) -> Result<()> {
+async fn connect_github(args: ConnectGithubArgs, colour: Colour) -> Result<()> {
     if args.auto {
         let request = client::GithubAppRequest {
             org: args.org,
@@ -1854,7 +1941,10 @@ async fn connect_github(args: ConnectGithubArgs) -> Result<()> {
 
         print!(
             "{}",
-            client::register_github(&args.server.server, &request).await?
+            render::prose::block(
+                &client::register_github(&args.server.server, &request).await?,
+                colour
+            )
         );
 
         // No polling: what happens next is a person opening a link, and a
@@ -1882,7 +1972,10 @@ async fn connect_github(args: ConnectGithubArgs) -> Result<()> {
 
     print!(
         "{}",
-        client::connect_github(&args.server.server, &registration).await?
+        render::prose::block(
+            &client::connect_github(&args.server.server, &registration).await?,
+            colour
+        )
     );
 
     Ok(())
@@ -1897,34 +1990,41 @@ fn required<T>(value: Option<T>, flag: &str) -> Result<T> {
     value.with_context(|| format!("`{flag}` is required with `--manual`"))
 }
 
-async fn connections(args: ConnectListArgs) -> Result<()> {
-    print!("{}", client::connections(&args.server.server).await?);
+async fn connections(args: ConnectListArgs, colour: Colour) -> Result<()> {
+    let rows = client::connections(&args.server.server).await?;
+
+    print!("{}", render::table::connections(&rows, colour));
 
     Ok(())
 }
 
-async fn connection(args: ConnectShowArgs) -> Result<()> {
+async fn connection(args: ConnectShowArgs, colour: Colour) -> Result<()> {
+    let shown = client::connection(&args.server.server, &args.slug).await?;
+
+    print!("{}", render::report::connection(&shown, colour));
+
+    Ok(())
+}
+
+async fn forget_connection(args: ConnectForgetArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
-        client::connection(&args.server.server, &args.slug).await?
+        render::prose::block(
+            &client::forget_connection(&args.server.server, &args.slug).await?,
+            colour
+        )
     );
 
     Ok(())
 }
 
-async fn forget_connection(args: ConnectForgetArgs) -> Result<()> {
+async fn destroy(args: DestroyArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
-        client::forget_connection(&args.server.server, &args.slug).await?
-    );
-
-    Ok(())
-}
-
-async fn destroy(args: DestroyArgs) -> Result<()> {
-    print!(
-        "{}",
-        client::destroy(&args.server.server, &args.app_id).await?
+        render::prose::block(
+            &client::destroy(&args.server.server, &args.app_id).await?,
+            colour
+        )
     );
 
     Ok(())

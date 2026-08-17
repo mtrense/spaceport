@@ -12,7 +12,10 @@
 //! scanned past.
 
 mod event;
+pub mod prose;
+pub mod report;
 mod status;
+pub mod table;
 
 use std::io::IsTerminal;
 
@@ -31,6 +34,25 @@ pub const CYAN: &str = "\x1b[36m";
 /// Set by anything that would rather not be sent escape codes.
 const NO_COLOUR_VAR: &str = "NO_COLOR";
 
+/// Names the terminal that cannot show any of this.
+const TERM_VAR: &str = "TERM";
+
+/// What `TERM` says when there is nothing to colour for.
+const DUMB_TERM: &str = "dumb";
+
+/// What an operator asked for, before the terminal gets a say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, Default)]
+pub enum When {
+    /// Colour when a person is watching and nothing has asked us not to.
+    #[default]
+    Auto,
+    /// Colour regardless — including into a pager, which is the case the
+    /// terminal check gets wrong.
+    Always,
+    /// Never colour, whoever is reading.
+    Never,
+}
+
 /// Whether these lines carry colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Colour {
@@ -39,17 +61,22 @@ pub enum Colour {
 }
 
 impl Colour {
-    /// Colour when a person is watching, and not when the output is being
-    /// piped into something that would only have to strip it out again.
+    /// What an operator's `--color` comes down to here.
     ///
-    /// `forced` is `--pretty`, which is an operator saying they want it
-    /// regardless — including into a pager, which is the case the terminal
-    /// check gets wrong.
-    pub fn detect(forced: bool) -> Self {
-        if forced {
-            return Self::Yes;
+    /// Under `Auto` that is: not when `NO_COLOR` is set at all, not when the
+    /// terminal says it is `dumb`, and not when the output is being piped into
+    /// something that would only have to strip the escapes out again.
+    pub fn resolve(when: When) -> Self {
+        match when {
+            When::Always => return Self::Yes,
+            When::Never => return Self::No,
+            When::Auto => {}
         }
+
         if std::env::var_os(NO_COLOUR_VAR).is_some() {
+            return Self::No;
+        }
+        if std::env::var_os(TERM_VAR).is_some_and(|term| term == DUMB_TERM) {
             return Self::No;
         }
 
@@ -78,7 +105,17 @@ mod tests {
 
     #[test]
     fn forcing_colour_beats_asking_the_terminal() {
-        assert_eq!(Colour::detect(true), Colour::Yes);
+        assert_eq!(Colour::resolve(When::Always), Colour::Yes);
+    }
+
+    #[test]
+    fn refusing_colour_beats_asking_the_terminal() {
+        assert_eq!(Colour::resolve(When::Never), Colour::No);
+    }
+
+    #[test]
+    fn asking_the_terminal_is_what_an_operator_gets_by_default() {
+        assert_eq!(When::default(), When::Auto);
     }
 
     /// What a terminal would not print, dropped the crude way: every escape

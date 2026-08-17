@@ -8,6 +8,7 @@
 
 pub mod client;
 pub mod server;
+pub mod wire;
 
 use std::fmt;
 use std::net::SocketAddr;
