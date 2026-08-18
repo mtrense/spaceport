@@ -170,6 +170,16 @@ const STATE_BYTES: usize = 16;
 /// GitHub's.
 pub const LIFETIME: Duration = Duration::minutes(30);
 
+/// How many unfinished registrations this spaceport will hold at once.
+///
+/// Registrations arrive over the operator socket, which is off the network, so
+/// this is not a number anybody outside the host can push against — it is here
+/// because the login flow's map is deliberately the same shape as this one and
+/// a bound that only one of them has is a bound the next reader will not
+/// believe. An operator registers Apps by hand; a hundred in flight is already
+/// a stuck loop rather than a busy afternoon.
+const MAX_PENDING_ATTEMPTS: usize = 256;
+
 /// The document GitHub creates an App from.
 ///
 /// Serialised into a hidden form field and posted by a browser, so every field
@@ -288,20 +298,35 @@ impl Attempts {
     }
 
     /// Remember an attempt and hand back the state that names it.
+    ///
+    /// Sweeps first, so a spaceport whose operator abandons registrations and
+    /// never reaches a callback still forgets them, and refuses rather than
+    /// grows once [`MAX_PENDING_ATTEMPTS`] are in flight — the refusal is a
+    /// sentence the operator interface already knows how to render.
     pub fn begin(&self, org: Option<String>, name: String, now: OffsetDateTime) -> Result<String> {
         let state = nonce()?;
 
-        self.pending
+        let mut pending = self
+            .pending
             .lock()
-            .expect("the pending attempts are never held across a panic")
-            .insert(
-                state.clone(),
-                Attempt {
-                    org,
-                    name,
-                    created_at: now,
-                },
+            .expect("the pending attempts are never held across a panic");
+
+        pending.retain(|_, attempt| !attempt.expired(now));
+
+        if pending.len() >= MAX_PENDING_ATTEMPTS {
+            bail!(
+                "this spaceport is already holding {MAX_PENDING_ATTEMPTS} unfinished registrations — finish or abandon one and try again"
             );
+        }
+
+        pending.insert(
+            state.clone(),
+            Attempt {
+                org,
+                name,
+                created_at: now,
+            },
+        );
 
         Ok(state)
     }
@@ -327,10 +352,10 @@ impl Attempts {
     /// that does not match one spaceport issued is not an answer to a question
     /// spaceport asked, and there is nothing to do with it but refuse it.
     ///
-    /// Expired attempts are dropped on the way past, which is the only sweeping
-    /// there is: without it a spaceport whose operator abandons a registration
-    /// keeps that attempt for as long as the process runs, and the map grows
-    /// with every one of them.
+    /// Expired attempts are dropped on the way past, as they are in
+    /// [`Attempts::begin`]: without it a spaceport whose operator abandons a
+    /// registration keeps that attempt for as long as the process runs, and the
+    /// map grows with every one of them.
     pub fn take(&self, state: &str, now: OffsetDateTime) -> Option<Attempt> {
         let mut pending = self
             .pending
@@ -621,6 +646,34 @@ mod tests {
 
         assert!(attempts.pending.lock().unwrap().get(&abandoned).is_none());
         assert!(attempts.pending.lock().unwrap().is_empty());
+    }
+
+    /// The same bound the login flow's map has, for the same reason: a map
+    /// nothing caps is a map whose size somebody else picks. Here it is the
+    /// operator socket doing the picking, so the ceiling is hygiene — and the
+    /// sweep on the way in is what lets an abandoned registration stop
+    /// counting against it without any callback ever arriving.
+    #[test]
+    fn a_full_map_refuses_until_its_attempts_expire() {
+        let attempts = Attempts::new();
+        let started = now();
+        for index in 0..MAX_PENDING_ATTEMPTS {
+            attempts
+                .begin(None, format!("Sp {index}"), started)
+                .unwrap();
+        }
+
+        assert!(
+            attempts
+                .begin(None, "One too many".to_owned(), started)
+                .is_err()
+        );
+        assert_eq!(attempts.pending.lock().unwrap().len(), MAX_PENDING_ATTEMPTS);
+
+        let later = started + LIFETIME + Duration::seconds(1);
+
+        assert!(attempts.begin(None, "Fresh".to_owned(), later).is_ok());
+        assert_eq!(attempts.pending.lock().unwrap().len(), 1);
     }
 
     /// Two attempts must not be able to answer for each other, which is the

@@ -132,6 +132,17 @@ pub struct Home {
 /// in allowed to sit unused.
 const LOGIN_STATE_LIFETIME: Duration = Duration::minutes(10);
 
+/// How many unfinished logins this spaceport will hold at once.
+///
+/// A ceiling rather than a tuning knob. The route that fills this map is
+/// unauthenticated by design — a sign-in button is a link anyone may follow —
+/// so without a number here the map's size is whatever request rate somebody
+/// points at it, and the edge is the one process on the host that must not be
+/// the one that runs out of memory. Four thousand is orders of magnitude more
+/// logins than a spaceport has genuinely in flight in a ten-minute window, so
+/// the number is only ever reached by a spaceport under attack.
+const MAX_PENDING_LOGINS: usize = 4096;
+
 /// One login in flight: which connection it went out through, and where the
 /// finished login should land.
 #[derive(Debug, Clone)]
@@ -151,6 +162,12 @@ struct LoginAttempt {
 /// to a question this spaceport asked, exactly once. Unlike the setup flow
 /// there is no `peek`: nothing between the redirect and the callback ever
 /// needs to read an attempt without spending it.
+///
+/// What the setup flow does not have to reckon with is who fills the map. This
+/// one is filled by `GET /auth/github/{slug}`, which is a link on a public
+/// login page and answers anybody — so the sweep runs on the way in as well as
+/// on the way out, and [`MAX_PENDING_LOGINS`] is the size this map has, rather
+/// than the size somebody else's request rate gives it.
 #[derive(Debug, Default)]
 pub struct LoginAttempts {
     pending: Mutex<HashMap<String, LoginAttempt>>,
@@ -162,43 +179,68 @@ impl LoginAttempts {
     }
 
     /// Remember that a login left through `connection` aiming at `next`, and
-    /// hand back the state that names it.
+    /// hand back the state that names it — or `None` when this spaceport is
+    /// already holding [`MAX_PENDING_LOGINS`] of them.
+    ///
+    /// Full means refuse, not evict: the alternative is that whoever fills the
+    /// map decides which of the logins already in flight stops working, and a
+    /// user thrown out mid-sign-in for somebody else's traffic is a worse
+    /// answer than a page telling them to try again. Both are a denial; only
+    /// one of them breaks a promise this spaceport already made.
     fn begin(
         &self,
         connection: String,
         next: String,
         now: OffsetDateTime,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<Option<String>> {
         let state = manifest::nonce()?;
 
-        self.pending
+        let mut pending = self
+            .pending
             .lock()
-            .expect("the pending logins are never held across a panic")
-            .insert(
-                state.clone(),
-                LoginAttempt {
-                    connection,
-                    next,
-                    created_at: now,
-                },
-            );
+            .expect("the pending logins are never held across a panic");
 
-        Ok(state)
+        sweep(&mut pending, now);
+
+        if pending.len() >= MAX_PENDING_LOGINS {
+            return Ok(None);
+        }
+
+        pending.insert(
+            state.clone(),
+            LoginAttempt {
+                connection,
+                next,
+                created_at: now,
+            },
+        );
+
+        Ok(Some(state))
     }
 
     /// Consume `state`, if it names a login that has not expired — sweeping
-    /// abandoned attempts on the way past, which is the only sweeping there
-    /// is, for [`Attempts::take`]'s reason.
+    /// abandoned attempts on the way past, for [`Attempts::take`]'s reason.
     fn take(&self, state: &str, now: OffsetDateTime) -> Option<LoginAttempt> {
         let mut pending = self
             .pending
             .lock()
             .expect("the pending logins are never held across a panic");
 
-        pending.retain(|_, attempt| now - attempt.created_at < LOGIN_STATE_LIFETIME);
+        sweep(&mut pending, now);
 
         pending.remove(state)
     }
+}
+
+/// Drop every login too old to still be answered.
+///
+/// On both paths rather than only on the callback's: a spaceport that starts
+/// logins and never sees one come back — which is every spaceport whose login
+/// page somebody is walking past — would otherwise never sweep at all. Bounded
+/// by [`MAX_PENDING_LOGINS`], so the scan under the lock costs a constant and
+/// a real login is never queued behind an arbitrarily long one.
+fn sweep(pending: &mut HashMap<String, LoginAttempt>, now: OffsetDateTime) {
+    pending.retain(|_, attempt| now - attempt.created_at < LOGIN_STATE_LIFETIME);
 }
 
 /// The session cookie's name. The `__Host-` prefix is a promise the browser
@@ -731,7 +773,19 @@ async fn github_start(
         safe_next(query.next.as_deref()).to_owned(),
         OffsetDateTime::now_utc(),
     ) {
-        Ok(state) => state,
+        Ok(Some(state)) => state,
+        Ok(None) => {
+            warn!(
+                limit = MAX_PENDING_LOGINS,
+                "a login start was refused because too many logins are already in flight"
+            );
+
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Too many sign-ins are in flight",
+                "This spaceport is holding as many unfinished sign-ins as it will. Nothing was started. Try again in a few minutes.",
+            );
+        }
         Err(error) => {
             warn!(error = %format!("{error:#}"), "a login start could not mint a state");
 
@@ -1008,19 +1062,34 @@ fn login_form(
     )
 }
 
+/// The longest `next` worth carrying.
+///
+/// Part of the shape and not a separate concern: a `next` is remembered in
+/// [`LoginAttempts`], which an unauthenticated request writes to, so its length
+/// is the size of an entry somebody else chooses. Half a kilobyte is a roomy
+/// path and query for any app spaceport fronts and keeps a full map's worst
+/// case in the low megabytes.
+const MAX_NEXT: usize = 512;
+
 /// Where a finished login may be sent: `next` when it is a plain absolute path
 /// on this host, `/` otherwise.
 ///
 /// The rules are deny-by-shape rather than a parse: it must start with `/`,
 /// must not start with `//` (which a browser reads as scheme-relative and
-/// sends to another host), and must not contain `\` (which some browsers
-/// normalise into `/` and turn `/\evil.example` back into the previous case).
-/// Anything with a scheme fails the leading-`/` test already. The fallback is
-/// `/` and never an error, because the value arrives on urls users share and
-/// a broken link should still land them somewhere signed in.
+/// sends to another host), must not contain `\` (which some browsers
+/// normalise into `/` and turn `/\evil.example` back into the previous case),
+/// and must fit in [`MAX_NEXT`]. Anything with a scheme fails the leading-`/`
+/// test already. The fallback is `/` and never an error, because the value
+/// arrives on urls users share and a broken link should still land them
+/// somewhere signed in.
 pub(super) fn safe_next(next: Option<&str>) -> &str {
     match next {
-        Some(next) if next.starts_with('/') && !next.starts_with("//") && !next.contains('\\') => {
+        Some(next)
+            if next.starts_with('/')
+                && !next.starts_with("//")
+                && !next.contains('\\')
+                && next.len() <= MAX_NEXT =>
+        {
             next
         }
         _ => "/",
@@ -3140,5 +3209,114 @@ mod tests {
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].role.as_str(), "editor");
         assert_eq!(held[0].mapped_rule, None);
+    }
+
+    /// One login remembered, with an explicit clock the tests can move.
+    fn begin_at(logins: &LoginAttempts, now: OffsetDateTime) -> Option<String> {
+        logins
+            .begin("spaceport-for-acme".to_owned(), "/".to_owned(), now)
+            .unwrap()
+    }
+
+    fn held(logins: &LoginAttempts) -> usize {
+        logins.pending.lock().unwrap().len()
+    }
+
+    /// The bound, which is the whole point: an unauthenticated route may be
+    /// walked as often as somebody likes and the map still stops growing.
+    #[test]
+    fn a_full_map_refuses_rather_than_grows() {
+        let logins = LoginAttempts::new();
+        let now = OffsetDateTime::now_utc();
+        for _ in 0..MAX_PENDING_LOGINS {
+            assert!(begin_at(&logins, now).is_some());
+        }
+
+        assert!(begin_at(&logins, now).is_none());
+        assert_eq!(held(&logins), MAX_PENDING_LOGINS);
+    }
+
+    /// Refusing rather than evicting, seen from the other side: a login already
+    /// in flight when the flood arrives still finishes.
+    #[test]
+    fn filling_the_map_does_not_spend_a_login_already_in_flight() {
+        let logins = LoginAttempts::new();
+        let now = OffsetDateTime::now_utc();
+        let mine = begin_at(&logins, now).unwrap();
+
+        for _ in 0..MAX_PENDING_LOGINS * 2 {
+            begin_at(&logins, now);
+        }
+
+        assert!(logins.take(&mine, now).is_some());
+    }
+
+    /// The sweep runs on the way in, so a spaceport nobody ever completes a
+    /// login at still forgets the abandoned ones — and a map filled by a burst
+    /// takes new logins again once that burst is past its lifetime.
+    #[test]
+    fn beginning_a_login_sweeps_the_expired_ones() {
+        let logins = LoginAttempts::new();
+        let started = OffsetDateTime::now_utc();
+        for _ in 0..MAX_PENDING_LOGINS {
+            begin_at(&logins, started);
+        }
+        assert!(begin_at(&logins, started).is_none());
+
+        let later = started + LOGIN_STATE_LIFETIME + Duration::seconds(1);
+
+        assert!(begin_at(&logins, later).is_some());
+        // Every one of the burst's entries went, and only the fresh one is
+        // left — no callback traffic involved.
+        assert_eq!(held(&logins), 1);
+    }
+
+    /// A `next` too long to be a path this host serves is a hostile shape like
+    /// any other: it lands at `/`, and what gets remembered is one byte rather
+    /// than however many somebody sent.
+    #[test]
+    fn an_overlong_next_falls_back_to_the_root() {
+        let longest = format!("/{}", "a".repeat(MAX_NEXT - 1));
+        assert_eq!(safe_next(Some(&longest)), longest);
+
+        let overlong = format!("/{}", "a".repeat(MAX_NEXT));
+        assert_eq!(safe_next(Some(&overlong)), "/");
+    }
+
+    /// And through the router: the start route stores the sanitized value, so
+    /// the size of an entry is spaceport's to decide.
+    #[tokio::test]
+    async fn starting_a_login_with_an_overlong_next_remembers_the_root() {
+        let (home, _, _) = sso_home();
+        connect_for_login(&home).await;
+
+        let state = started(
+            home.clone(),
+            &format!(
+                "/auth/github/spaceport-for-acme?next=%2F{}",
+                "a".repeat(MAX_NEXT)
+            ),
+        )
+        .await;
+
+        let attempt = home.logins.take(&state, OffsetDateTime::now_utc()).unwrap();
+        assert_eq!(attempt.next, "/");
+    }
+
+    /// A refused start is a sentence and a 503, not a bounce to GitHub for a
+    /// state this spaceport did not keep.
+    #[tokio::test]
+    async fn starting_a_login_at_capacity_is_refused() {
+        let (home, _, _) = sso_home();
+        connect_for_login(&home).await;
+        let now = OffsetDateTime::now_utc();
+        for _ in 0..MAX_PENDING_LOGINS {
+            begin_at(&home.logins, now);
+        }
+
+        let (status, body) = get_path(home, "/auth/github/spaceport-for-acme").await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("Nothing was started"), "{body}");
     }
 }
