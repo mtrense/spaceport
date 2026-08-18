@@ -832,7 +832,9 @@ struct GithubCallback {
 /// connection and the `next` so neither is ever read off the request. Then the
 /// connection's own client turns the code into a token and the token into who
 /// the person is — and everything from there is [`SsoRepository::login`]'s one
-/// transaction. Every refusal on the way is a sentence with the login page a
+/// transaction. A GitHub account no mapping rule matches is turned away here
+/// without a user being made, so an unknown arrival leaves the log entry and
+/// nothing else. Every refusal on the way is a sentence with the login page a
 /// click away, because the person standing here is a user mid-sign-in, not an
 /// operator reading a terminal.
 async fn github_callback(
@@ -994,6 +996,11 @@ async fn github_callback(
                 "GitHub signed you in, and the spaceport account `{}` it belongs to is suspended. An operator can resume it.",
                 user.slug
             ),
+        ),
+        Ok(SsoOutcome::Unmapped) => problem(
+            StatusCode::FORBIDDEN,
+            "This spaceport has no account for you",
+            "GitHub confirmed who you are, but there is no account here for you and no mapping rule that would make one. An operator has to add a mapping rule that matches you, or create the account, before you can sign in. Once they have, start again from the login page at /login.",
         ),
         Err(error) => {
             warn!(error = %format!("{error:#}"), "an sso login could not be recorded");
@@ -3005,6 +3012,17 @@ mod tests {
             .create(&"alice".parse().unwrap(), Some("octocat@acme.example"))
             .await
             .unwrap();
+        // Auto-creation is gated on a rule matching, so a test about what the
+        // email does has to get past that gate first: the login attribute the
+        // callback always plants is the cheapest thing to match on.
+        crate::auth::MappingRepository::new(db.clone())
+            .add(
+                "spaceport-for-acme",
+                &"reader@blog".parse().unwrap(),
+                &["login=octocat".parse().unwrap()],
+            )
+            .await
+            .unwrap();
 
         let state = started(home.clone(), "/auth/github/spaceport-for-acme").await;
         let response =
@@ -3102,13 +3120,68 @@ mod tests {
         );
     }
 
+    /// The create-gate end to end through the router: a stranger no rule
+    /// matches is turned away, and nothing is made for them — no user, no
+    /// session, and no `user.created` or `login.succeeded` in the log that an
+    /// operator would later have to read past.
+    #[tokio::test]
+    async fn a_github_login_matching_no_mapping_rule_creates_nothing() {
+        let (home, github, db) = sso_home();
+        connect_for_login(&home).await;
+        github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
+        github.user_emails_in_pages(&[&[("octocat@acme.example", true, true)]]);
+        github.user_belongs_to_orgs(&["acme-corp"]);
+        // A rule that exists and does not match: an empty table would refuse
+        // this login for the wrong reason.
+        crate::auth::MappingRepository::new(db.clone())
+            .add(
+                "spaceport-for-acme",
+                &"reader@blog".parse().unwrap(),
+                &["org=other-corp".parse().unwrap()],
+            )
+            .await
+            .unwrap();
+
+        let state = started(home.clone(), "/auth/github/spaceport-for-acme").await;
+        let response =
+            callback_with(home.clone(), &format!("code=a-login-code&state={state}")).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(response.headers().get(http::header::SET_COOKIE).is_none());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("mapping rule"), "{body}");
+        assert!(body.contains("/login"), "{body}");
+        // Nobody was made, and the log carries no trace of one.
+        let users = crate::auth::UserRepository::new(db.clone());
+        assert!(users.list(None).await.unwrap().is_empty());
+        let entries = home.auth_log.entries(None).await.unwrap();
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.kind == "user.created" || entry.kind == "login.succeeded"),
+            "{entries:?}"
+        );
+    }
+
     /// The state is single-use and must be spaceport's own: garbage is
     /// refused, and the same state answered twice signs in once.
     #[tokio::test]
     async fn a_bad_or_replayed_state_is_refused() {
-        let (home, github, _) = sso_home();
+        let (home, github, db) = sso_home();
         connect_for_login(&home).await;
         github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
+        // Auto-creation is gated on a rule matching, and the replay half only
+        // means something if the first callback really signs in — so this test
+        // about state has to get past that gate first.
+        crate::auth::MappingRepository::new(db.clone())
+            .add(
+                "spaceport-for-acme",
+                &"reader@blog".parse().unwrap(),
+                &["login=octocat".parse().unwrap()],
+            )
+            .await
+            .unwrap();
 
         let (status, body) = get_path(
             home.clone(),

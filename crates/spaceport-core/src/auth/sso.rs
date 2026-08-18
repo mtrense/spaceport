@@ -69,12 +69,21 @@ pub enum SsoOutcome {
     /// the refusal is already in the log. Carries the record so the page can
     /// say whose door is closed — the person is looking at their own account.
     Suspended(UserRecord),
+    /// GitHub confirmed who this is, and spaceport has neither an account for
+    /// them nor a rule that would make one: no mapping of this connection
+    /// matches the attributes the login arrived with. Nothing was written but
+    /// the refusal itself, and there is no record to carry back — auto-creating
+    /// here would leave a user, an identity snapshot, a session and a fan of
+    /// log rows behind for somebody who could not have been entitled to
+    /// anything anyway.
+    Unmapped,
 }
 
 /// What the transaction closure hands back, before the pre-minted secrets are
 /// folded in.
 enum Inner {
     Suspended(UserRecord),
+    Unmapped,
     SignedIn {
         user: UserId,
         expires_at: String,
@@ -152,8 +161,53 @@ impl SsoRepository {
                 sweep_expired_in(&transaction)?;
 
                 let at = now();
+
+                // The judgement, made once and used twice: this connection's
+                // rules read out of the table and evaluated against the
+                // snapshot before anything is written. It gates auto-creation
+                // below and it is the same verdict the re-sync applies further
+                // down, because it is handed to `resync_in` rather than
+                // recomputed there — two evaluations of the same slate could
+                // only ever agree by luck.
+                let mappings = connection_mappings(&transaction, &login.connection)?;
+                let matched = evaluate(&mappings, &login.connection, &login.attributes);
+
+                // The gate is on *creation* only, deliberately. A user resolved
+                // by a stored identity or a verified email who currently
+                // matches no rule still signs in with whatever slate they have:
+                // operator-made accounts never match a rule at all, and a
+                // member who temporarily fell out of an org must keep getting
+                // through the door rather than losing their account to a
+                // membership blip.
                 let user = match resolve(&transaction, &login)? {
                     Some(user) => user,
+                    // Nobody spaceport knows, and no rule that would make
+                    // somebody of them: the login is refused before a single
+                    // row is written about them. One audit entry is the whole
+                    // trace it leaves, about no user because there is no user —
+                    // `jwt.rs`'s `key.rotated` is the precedent for a userless
+                    // entry. Returning here steps over the suspension gate
+                    // below, which is right: suspension is a property of a
+                    // resolved user, and there is none to be suspended.
+                    None if matched.is_empty() => {
+                        record_in(
+                            &transaction,
+                            &at,
+                            "login.failed",
+                            None,
+                            &login.connection,
+                            Some(&format!(
+                                "sso login as `{}` ({}) refused: no mapping rule of this \
+                                 connection matches the account",
+                                login.external_login, login.external_id
+                            )),
+                        )?;
+                        transaction
+                            .commit()
+                            .context("committing an unmapped sso login")?;
+
+                        return Ok(Inner::Unmapped);
+                    }
                     None => create(&transaction, &login, &fresh_user, &slug, &suffixed, &at)?,
                 };
 
@@ -182,7 +236,7 @@ impl SsoRepository {
                 }
 
                 record_identity_in(&transaction, &user.id, &login, &at)?;
-                let changed = resync_in(&transaction, &user.id, &login, &at)?;
+                let changed = resync_in(&transaction, &user.id, &login, &at, &mappings, &matched)?;
 
                 let expires_at = stamp_after(DEFAULT_SESSION_LIFETIME);
                 transaction
@@ -226,6 +280,11 @@ impl SsoRepository {
                 info!(user = %user.id, slug = %user.slug, "sso login refused: suspended");
 
                 Ok(SsoOutcome::Suspended(user))
+            }
+            Inner::Unmapped => {
+                info!("sso login refused: no mapping rule matches the account");
+
+                Ok(SsoOutcome::Unmapped)
             }
             Inner::SignedIn {
                 user,
@@ -423,10 +482,57 @@ fn record_identity_in(
     Ok(())
 }
 
+/// Every rule of one connection, read the way `mapping list` reads them.
+///
+/// A free function over the caller's transaction because the login needs this
+/// slate twice over — once to decide whether an unknown account may become a
+/// user at all, and once to re-sync whatever user it ends up being — and
+/// reading the table twice inside one transaction would only invite the two
+/// reads to disagree. A row this build cannot parse is skipped with a warning
+/// rather than costing the login, exactly as it does not cost the listing: a
+/// mapping written by some newer spaceport must not lock everybody out.
+fn connection_mappings(
+    transaction: &Transaction<'_>,
+    connection: &str,
+) -> Result<Vec<MappingRecord>> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT rule_id, connection, spaceport_app, roles, conditions, created_at
+             FROM mappings WHERE connection = ?1 ORDER BY created_at, rule_id",
+        )
+        .context("preparing the login re-sync's mapping query")?;
+    let rows: Vec<mapping::MappingRow> = statement
+        .query_map(rusqlite::params![connection], mapping::mapping_row)
+        .context("reading the connection's mappings")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("reading the connection's mappings")?;
+    drop(statement);
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| match mapping::mapping_record(row) {
+            Ok(record) => Some(record),
+            Err(error) => {
+                tracing::warn!(%error, "skipping a stored mapping this build cannot read");
+                None
+            }
+        })
+        .collect())
+}
+
 /// The spec's full re-sync: every rule of this connection is re-judged against
 /// the fresh snapshot, entitlements whose rule no longer matches go, new
 /// matches arrive — and manual grants (`mapped_rule` NULL) and other
 /// connections' rules are never touched. Answers whether anything moved.
+///
+/// The judgement arrives as an argument rather than being made here, and that
+/// is the point: the login has already asked [`evaluate`] whether any rule
+/// matches, because the answer decides whether an unknown account may become a
+/// user at all, and handing that same `matched` slice down is what makes the
+/// create-gate and the re-sync provably one judgement instead of two
+/// evaluations that could drift apart the day either side grows a wrinkle.
+/// `mappings` comes along for the same reason — it is the set the stale check
+/// asks "was this row one of ours".
 ///
 /// The changes land as one `mapping.synced` log entry rather than a fan of
 /// grants and revokes, for the reason `mapping drop` gives: the rows moved as
@@ -437,40 +543,16 @@ fn resync_in(
     user: &UserId,
     login: &SsoLogin,
     at: &str,
+    mappings: &[MappingRecord],
+    matched: &[&MappingRecord],
 ) -> Result<bool> {
-    // Every rule of this connection, read the way `mapping list` reads them —
-    // a row this build cannot parse is skipped with a warning rather than
-    // costing the login, exactly as it does not cost the listing.
-    let mut statement = transaction
-        .prepare(
-            "SELECT rule_id, connection, spaceport_app, roles, conditions, created_at
-             FROM mappings WHERE connection = ?1 ORDER BY created_at, rule_id",
-        )
-        .context("preparing the login re-sync's mapping query")?;
-    let rows: Vec<mapping::MappingRow> = statement
-        .query_map(rusqlite::params![login.connection], mapping::mapping_row)
-        .context("reading the connection's mappings")?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .context("reading the connection's mappings")?;
-    drop(statement);
-    let mappings: Vec<MappingRecord> = rows
-        .into_iter()
-        .filter_map(|row| match mapping::mapping_record(row) {
-            Ok(record) => Some(record),
-            Err(error) => {
-                tracing::warn!(%error, "skipping a stored mapping this build cannot read");
-                None
-            }
-        })
-        .collect();
     let this_connections_rules: HashSet<&str> = mappings
         .iter()
         .map(|mapping| mapping.rule_id.as_str())
         .collect();
 
-    // What the snapshot earns: (app, role, rule) triples, judged by the very
-    // function `mapping test` previews with.
-    let matched = evaluate(&mappings, &login.connection, &login.attributes);
+    // What the snapshot earns: (app, role, rule) triples, from the verdict the
+    // very function `mapping test` previews with already reached.
     let desired: Vec<(String, String, String)> = matched
         .iter()
         .flat_map(|rule| {
@@ -569,7 +651,7 @@ fn resync_in(
 mod tests {
     use super::*;
     use crate::auth::{
-        AuthLogRepository, EntitlementRepository, IdentityRepository, MappingRepository,
+        AuthEvent, AuthLogRepository, EntitlementRepository, IdentityRepository, MappingRepository,
         UserRepository,
     };
 
@@ -637,7 +719,21 @@ mod tests {
         match outcome {
             SsoOutcome::SignedIn(fresh) => fresh,
             SsoOutcome::Suspended(user) => panic!("refused as suspended: {}", user.slug),
+            SsoOutcome::Unmapped => panic!("refused as unmapped"),
         }
+    }
+
+    /// Plant one rule of `spaceport-acme` that the octocat login satisfies, so
+    /// a test about something else than the create-gate gets past it.
+    async fn plant_octocat_rule(db: &Db) {
+        MappingRepository::new(db.clone())
+            .add(
+                "spaceport-acme",
+                &"reader@blog".parse().unwrap(),
+                &["login=octocat".parse().unwrap()],
+            )
+            .await
+            .unwrap();
     }
 
     /// The whole auto-create path in one pass: a stranger's login makes a
@@ -647,6 +743,7 @@ mod tests {
     async fn a_stranger_becomes_a_prefixed_user_with_their_primary_email() {
         let (db, users, sso, _, log) = repositories();
         plant_connection(&db, "spaceport-acme").await;
+        plant_octocat_rule(&db).await;
 
         let fresh = signed_in(
             sso.login(octocat(
@@ -739,12 +836,17 @@ mod tests {
     async fn a_taken_slug_is_suffixed_rather_than_taken_over() {
         let (db, users, sso, _, _) = repositories();
         plant_connection(&db, "spaceport-acme").await;
+        plant_octocat_rule(&db).await;
         let squatter = users
             .create(&"github:octocat".parse().unwrap(), None)
             .await
             .unwrap();
 
-        let fresh = signed_in(sso.login(octocat(&[], &[])).await.unwrap());
+        let fresh = signed_in(
+            sso.login(octocat(&[], &[("login", &["octocat"])]))
+                .await
+                .unwrap(),
+        );
 
         assert_ne!(fresh.user, squatter.id);
         let listed = users.list(None).await.unwrap();
@@ -930,5 +1032,79 @@ mod tests {
         let identities = IdentityRepository::new(db);
         let alice = &users.list(None).await.unwrap()[0];
         assert!(identities.for_user(&alice.id).await.unwrap().is_empty());
+    }
+
+    /// The create-gate: a stranger no rule of the connection matches is refused
+    /// outright and leaves nothing behind — no user, no snapshot, no session,
+    /// and no `user.created` entry to read as an account that briefly existed.
+    /// The single `login.failed` row is about no user at all, because at the
+    /// moment of refusal there is none.
+    #[tokio::test]
+    async fn an_unmapped_stranger_is_refused_and_leaves_nothing_behind() {
+        let (db, users, sso, _, log) = repositories();
+        plant_connection(&db, "spaceport-acme").await;
+        let mappings = MappingRepository::new(db.clone());
+        // A rule exists — it simply is not one this login satisfies, which is
+        // the case worth testing: an empty table would pass for the wrong
+        // reason.
+        mappings
+            .add(
+                "spaceport-acme",
+                &"reader@blog".parse().unwrap(),
+                &["org=acme-corp".parse().unwrap()],
+            )
+            .await
+            .unwrap();
+
+        let outcome = sso
+            .login(octocat(
+                &["octocat@acme.example"],
+                &[("org", &["some-other-org"])],
+            ))
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, SsoOutcome::Unmapped), "not refused");
+        assert!(users.list(None).await.unwrap().is_empty());
+        let entries = log.entries(None).await.unwrap();
+        assert!(
+            !entries.iter().any(|entry| entry.kind == "user.created"),
+            "{entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|entry| entry.kind == "login.succeeded"),
+            "{entries:?}"
+        );
+        let failed: Vec<&AuthEvent> = entries
+            .iter()
+            .filter(|entry| entry.kind == "login.failed")
+            .collect();
+        assert_eq!(failed.len(), 1, "{entries:?}");
+        assert_eq!(failed[0].origin, "spaceport-acme");
+        assert_eq!(failed[0].user, None);
+    }
+
+    /// The guard against over-gating: the rule check stands in front of
+    /// *creation* and nothing else. A user spaceport already knows — here by
+    /// verified email, as an operator-made account is reached — signs in with
+    /// the slate they have even when no rule matches them at all, because
+    /// operator-made accounts never match one and a member who fell out of an
+    /// org for an afternoon must still get through the door.
+    #[tokio::test]
+    async fn an_existing_user_who_matches_no_rule_still_signs_in() {
+        let (db, users, sso, _, _) = repositories();
+        plant_connection(&db, "spaceport-acme").await;
+        let alice = users
+            .create(&"alice".parse().unwrap(), Some("octocat@acme.example"))
+            .await
+            .unwrap();
+
+        let fresh = signed_in(
+            sso.login(octocat(&["octocat@acme.example"], &[]))
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(fresh.user, alice.id);
     }
 }
