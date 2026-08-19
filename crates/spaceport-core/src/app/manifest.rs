@@ -922,6 +922,12 @@ fn default_success_threshold() -> u32 {
     1
 }
 
+/// The longest any single probe duration may be. See [`Probe::validate`].
+const MAX_PROBE_DURATION: Duration = Duration::from_secs(60 * 60);
+
+/// The most checks any probe threshold may count. See [`Probe::validate`].
+const MAX_PROBE_THRESHOLD: u32 = 3600;
+
 impl Default for Probe {
     fn default() -> Self {
         Self {
@@ -939,8 +945,16 @@ impl Default for Probe {
 
 impl Probe {
     /// How long a wholly unresponsive app is given before an apply gives up.
+    ///
+    /// Saturates rather than overflowing: `Duration`'s `+` and `*` panic on
+    /// overflow even in release, and a probe persisted into a build row before
+    /// [`Probe::validate`] grew its ceilings is replayed through here on every
+    /// apply — a panic would poison that app for good.
     pub fn budget(&self) -> Duration {
-        self.initial_delay + self.interval * self.failure_threshold
+        self.interval
+            .checked_mul(self.failure_threshold)
+            .and_then(|checks| self.initial_delay.checked_add(checks))
+            .unwrap_or(Duration::MAX)
     }
 
     /// `which` is the name the manifest gave this check — `readiness` or
@@ -976,6 +990,28 @@ impl Probe {
         }
         if self.timeout.is_zero() {
             bail!("a {which} `timeout` of zero would fail every check");
+        }
+
+        // Ceilings, so that a manifest cannot hand [`Probe::budget`] numbers
+        // whose product no longer fits a `Duration`. An hour is far past any
+        // useful setting — the defaults are a 1s interval and a 5s timeout —
+        // and 3600 checks is a hundred and twenty times the default threshold
+        // of 30, so nothing an operator would plausibly write is newly refused.
+        if self.initial_delay > MAX_PROBE_DURATION {
+            bail!("a {which} `initial_delay` above an hour would stall every apply behind it");
+        }
+        if self.interval > MAX_PROBE_DURATION {
+            bail!("a {which} `interval` above an hour would check too rarely to mean anything");
+        }
+        if self.timeout > MAX_PROBE_DURATION {
+            bail!("a {which} `timeout` above an hour would hang a check rather than fail it");
+        }
+        if self.failure_threshold > MAX_PROBE_THRESHOLD
+            || self.success_threshold > MAX_PROBE_THRESHOLD
+        {
+            bail!(
+                "{which} thresholds above {MAX_PROBE_THRESHOLD} checks are more waiting than any app is worth"
+            );
         }
 
         Ok(())
@@ -1833,6 +1869,53 @@ success_threshold: 2",
     fn rejects_a_pointless_interval_or_timeout() {
         assert!(AppManifest::parse(&with_readiness("interval: 0s")).is_err());
         assert!(AppManifest::parse(&with_readiness("timeout: 0s")).is_err());
+    }
+
+    /// The struct is built directly rather than parsed, so that the test still
+    /// covers build rows persisted before validation grew its ceilings.
+    #[test]
+    fn saturates_a_budget_whose_checks_would_overflow() {
+        let probe = Probe {
+            interval: Duration::from_secs(u64::MAX),
+            failure_threshold: 30,
+            ..Probe::default()
+        };
+
+        assert_eq!(probe.budget(), Duration::MAX);
+    }
+
+    #[test]
+    fn saturates_a_budget_whose_initial_delay_would_overflow() {
+        let probe = Probe {
+            initial_delay: Duration::MAX - Duration::from_secs(1),
+            interval: Duration::from_secs(60),
+            failure_threshold: 30,
+            ..Probe::default()
+        };
+
+        assert_eq!(probe.budget(), Duration::MAX);
+    }
+
+    #[test]
+    fn rejects_an_interval_no_apply_could_outlast() {
+        let err = AppManifest::parse(&with_readiness("interval: 18446744073709551615s"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("readiness"), "{err}");
+        assert!(err.contains("`interval`"), "{err}");
+    }
+
+    /// Guards the ceilings against being drawn tighter than the defaults.
+    #[test]
+    fn accepts_the_defaults_the_ceilings_have_to_leave_room_for() {
+        let readiness = AppManifest::parse(MINIMAL)
+            .unwrap()
+            .container
+            .health
+            .readiness;
+
+        assert_eq!(readiness, Probe::default());
     }
 
     #[test]
