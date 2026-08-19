@@ -24,9 +24,10 @@
 //! them delete every outstanding code. What stops somebody working through the
 //! forty-bit code space instead is [`crate::edge::LoginThrottle`], which
 //! counts failed redemptions per client address in memory at the edge and
-//! refuses past its budget without this module being asked at all. The two
-//! halves only work together: this file bounds attempts at a code somebody
-//! knows exists, the edge bounds attempts at codes nobody does.
+//! refuses past its budget without this module being asked at all. In the
+//! interim flow that is the whole of the bound, and the five attempts here are
+//! waiting for the sign-in that posts an address alongside the code and can
+//! therefore say which pending code a wrong one was aimed at.
 //!
 //! Same discipline as the rest of [`crate::auth`]: every mutation writes its
 //! [`crate::auth::log`] entry in the same transaction, or not at all — and
@@ -70,12 +71,27 @@ const CODE_TTL: Duration = Duration::from_secs(10 * 60);
 /// guess that matched the code's hash counts, so this is a budget its own
 /// holder can spend and nobody else can spend for them.
 ///
-/// Which makes it a narrow counter, and worth being plain about: a guess whose
-/// hash matches a *live* code simply redeems, so what this counts is repeated
-/// arrivals of a code that is real and refused anyway — a user's own code after
-/// their account was suspended, or one the sweep and the check disagree about
-/// inside the second they round differently. It is no longer what bounds
-/// guessing; that is [`crate::edge::LoginThrottle`], out at the edge.
+/// Which, in the flow this file serves today, means it very nearly never
+/// counts anything — and that is worth being plain about, because the next
+/// reader to work it out will otherwise reasonably conclude this is dead and
+/// delete it. A hash lookup has no partial credit: submit input whose hash
+/// matches the row and you *have* the code, so you redeem rather than fail.
+/// There is no such thing here as a wrong guess at a known code, because the
+/// code is the only thing naming the code. What is left is a row that matched
+/// and is refused anyway, and the sweep in front of the lookup has already
+/// deleted the rows that would qualify — the over-attempted and the expired —
+/// while [`remove_all_in`] deletes a suspended or dropped user's codes before
+/// anyone can submit one. All that actually reaches the counter is a code
+/// caught between the sweep, which compares stamps as text, and the check,
+/// which parses them: sub-second, and swept on the next pass regardless.
+///
+/// It stays because it is early, not because it is load-bearing. The spec's
+/// email sign-in posts an address *and* a code, and that is the flow the five
+/// belongs to: with the address naming the row, a wrong code is attributable
+/// to exactly one pending code, and this becomes the budget it reads as. Until
+/// then the interim form — an operator mints a code and a form posts only that
+/// — cannot attribute a wrong guess to anything, which is why guessing is
+/// bounded out at the edge by [`crate::edge::LoginThrottle`] instead.
 const MAX_CODE_ATTEMPTS: i64 = 5;
 
 /// How long a session lives when the mint names no `--expires`.
