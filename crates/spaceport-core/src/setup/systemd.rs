@@ -19,6 +19,23 @@ pub const UNIT_NAME: &str = "spaceport.service";
 /// — belong.
 pub const UNIT_DIR: &str = "/etc/systemd/system";
 
+/// How many file descriptors the unit gives spaceport.
+///
+/// The edge admits up to [`crate::edge::MAX_CONNECTIONS`] connections at once
+/// and each one may hold two descriptors — the client's socket, and the
+/// upstream socket its requests are proxied through — so twice that number is
+/// the ceiling connections alone can reach. The thousand on top is everything
+/// that is not a connection: the two listeners, the operator socket, the engine
+/// socket, the database and its journal, and the odd file.
+///
+/// Without this the cap in the edge would be decoration. Linux's default soft
+/// limit is 1024 descriptors, so a process that never asks for more meets
+/// `EMFILE` in `accept()` at a few hundred connections — an outage that looks
+/// like a bug, since the connection table it was supposed to fill is barely
+/// touched. `LimitNOFILE` is how a unit asks, and the hard limit on any modern
+/// kernel is far above this, so the ask is granted.
+pub(crate) const FILE_DESCRIPTOR_LIMIT: usize = crate::edge::MAX_CONNECTIONS * 2 + 1_000;
+
 /// Whether this host was booted by systemd.
 ///
 /// The directory is systemd's own marker for "I am the init system here", and
@@ -54,6 +71,10 @@ Type=exec
 ExecStart={command}
 # The edge binds 80 and 443 and the runtime talks to the engine's socket.
 User=root
+# The edge caps how many connections it will hold at once; this is what makes
+# that cap the limit spaceport actually meets, rather than the default 1024
+# descriptors it would otherwise run out of first.
+LimitNOFILE={FILE_DESCRIPTOR_LIMIT}
 Restart=on-failure
 RestartSec=2s
 # spaceport shuts down gracefully on SIGINT and is killed by SIGTERM, so stops
@@ -142,6 +163,19 @@ mod tests {
             unit.contains("--operator \"unix:/run/spaceport.sock\""),
             "{unit}"
         );
+    }
+
+    /// The edge's connection cap is only a cap if the process has the
+    /// descriptors to reach it, and nothing but the unit asks for them.
+    #[test]
+    fn raises_the_descriptor_limit_to_match_the_connection_cap() {
+        let unit = rendered(None);
+
+        // The number spelled out rather than interpolated from the constant,
+        // which would assert nothing: twice the ten thousand connections the
+        // edge admits, plus room for everything that is not a connection. A
+        // change to either number should have to be made here too.
+        assert!(unit.contains("\nLimitNOFILE=21000\n"), "{unit}");
     }
 
     /// A restart that killed in-flight requests would be a setup that made

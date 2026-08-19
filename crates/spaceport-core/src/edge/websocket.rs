@@ -17,7 +17,14 @@
 //! Open apps' WebSockets, and upgrades under a gated app's public prefixes,
 //! tunnel untracked: no session authenticated them, so no session's death can
 //! have anything to say about them — they end when either side hangs up, as
-//! any proxy would have it.
+//! any proxy would have it, or when spaceport itself stops.
+//!
+//! Every tunnel, tracked or not, keeps the [`super::ConnectionSlot`] of the
+//! connection it was handshaked on. hyper's connection future completes at the
+//! `101`, so the tunnel is what the connection has become and has to carry what
+//! the connection was carrying: its place under [`super::MAX_CONNECTIONS`], its
+//! entry in the tally shutdown waits out, and the duty to notice a shutdown at
+//! all, since by then there is no connection left to be shut down gracefully.
 //!
 //! Mechanically this is hyper's upgrade dance on both sides. The edge already
 //! serves every connection `with_upgrades`, so the client half is the
@@ -39,10 +46,10 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
-use super::EdgeState;
 use super::gate;
 use super::proxy;
 use super::service::ConnInfo;
+use super::{ConnectionSlot, EdgeState};
 use crate::app::Auth;
 use crate::app::manifest::Host;
 use crate::app::store::App;
@@ -147,6 +154,19 @@ pub(super) async fn tunnel(
         None => None,
     };
 
+    // The connection's slot, taken before the rewrite for the same reason the
+    // upgrade is: this is the last place the request's extensions are intact.
+    //
+    // It has to be carried into the tunnel rather than left to the connection
+    // task, because that task is about to finish. hyper's HTTP/1.1 connection
+    // future completes at the upgrade — it fulfils the pending `Upgraded` and
+    // returns — so the task that admitted this client ends within moments of
+    // the `101`, while the tunnel below runs for the whole session holding two
+    // sockets. Without this clone a WebSocket would be the one connection shape
+    // [`super::MAX_CONNECTIONS`] did not bound, and `serve` would return with
+    // tunnels still open.
+    let slot = req.extensions().get::<ConnectionSlot>().cloned();
+
     // The client's half of the upgrade, taken off the request before the
     // rewrite: hyper completes it once this handler answers `101`.
     let client_upgrade = hyper::upgrade::on(&mut req);
@@ -205,6 +225,9 @@ pub(super) async fn tunnel(
 
     let upstream_upgrade = hyper::upgrade::on(&mut response);
     let app_id = app.id.clone();
+    // `slot` moves in here with everything else and is dropped when this task
+    // ends, in every arm alike — including the upgrade that never completes
+    // below, which still occupied a connection until it was given up on.
     tokio::spawn(async move {
         let (client, upstream) = match tokio::try_join!(client_upgrade, upstream_upgrade) {
             Ok(both) => both,
@@ -238,6 +261,19 @@ pub(super) async fn tunnel(
                 None => std::future::pending().await,
             }
         };
+        // A tunnel is the one thing here nobody else can stop. The graceful
+        // shutdown hyper does per connection has already happened by the time a
+        // tunnel exists — the connection it belonged to completed at the `101`
+        // — and a WebSocket has no request in flight to drain, so watching the
+        // token is both the only way this ends on a stop and the honest one: a
+        // client whose socket closes reconnects, where a client waiting on a
+        // process that will not exit waits for systemd to kill it.
+        let stopping = async {
+            match &slot {
+                Some(slot) => slot.shutdown().cancelled().await,
+                None => std::future::pending().await,
+            }
+        };
 
         tokio::select! {
             shovelled = tokio::io::copy_bidirectional(&mut client, &mut upstream) => {
@@ -250,6 +286,9 @@ pub(super) async fn tunnel(
             }
             () = expired => {
                 debug!(app = %app_id, "cut a websocket tunnel: its session expired");
+            }
+            () = stopping => {
+                debug!(app = %app_id, "cut a websocket tunnel: spaceport is shutting down");
             }
         }
         // Dropping both halves is the teardown, in every arm alike: the TCP

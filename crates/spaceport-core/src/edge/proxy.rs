@@ -712,7 +712,14 @@ mod tests {
                     peer,
                     scheme: Scheme::Https,
                 };
-                let service = TowerToHyperService::new(EdgeService::new(state.clone(), conn));
+                // A slot of its own per connection: this fixture has no accept
+                // loop and so no budget, and the tunnel tests below only need
+                // the slot to exist and to be the thing they keep hold of.
+                let service = TowerToHyperService::new(EdgeService::new(
+                    state.clone(),
+                    conn,
+                    crate::edge::ConnectionSlot::detached(),
+                ));
 
                 // With upgrades, as the daemon serves every connection — the
                 // WebSocket tests upgrade through this very fixture.

@@ -26,8 +26,8 @@ use http::{HeaderValue, Request, Response, StatusCode, header};
 use hyper::body::Incoming;
 use tower::{Service, ServiceExt};
 
-use super::EdgeState;
 use super::proxy;
+use super::{ConnectionSlot, EdgeState};
 use crate::app::manifest::Host;
 
 /// Path prefixes spaceport claims for itself. Everything else is proxied.
@@ -72,11 +72,12 @@ pub struct ConnInfo {
 pub struct EdgeService {
     state: Arc<EdgeState>,
     conn: ConnInfo,
+    slot: ConnectionSlot,
 }
 
 impl EdgeService {
-    pub fn new(state: Arc<EdgeState>, conn: ConnInfo) -> Self {
-        Self { state, conn }
+    pub fn new(state: Arc<EdgeState>, conn: ConnInfo, slot: ConnectionSlot) -> Self {
+        Self { state, conn, slot }
     }
 }
 
@@ -93,6 +94,12 @@ impl Service<Request<Incoming>> for EdgeService {
 
     fn call(&mut self, mut req: Request<Incoming>) -> Self::Future {
         req.extensions_mut().insert(self.conn);
+        // Along for the ride so that a handler which turns this request into
+        // something outliving the connection — the WebSocket tunnel, and only
+        // it so far — can keep the connection counted. It goes out with the
+        // request when the request is dropped, which for everything else is
+        // exactly the right moment.
+        req.extensions_mut().insert(self.slot.clone());
 
         if is_spaceport_path(req.uri().path()) {
             let router = self.state.router.clone();
