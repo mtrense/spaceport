@@ -689,6 +689,7 @@ mod tests {
                 jwt_cache: jwt_cache.clone(),
                 https_port: 443,
                 logins: Arc::new(crate::edge::home::LoginAttempts::new()),
+                throttle: Arc::new(crate::edge::home::LoginThrottle::new()),
                 sso: Arc::new(crate::auth::SsoRepository::new(db)),
             })),
             apps,

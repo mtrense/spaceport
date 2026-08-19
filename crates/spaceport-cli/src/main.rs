@@ -1378,6 +1378,7 @@ async fn run(args: RunArgs) -> Result<()> {
         // In-memory like `attempts`, and per-process for the same reason: a
         // login that does not survive a restart is one more click.
         logins: Arc::new(edge::LoginAttempts::new()),
+        throttle: Arc::new(edge::LoginThrottle::new()),
         sso,
     });
 

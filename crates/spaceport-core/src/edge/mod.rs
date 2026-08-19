@@ -26,7 +26,7 @@ mod service;
 pub mod tls;
 mod websocket;
 
-pub use home::{Home, LoginAttempts};
+pub use home::{Home, LoginAttempts, LoginThrottle};
 pub use service::{ConnInfo, Scheme};
 
 use std::future::Future;

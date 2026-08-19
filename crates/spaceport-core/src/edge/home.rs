@@ -25,19 +25,21 @@
 //! set up for the first time.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use serde::Deserialize;
 use time::{Duration, OffsetDateTime};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::gate::query_encode;
+use super::service::ConnInfo;
 use crate::app::manifest::Host;
 use crate::app::{AppId, AppStore, Auth};
 use crate::auth::{
@@ -117,6 +119,11 @@ pub struct Home {
     /// is: a login that does not survive a restart is one more click on the
     /// login page.
     pub logins: Arc<LoginAttempts>,
+    /// What bounds guessing at one-time codes. Held here rather than inside the
+    /// session repository because it is the *edge's* memory of who has been
+    /// knocking — one process, one window, no database — and `POST /login` is
+    /// the only door it stands in front of.
+    pub throttle: Arc<LoginThrottle>,
     /// The transaction a finished GitHub bounce lands in: resolve the user,
     /// snapshot the identity, re-sync the mapped entitlements, mint the
     /// session — one commit, over the same tables the operator socket reads.
@@ -243,6 +250,202 @@ fn sweep(pending: &mut HashMap<String, LoginAttempt>, now: OffsetDateTime) {
     pending.retain(|_, attempt| now - attempt.created_at < LOGIN_STATE_LIFETIME);
 }
 
+/// How long a failed redemption is held against whoever sent it.
+///
+/// The same ten minutes a code lives, because that is the unit the budget is
+/// really about: whatever somebody can try inside one code's lifetime is what
+/// they get to try against that code. It is also short enough that a client
+/// who has spent its budget — including a whole office behind one address — is
+/// working again within one coffee, without an operator being called.
+const LOGIN_FAILURE_WINDOW: Duration = Duration::minutes(10);
+
+/// How many failed redemptions one client address may spend in a window.
+///
+/// Sized for the office NAT rather than for the attacker, because the attacker
+/// is hopeless at any of these numbers: twenty guesses per ten minutes against
+/// a forty-bit code space is one expected hit every four hundred thousand
+/// years, so the only question left is whether the number is generous enough
+/// for real people. A single user cannot fail more than
+/// `MAX_CODE_ATTEMPTS` times at their own code before it dies of its own
+/// accord, so twenty is four users mistyping their way through an entire code
+/// each, from one address, inside ten minutes.
+const MAX_FAILURES_PER_CLIENT: u32 = 20;
+
+/// How many client addresses the throttle will remember at once.
+///
+/// [`MAX_PENDING_LOGINS`]' argument, applied to a map an unauthenticated `POST`
+/// fills: the size is a number this build chose, never one somebody else's
+/// request rate chose.
+///
+/// Unlike the pending logins, a full map here *evicts* rather than refuses, and
+/// the difference matters enough to spell out. Refusing an address the map has
+/// no room for would hand any attacker the lockout this whole change exists to
+/// remove: fill the map from four thousand addresses and every user whose
+/// address is not already in it is refused. Evicting the window closest to
+/// turning over costs almost nothing instead — the evicted address gets its
+/// budget back early, and buying that back for one address means pushing four
+/// thousand others through first, which is far more work than the twenty
+/// guesses it returns.
+const MAX_THROTTLED_CLIENTS: usize = 4096;
+
+/// What one client has spent inside one window.
+#[derive(Debug, Clone, Copy)]
+struct Spent {
+    failures: u32,
+    /// When the window opened — at the client's first failure in it, so the
+    /// window is forgotten whole rather than decaying guess by guess. Cheaper
+    /// than a timestamp per failure, and the difference only ever shows up as
+    /// a client getting its next budget slightly sooner.
+    opened_at: OffsetDateTime,
+}
+
+impl Default for Spent {
+    fn default() -> Self {
+        Self {
+            failures: 0,
+            opened_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+}
+
+/// The failed one-time-code redemptions this spaceport has answered lately.
+///
+/// The other half of the code's five attempts, and the half that has to live
+/// out here. A code's counter can only count guesses that hit it; somebody
+/// working through the code space hits nothing, so the table never sees them
+/// coming — see [`crate::auth::SessionRepository::redeem`]. This does: it
+/// counts refusals per client address and, once a budget is spent, answers the
+/// next one without the database being asked at all, which is the point. A
+/// refusal has to be cheaper for spaceport than the guess was for whoever sent
+/// it, or the throttle is itself the denial of service.
+///
+/// In memory and per process, like [`LoginAttempts`] and for the same reason:
+/// what it holds is worth exactly one window, and a restart that forgets it
+/// costs an attacker one window's budget. Bounded by
+/// [`MAX_THROTTLED_CLIENTS`], swept on the way past.
+#[derive(Debug, Default)]
+pub struct LoginThrottle {
+    spent: Mutex<Ledger>,
+}
+
+/// The throttle's whole state, behind one lock: the per-address budgets and the
+/// global one. One lock rather than two, because every path reads both and a
+/// pair of locks would only be a pair of chances to take them in the wrong
+/// order.
+#[derive(Debug, Default)]
+struct Ledger {
+    clients: HashMap<IpAddr, Spent>,
+}
+
+impl Ledger {
+    /// Forget every window that has turned over.
+    fn sweep(&mut self, now: OffsetDateTime) {
+        self.clients
+            .retain(|_, spent| now - spent.opened_at < LOGIN_FAILURE_WINDOW);
+    }
+
+    /// Forget the window closest to turning over, to make room for one more.
+    ///
+    /// Only ever called on a map the sweep has already been over, so every
+    /// window in it is live and one of them has to go: the oldest is the one
+    /// with the least of its budget left to give back.
+    fn evict_oldest(&mut self) {
+        let oldest = self
+            .clients
+            .iter()
+            .min_by_key(|(_, spent)| spent.opened_at)
+            .map(|(client, _)| *client);
+
+        if let Some(oldest) = oldest {
+            self.clients.remove(&oldest);
+        }
+    }
+}
+
+impl LoginThrottle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether a redemption from `client` is worth asking the database about.
+    ///
+    /// Asked before the code is looked at, so a client past its budget costs a
+    /// lock and a hash lookup and nothing else. It is deliberately not the same
+    /// call as [`LoginThrottle::charge`]: a redemption that *succeeds* must not
+    /// be charged, and only the repository knows which it was. Two calls means
+    /// two lock acquisitions and so a handful of concurrent requests can spend
+    /// the last of a budget together — an overshoot of however many are in
+    /// flight at once, against budgets in the hundreds, which is not worth
+    /// holding a lock across a database call to avoid.
+    fn permits(&self, client: IpAddr, now: OffsetDateTime) -> bool {
+        let mut spent = self
+            .spent
+            .lock()
+            .expect("the login throttle is never held across a panic");
+
+        spent.sweep(now);
+
+        match spent.clients.get(&client) {
+            Some(client) => client.failures < MAX_FAILURES_PER_CLIENT,
+            // An address that has not failed inside this window is owed the
+            // benefit of the doubt, whatever else the map is holding. There is
+            // no ceiling across addresses on purpose: one would be a lever any
+            // stranger could pull to refuse everybody, which is the shape of
+            // the bug this replaced. The per-address budget is enough on its
+            // own — twenty guesses per address per window against a forty-bit
+            // space stays hopeless however many addresses are brought to it.
+            None => true,
+        }
+    }
+
+    /// Charge one failed redemption to `client`.
+    ///
+    /// Only failures are counted, and a success neither counts nor clears: the
+    /// window is short enough to forgive a real user's typos on its own, where
+    /// clearing on success would hand anybody holding one working code a way to
+    /// reset the budget between guesses at the next one.
+    fn charge(&self, client: IpAddr, now: OffsetDateTime) {
+        let mut spent = self
+            .spent
+            .lock()
+            .expect("the login throttle is never held across a panic");
+
+        spent.sweep(now);
+
+        match spent.clients.get_mut(&client) {
+            // Saturating, because a client that keeps knocking after its
+            // budget is spent keeps being counted, and how high that goes is
+            // nobody here's decision — every number past the budget means the
+            // same thing.
+            Some(client) => client.failures = client.failures.saturating_add(1),
+            None => {
+                if spent.clients.len() >= MAX_THROTTLED_CLIENTS {
+                    spent.evict_oldest();
+                }
+                spent.clients.insert(
+                    client,
+                    Spent {
+                        failures: 1,
+                        opened_at: now,
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// Which client a login post is charged to: the peer address the connection
+/// arrived from.
+///
+/// [`ConnInfo`] is attached to every request the edge's own listeners accept,
+/// so the only requests without one are the ones that never crossed a socket —
+/// this module's tests, today. Those are bucketed together under the
+/// unspecified address rather than exempted, because "no address" must not be
+/// the one way past the budget.
+fn client_of(conn: Option<&ConnInfo>) -> IpAddr {
+    conn.map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |conn| conn.peer.ip())
+}
+
 /// The session cookie's name. The `__Host-` prefix is a promise the browser
 /// enforces — `Secure`, `Path=/`, no `Domain` — so a cookie under this name
 /// cannot be planted by a subdomain or ride to one. Spaceport can afford the
@@ -357,7 +560,19 @@ async fn sso_buttons(home: &Home, next: Option<&str>) -> String {
 /// because a forged login steals a session, but because it plants one: a
 /// cross-site form that signs the victim into the attacker's account makes
 /// everything they then do the attacker's to read.
-async fn login(State(home): State<Arc<Home>>, headers: HeaderMap, body: String) -> Response {
+///
+/// And [`LoginThrottle`] stands in front of the database. A code's five
+/// attempts only bound guesses that hit a real code; this bounds the ones that
+/// hit nothing, which is every guess an attacker working through the code space
+/// makes. Past the budget the answer is assembled here and the redemption's
+/// write transaction never runs — the refusal has to cost spaceport less than
+/// the request cost whoever sent it.
+async fn login(
+    State(home): State<Arc<Home>>,
+    conn: Option<Extension<ConnInfo>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
     if let Some(refusal) = super::gate::csrf_refusal(
         &http::Method::POST,
         &headers,
@@ -380,9 +595,32 @@ async fn login(State(home): State<Arc<Home>>, headers: HeaderMap, body: String) 
         );
     };
 
-    match home.sessions.redeem(&Secret::new(code)).await {
+    let client = client_of(conn.as_ref().map(|Extension(conn)| conn));
+    let now = OffsetDateTime::now_utc();
+    let outcome = match home.throttle.permits(client, now) {
+        true => home.sessions.redeem(&Secret::new(code)).await,
+        // Out of budget: the same refusal the repository would have produced,
+        // produced without asking it. `debug` and not `warn`, because how
+        // often this line is written is decided by whoever is knocking, and a
+        // log an attacker can fill is a second denial of service.
+        false => {
+            debug!(%client, "a login was refused without the code being looked at");
+
+            Err(RedeemError::Refused)
+        }
+    };
+
+    match outcome {
         Ok(fresh) => session_response(&fresh, next),
         Err(RedeemError::Refused) => {
+            // One refusal, whichever side it came from, all the way down to
+            // the sentence: an attacker who could tell "wrong code" from "out
+            // of budget" would know exactly when to stop and come back. The
+            // page's SSO buttons are rendered for the same reason, so the two
+            // answers are the same bytes — that read is a single indexed
+            // `SELECT` with no commit behind it, which leaves the asymmetry
+            // this throttle exists for intact.
+            home.throttle.charge(client, now);
             let buttons = sso_buttons(&home, next).await;
 
             login_form(
@@ -1490,6 +1728,7 @@ mod tests {
             jwt_cache: Arc::new(crate::auth::JwtCache::new()),
             https_port: 443,
             logins: Arc::new(LoginAttempts::new()),
+            throttle: Arc::new(LoginThrottle::new()),
             sso: Arc::new(SsoRepository::new(db)),
         });
 
@@ -2233,6 +2472,7 @@ mod tests {
             jwt_cache: Arc::new(crate::auth::JwtCache::new()),
             https_port: 443,
             logins: Arc::new(LoginAttempts::new()),
+            throttle: Arc::new(LoginThrottle::new()),
             sso: Arc::new(SsoRepository::new(db.clone())),
         });
 
@@ -2275,6 +2515,45 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    /// The same submission, from a named client address — what the edge's
+    /// listeners attach to every request they accept, and what the throttle
+    /// counts against.
+    async fn post_form_from(
+        home: Arc<Home>,
+        path: &str,
+        body: &str,
+        peer: &str,
+    ) -> http::Response<Body> {
+        router(home)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(
+                        http::header::CONTENT_TYPE,
+                        "application/x-www-form-urlencoded",
+                    )
+                    .header("sec-fetch-site", "same-origin")
+                    .extension(ConnInfo {
+                        peer: peer.parse().unwrap(),
+                        scheme: crate::edge::Scheme::Https,
+                    })
+                    .body(Body::from(body.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Every wrong guess one client is allowed, so the next request from it
+    /// meets the throttle rather than the database.
+    async fn spend_the_budget(home: &Arc<Home>, peer: &str) {
+        for _ in 0..MAX_FAILURES_PER_CLIENT {
+            let response = post_form_from(home.clone(), "/login", "code=wrongcod", peer).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
     }
 
     #[tokio::test]
@@ -2353,6 +2632,76 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("did not work"), "{body}");
         assert!(body.contains(r#"<input name="code""#), "{body}");
+    }
+
+    /// Past its budget a client is refused without the code being looked at —
+    /// which the *good* code proves: it is submitted, it is refused, and it is
+    /// still sitting unspent in the table afterwards, so nothing about it was
+    /// read or written. That is the property the throttle exists for; a
+    /// refusal that still cost a transaction and an fsync would be no defence.
+    #[tokio::test]
+    async fn a_client_past_its_budget_is_refused_without_the_code_being_checked() {
+        let (home, users) = auth_home();
+        let code = minted_code(&home, &users, "alice").await;
+        spend_the_budget(&home, "203.0.113.7:54321").await;
+
+        let response = post_form_from(
+            home.clone(),
+            "/login",
+            &format!("code={code}"),
+            "203.0.113.7:9",
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().get(http::header::SET_COOKIE).is_none());
+        // Untouched: the repository, asked directly, still redeems it.
+        assert!(home.sessions.redeem(&Secret::new(code)).await.is_ok());
+    }
+
+    /// And the refusal says nothing about which refusal it was. An attacker who
+    /// could tell "wrong code" from "out of budget" would know exactly when to
+    /// stop and come back.
+    #[tokio::test]
+    async fn a_refusal_past_the_budget_reads_like_any_other_refusal() {
+        let (home, _) = auth_home();
+        let ordinary =
+            post_form_from(home.clone(), "/login", "code=wrongcod", "203.0.113.7:1").await;
+        let ordinary = (
+            ordinary.status(),
+            ordinary.into_body().collect().await.unwrap().to_bytes(),
+        );
+
+        spend_the_budget(&home, "203.0.113.7:2").await;
+        let throttled =
+            post_form_from(home.clone(), "/login", "code=wrongcod", "203.0.113.7:3").await;
+        let throttled = (
+            throttled.status(),
+            throttled.into_body().collect().await.unwrap().to_bytes(),
+        );
+
+        assert_eq!(throttled, ordinary);
+    }
+
+    /// The budget is per address, so somebody else's guessing is not a user's
+    /// problem: a good code from a client that has failed nothing still signs
+    /// in, however much the neighbour has been knocking.
+    #[tokio::test]
+    async fn a_good_code_still_works_after_another_clients_failures() {
+        let (home, users) = auth_home();
+        let code = minted_code(&home, &users, "alice").await;
+        spend_the_budget(&home, "203.0.113.7:54321").await;
+
+        let response =
+            post_form_from(home, "/login", &format!("code={code}"), "198.51.100.4:443").await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(
+            response.headers()[http::header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .starts_with("__Host-spaceport-session=")
+        );
     }
 
     /// A suspended user's code is exactly as refused as one that never
@@ -2777,6 +3126,7 @@ mod tests {
             jwt_cache: Arc::new(crate::auth::JwtCache::new()),
             https_port: 443,
             logins: Arc::new(LoginAttempts::new()),
+            throttle: Arc::new(LoginThrottle::new()),
             sso: Arc::new(SsoRepository::new(db.clone())),
         });
 
@@ -3342,6 +3692,121 @@ mod tests {
         // Every one of the burst's entries went, and only the fresh one is
         // left — no callback traffic involved.
         assert_eq!(held(&logins), 1);
+    }
+
+    /// The `index`th client address — as many distinct ones as a test needs to
+    /// pretend to be a botnet with.
+    fn client(index: u32) -> IpAddr {
+        IpAddr::from([10, (index >> 16) as u8, (index >> 8) as u8, index as u8])
+    }
+
+    fn tracked(throttle: &LoginThrottle) -> usize {
+        throttle.spent.lock().unwrap().clients.len()
+    }
+
+    /// The per-address budget: twenty failures and the twenty-first request is
+    /// refused before anything is looked at — and a second address is still as
+    /// welcome as it ever was, which is the difference between a throttle and
+    /// the global charge this replaced.
+    #[test]
+    fn a_client_that_spends_its_budget_is_refused_and_its_neighbour_is_not() {
+        let throttle = LoginThrottle::new();
+        let now = OffsetDateTime::now_utc();
+
+        for _ in 0..MAX_FAILURES_PER_CLIENT {
+            assert!(throttle.permits(client(1), now));
+            throttle.charge(client(1), now);
+        }
+
+        assert!(!throttle.permits(client(1), now));
+        assert!(throttle.permits(client(2), now));
+    }
+
+    /// A budget is a window's worth, not a lifetime's: the client that spent
+    /// its twenty is trying again ten minutes later, with no operator involved.
+    #[test]
+    fn a_spent_budget_comes_back_when_the_window_turns_over() {
+        let throttle = LoginThrottle::new();
+        let now = OffsetDateTime::now_utc();
+        for _ in 0..MAX_FAILURES_PER_CLIENT {
+            throttle.charge(client(1), now);
+        }
+        assert!(!throttle.permits(client(1), now));
+
+        let later = now + LOGIN_FAILURE_WINDOW + Duration::seconds(1);
+
+        assert!(throttle.permits(client(1), later));
+    }
+
+    /// The property that makes this a throttle and not a lockout lever: no
+    /// number of guessing addresses can make the spaceport refuse an address
+    /// that has not guessed. Somebody else's flood is never a stranger's
+    /// problem, however large it gets — which is exactly what the global charge
+    /// this replaced got wrong, and what a ceiling across addresses would have
+    /// got wrong again.
+    #[test]
+    fn a_flood_from_other_addresses_never_refuses_an_innocent_one() {
+        let throttle = LoginThrottle::new();
+        let now = OffsetDateTime::now_utc();
+
+        // Twice as many addresses as the map holds, so it is full and evicting
+        // throughout, and one of them spending its whole budget for good
+        // measure — neither shape is a stranger's problem.
+        for guesser in 0..(MAX_THROTTLED_CLIENTS as u32) * 2 {
+            throttle.charge(client(guesser), now);
+        }
+        for _ in 0..MAX_FAILURES_PER_CLIENT {
+            throttle.charge(client(1), now);
+        }
+
+        assert!(throttle.permits(client(u32::MAX), now));
+    }
+
+    /// The bound, [`a_full_map_refuses_rather_than_grows`]' argument applied to
+    /// the map an unauthenticated `POST` fills — except that this map evicts
+    /// where the pending logins refuse, because refusing here would be the
+    /// lockout the test above exists to rule out.
+    #[test]
+    fn the_throttle_forgets_addresses_rather_than_growing_without_bound() {
+        let throttle = LoginThrottle::new();
+        let now = OffsetDateTime::now_utc();
+
+        for index in 0..(MAX_THROTTLED_CLIENTS as u32) * 2 {
+            throttle.charge(client(index), now);
+        }
+
+        assert_eq!(tracked(&throttle), MAX_THROTTLED_CLIENTS);
+
+        // And full is not a state it stays in: a window later the whole burst
+        // is forgotten and one fresh address is all that is held.
+        let later = now + LOGIN_FAILURE_WINDOW + Duration::seconds(1);
+        throttle.charge(client(0), later);
+
+        assert_eq!(tracked(&throttle), 1);
+    }
+
+    /// Eviction is by age, so the address whose window is closest to turning
+    /// over is the one that goes: the newcomer is remembered, and the budget
+    /// handed back is the one that had least of itself left to spend.
+    #[test]
+    fn a_full_throttle_evicts_the_window_nearest_its_end() {
+        let throttle = LoginThrottle::new();
+        let now = OffsetDateTime::now_utc();
+
+        // The oldest window, then a full map's worth a minute newer.
+        throttle.charge(client(0), now);
+        let newer = now + Duration::minutes(1);
+        for index in 1..MAX_THROTTLED_CLIENTS as u32 {
+            throttle.charge(client(index), newer);
+        }
+        assert_eq!(tracked(&throttle), MAX_THROTTLED_CLIENTS);
+
+        throttle.charge(client(u32::MAX), newer);
+
+        assert_eq!(tracked(&throttle), MAX_THROTTLED_CLIENTS);
+        let spent = throttle.spent.lock().unwrap();
+        assert!(!spent.clients.contains_key(&client(0)), "the oldest stayed");
+        assert!(spent.clients.contains_key(&client(u32::MAX)));
     }
 
     /// A `next` too long to be a path this host serves is a hostile shape like

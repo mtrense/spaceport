@@ -13,8 +13,20 @@
 //! and hands it to the person it is for; the login page redeems it into a
 //! session whose expiry was fixed when the code was minted — `--expires` is a
 //! statement about the session being authorised, not about how quickly the
-//! user types. Codes are hashed like tokens, die after ten minutes, after five
-//! failed attempts, or on first use, whichever comes first.
+//! user types. Codes are hashed like tokens, and die after ten minutes, on
+//! first use, or after five failed attempts *at that code* — see
+//! [`MAX_CODE_ATTEMPTS`] for how narrow that third case now is.
+//!
+//! Those five attempts are the whole of what this table does about guessing,
+//! and deliberately so: a submitted code that matches no row cannot be
+//! attributed to any pending code, so it charges none of them — the alternative
+//! is that one stranger's wrong guess spends everybody's attempts, and five of
+//! them delete every outstanding code. What stops somebody working through the
+//! forty-bit code space instead is [`crate::edge::LoginThrottle`], which
+//! counts failed redemptions per client address in memory at the edge and
+//! refuses past its budget without this module being asked at all. The two
+//! halves only work together: this file bounds attempts at a code somebody
+//! knows exists, the edge bounds attempts at codes nobody does.
 //!
 //! Same discipline as the rest of [`crate::auth`]: every mutation writes its
 //! [`crate::auth::log`] entry in the same transaction, or not at all — and
@@ -53,8 +65,17 @@ use crate::state::{Db, now};
 /// to spare — a longer window is only a longer time a leaked code works.
 const CODE_TTL: Duration = Duration::from_secs(10 * 60);
 
-/// How many failed redemptions a code survives. After the fifth, the code is
-/// dead however much of its ten minutes remain.
+/// How many failed redemptions a code survives. After the fifth attempt at
+/// *that* code, it is dead however much of its ten minutes remain. Only a
+/// guess that matched the code's hash counts, so this is a budget its own
+/// holder can spend and nobody else can spend for them.
+///
+/// Which makes it a narrow counter, and worth being plain about: a guess whose
+/// hash matches a *live* code simply redeems, so what this counts is repeated
+/// arrivals of a code that is real and refused anyway — a user's own code after
+/// their account was suspended, or one the sweep and the check disagree about
+/// inside the second they round differently. It is no longer what bounds
+/// guessing; that is [`crate::edge::LoginThrottle`], out at the edge.
 const MAX_CODE_ATTEMPTS: i64 = 5;
 
 /// How long a session lives when the mint names no `--expires`.
@@ -67,8 +88,14 @@ pub const DEFAULT_SESSION_LIFETIME: Duration = Duration::from_secs(12 * 3600);
 const CODE_ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
 
 /// How many characters a code is. Eight from a 31-character alphabet is about
-/// forty bits — five guesses against that is nothing, and five guesses is all
-/// anybody gets.
+/// forty bits, which is only a credential at all because guessing is bounded:
+/// a guess that hits a real code gets five tries at it, and a guess that hits
+/// nothing at all is bounded by the edge's [`crate::edge::LoginThrottle`] to
+/// twenty tries per client address per ten minutes. A trillion codes at that
+/// rate is hopeless from one address and stays hopeless from a hundred
+/// thousand, which is why the throttle needs no ceiling across addresses —
+/// and must not have one, since a ceiling everybody shares is a lockout
+/// anybody can trigger.
 const CODE_LEN: usize = 8;
 
 /// How many random bytes a session token is made of, before encoding. The same
@@ -375,15 +402,20 @@ impl SessionRepository {
 
     /// Redeem `code` into a session, or refuse without saying why.
     ///
-    /// The failure path charges *every* pending code, not one. The login form
-    /// carries only the code — no email, no user — so a wrong guess cannot be
-    /// attributed to the code it was aimed at, and counting it against nothing
-    /// would hand a guesser five attempts per outstanding code instead of five
-    /// in total. Charging them all keeps the spec's arithmetic honest at the
-    /// cost of a mistyped code burning one attempt for everybody, which ten
-    /// minutes and a re-mint absorb. The failed attempt lands in the log
-    /// either way — attributed to the code's user when the code was real, and
-    /// to nobody when it never existed.
+    /// The failure path charges the one row the guess can be attributed to,
+    /// and no row at all when it can be attributed to none. The login form
+    /// carries only the code — no email, no user — so the hash is the only
+    /// thing that names a pending code: when it matches, the attempt was
+    /// certainly aimed at that code and counts against its five; when it
+    /// matches nothing, there is no code it was aimed at, and charging every
+    /// pending row instead would let anybody on the internet spend five
+    /// strangers' attempts with five wrong guesses — and since a code out of
+    /// attempts is *deleted* by the sweep, that is not a refusal, it is every
+    /// outstanding code gone. What bounds blind guessing is not this table but
+    /// [`crate::edge::LoginThrottle`] in front of it; see the module
+    /// comment. The failed attempt lands in the log either way — attributed to
+    /// the code's user when the code was real, and to nobody when it never
+    /// existed.
     pub async fn redeem(&self, code: &Secret) -> Result<FreshSession, RedeemError> {
         // Token and id minted out here for the mint's reason: no randomness
         // inside the lock. Made before we know the code is good, at the cost
@@ -434,11 +466,23 @@ impl SessionRepository {
                 };
 
                 if !good {
-                    // Charge every pending code — see the method comment for
-                    // why the guess cannot be aimed better than that.
-                    transaction
-                        .execute("UPDATE login_codes SET attempts = attempts + 1", [])
-                        .context("counting a failed code attempt")?;
+                    // Charge the row the hash names, and only it. A guess that
+                    // matched nothing charges nothing: there is no pending code
+                    // it was an attempt at, and the `WHERE`-less update this
+                    // replaced turned five strangers' guesses into every
+                    // outstanding code being swept away. A matched-but-dead row
+                    // — expired, spent out, its user suspended — is charged
+                    // like any other, which changes nothing about a row the
+                    // sweep is about to take anyway.
+                    if matched.is_some() {
+                        transaction
+                            .execute(
+                                "UPDATE login_codes SET attempts = attempts + 1
+                                 WHERE code_hash = ?1",
+                                rusqlite::params![code_hash],
+                            )
+                            .context("counting a failed code attempt")?;
+                    }
 
                     let user: Option<UserId> = matched
                         .as_ref()
@@ -1036,6 +1080,51 @@ mod tests {
             .unwrap();
     }
 
+    /// What `code`'s row has been charged so far, or `None` when no row
+    /// answers to it — the counter no listing exposes and the whole of what
+    /// the failure path writes.
+    async fn attempts_at(sessions: &SessionRepository, code: &Secret) -> Option<i64> {
+        let code_hash = hash(code.expose());
+
+        sessions
+            .db
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT attempts FROM login_codes WHERE code_hash = ?1",
+                        rusqlite::params![code_hash],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .context("reading a code's attempts")
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Suspend every user straight in the table, behind
+    /// [`UserRepository::suspend`]'s back.
+    ///
+    /// The repository's own suspend offboards — it deletes the pending codes
+    /// along with the sessions — which leaves no way through the public API to
+    /// reach the one state [`MAX_CODE_ATTEMPTS`] still counts: a guess whose
+    /// hash *matches* a live row and is refused anyway. Now that only a
+    /// matching guess is charged, that is the narrow case the counter is for,
+    /// and it is the case these tests have to construct by hand.
+    async fn suspend_behind_the_cascade(sessions: &SessionRepository) {
+        sessions
+            .db
+            .call(move |connection| {
+                connection
+                    .execute("UPDATE users SET suspended = 1", [])
+                    .context("suspending a user by hand")?;
+
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn a_code_is_eight_unambiguous_characters() {
         let code = generate_code().unwrap();
@@ -1121,21 +1210,79 @@ mod tests {
         assert_eq!(sessions.list(&by_slug("alice")).await.unwrap().1.len(), 1);
     }
 
-    /// Five wrong guesses kill the code that was waiting, however right the
-    /// sixth guess is — the brute-force arithmetic the spec fixes.
+    /// The regression test for the denial of service this failure path used to
+    /// be: a guess that matches nothing is charged to nothing, so five of them
+    /// from a stranger leave every pending code exactly where it was. The
+    /// `WHERE`-less update this replaced would have swept both codes away here.
     #[tokio::test]
-    async fn five_failed_attempts_kill_a_pending_code() {
+    async fn a_guess_that_matches_no_code_charges_none_of_them() {
         let (users, sessions, _) = repositories();
         users.create(&slug("alice"), None).await.unwrap();
-        let minted = mint(&sessions, "alice").await;
+        users.create(&slug("bob"), None).await.unwrap();
+        let alice = mint(&sessions, "alice").await;
+        let bob = mint(&sessions, "bob").await;
 
         for _ in 0..MAX_CODE_ATTEMPTS {
             let wrong = sessions.redeem(&Secret::new("wrongcod")).await.unwrap_err();
             assert!(matches!(wrong, RedeemError::Refused), "{wrong}");
         }
 
-        let real = sessions.redeem(&minted.code).await.unwrap_err();
-        assert!(matches!(real, RedeemError::Refused), "{real}");
+        assert_eq!(attempts_at(&sessions, &alice.code).await, Some(0));
+        assert_eq!(attempts_at(&sessions, &bob.code).await, Some(0));
+        // And both are still ways in, which is the part a user notices.
+        assert!(sessions.redeem(&alice.code).await.is_ok());
+        assert!(sessions.redeem(&bob.code).await.is_ok());
+    }
+
+    /// A guess that *does* name a code is charged to that code and to no
+    /// other. Refused with the hash matching is the narrow case
+    /// [`suspend_behind_the_cascade`] describes — a live code with a matching
+    /// hash simply redeems.
+    #[tokio::test]
+    async fn a_failed_guess_at_a_known_code_charges_that_code_alone() {
+        let (users, sessions, _) = repositories();
+        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("bob"), None).await.unwrap();
+        let alice = mint(&sessions, "alice").await;
+        let bob = mint(&sessions, "bob").await;
+        suspend_behind_the_cascade(&sessions).await;
+
+        let refused = sessions.redeem(&alice.code).await.unwrap_err();
+
+        assert!(matches!(refused, RedeemError::Refused), "{refused}");
+        assert_eq!(attempts_at(&sessions, &alice.code).await, Some(1));
+        assert_eq!(attempts_at(&sessions, &bob.code).await, Some(0));
+    }
+
+    /// Five failures against one code still kill that code — and still only
+    /// it. The fifth charge puts the row at [`MAX_CODE_ATTEMPTS`], which is
+    /// what the next sweep deletes; bob's code, never guessed at, is untouched
+    /// and still redeems.
+    #[tokio::test]
+    async fn five_failed_attempts_kill_the_code_they_were_aimed_at_and_no_other() {
+        let (users, sessions, _) = repositories();
+        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("bob"), None).await.unwrap();
+        let alice = mint(&sessions, "alice").await;
+        let bob = mint(&sessions, "bob").await;
+        suspend_behind_the_cascade(&sessions).await;
+
+        for _ in 0..MAX_CODE_ATTEMPTS {
+            let refused = sessions.redeem(&alice.code).await.unwrap_err();
+            assert!(matches!(refused, RedeemError::Refused), "{refused}");
+        }
+
+        // Dead at five, and gone at the next sweep — which is the next
+        // redemption's, since that is the only cleanup these tables have.
+        assert_eq!(
+            attempts_at(&sessions, &alice.code).await,
+            Some(MAX_CODE_ATTEMPTS)
+        );
+        let _ = sessions.redeem(&alice.code).await;
+        assert_eq!(attempts_at(&sessions, &alice.code).await, None);
+        assert_eq!(attempts_at(&sessions, &bob.code).await, Some(0));
+        users.resume(&by_slug("bob")).await.unwrap();
+        assert!(sessions.redeem(&bob.code).await.is_ok());
     }
 
     /// Four failures leave the code alive: the counter kills at five, not
@@ -1145,11 +1292,17 @@ mod tests {
         let (users, sessions, _) = repositories();
         users.create(&slug("alice"), None).await.unwrap();
         let minted = mint(&sessions, "alice").await;
+        suspend_behind_the_cascade(&sessions).await;
 
         for _ in 0..(MAX_CODE_ATTEMPTS - 1) {
-            let _ = sessions.redeem(&Secret::new("wrongcod")).await;
+            let _ = sessions.redeem(&minted.code).await;
         }
 
+        assert_eq!(
+            attempts_at(&sessions, &minted.code).await,
+            Some(MAX_CODE_ATTEMPTS - 1)
+        );
+        users.resume(&by_slug("alice")).await.unwrap();
         assert!(sessions.redeem(&minted.code).await.is_ok());
     }
 
