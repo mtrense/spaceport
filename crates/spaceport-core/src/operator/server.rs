@@ -53,8 +53,14 @@ use crate::status::Instance;
 /// Only the owner may talk to the socket: reaching it is the right to start
 /// containers on this host.
 ///
-/// This mode is the whole of the interface's access control — see [`super`].
+/// This mode is the whole of the interface's access control — see [`super`] —
+/// so [`bind_socket`] takes care that it is the mode the socket has for every
+/// instant it is reachable, and not one it settles into shortly after.
 const SOCKET_MODE: u32 = 0o600;
+
+/// The mode of the directory a socket is born in, and never leaves until it is
+/// owner-only. Nobody else may so much as traverse it.
+const STAGING_MODE: u32 = 0o700;
 
 /// Serve the operator interface until `shutdown` is cancelled.
 pub async fn serve(
@@ -79,18 +85,28 @@ pub async fn serve(
     result
 }
 
-/// Bind a unix socket, clearing a socket left behind by a previous run.
+/// Bind a unix socket, replacing one left behind by a previous run.
+///
+/// The socket is never, for an instant, reachable under its published name at
+/// anything but [`SOCKET_MODE`]. `bind(2)` makes the node at `0777 & ~umask`,
+/// which under the umask a unit file (`UMask=0000`), a login shell or a
+/// container entrypoint can hand this process is group- or world-writable, and
+/// the kernel checks that mode at `connect(2)` — so a connection that lands
+/// between the bind and a `chmod` survives the `chmod`, and whoever owns it
+/// owns the host. So the node is born inside a directory nobody else may
+/// traverse, taken down to owner-only there, and only then linked into the
+/// name an operator connects to.
+///
+/// Publishing with `rename(2)` also means the path is never absent: a restart
+/// replaces the socket in one step, rather than unlinking one and leaving
+/// whoever connects in between with a spaceport that appears not to exist.
 fn bind_socket(path: &Path) -> Result<UnixListener> {
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::os::unix::fs::FileTypeExt;
 
-    // Only ever unlink a socket. Pointing `--operator` at a real file is a
-    // mistake, and deleting it would be a worse one.
+    // Only ever replace a socket. Pointing `--operator` at a real file is a
+    // mistake, and clobbering it would be a worse one.
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => {
-            std::fs::remove_file(path).with_context(|| {
-                format!("removing the stale operator socket `{}`", path.display())
-            })?;
-        }
+        Ok(metadata) if metadata.file_type().is_socket() => {}
         Ok(_) => anyhow::bail!(
             "`{}` exists and is not a socket, so spaceport will not replace it",
             path.display()
@@ -98,12 +114,75 @@ fn bind_socket(path: &Path) -> Result<UnixListener> {
         Err(_) => {}
     }
 
-    let listener = UnixListener::bind(path)
+    let staging = staging_dir(path)?;
+    let result = bind_staged(&staging.join("s"), path);
+    // Whether the bind worked or not: what stays behind is the socket at its
+    // published name, never the directory it was made in.
+    if let Err(error) = std::fs::remove_dir_all(&staging) {
+        warn!(path = %staging.display(), %error, "could not remove the staging directory");
+    }
+
+    result
+}
+
+/// Bind at `staged`, restrict it, and publish it at `path`.
+fn bind_staged(staged: &Path, path: &Path) -> Result<UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let listener = UnixListener::bind(staged)
         .with_context(|| format!("binding the operator interface to `{}`", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_MODE))
+    std::fs::set_permissions(staged, std::fs::Permissions::from_mode(SOCKET_MODE))
         .with_context(|| format!("restricting access to `{}`", path.display()))?;
+    // The listener holds the socket open by descriptor, so renaming the name it
+    // was bound under does not disturb it.
+    std::fs::rename(staged, path)
+        .with_context(|| format!("publishing the operator socket at `{}`", path.display()))?;
 
     Ok(listener)
+}
+
+/// A directory of this process's own, next to the socket, that only its owner
+/// may enter.
+///
+/// Next to it because the socket leaves by [`std::fs::rename`], which is a
+/// single filesystem or nothing. Short-named because a unix socket address is a
+/// little over a hundred bytes and the operator has already spent most of them.
+///
+/// `mkdir(2)` takes the same umask that makes the bind unsafe, but only ever
+/// subtracts from the mode it is given: `0700 & ~umask` is never wider than
+/// `0700`, so nobody else can traverse this directory at any point. The `chmod`
+/// after it is for the other direction — a umask that took away bits this
+/// process needs to reach its own socket.
+fn staging_dir(path: &Path) -> Result<std::path::PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// So that two spaceports in one process — every test binding at once —
+    /// never stage in the same directory.
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let staging = parent.unwrap_or(Path::new(".")).join(format!(
+        ".sp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    std::fs::DirBuilder::new()
+        .mode(STAGING_MODE)
+        .create(&staging)
+        .with_context(|| {
+            format!(
+                "creating `{}` to bind the operator socket in",
+                staging.display()
+            )
+        })?;
+    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(STAGING_MODE))
+        .with_context(|| format!("restricting access to `{}`", staging.display()))?;
+
+    Ok(staging)
 }
 
 async fn run(listener: UnixListener, router: Router, shutdown: CancellationToken) -> Result<()> {
@@ -10398,5 +10477,143 @@ container:
             "{audit}"
         );
         assert!(!audit.contains("no IdP login recorded"), "{audit}");
+    }
+
+    /// A directory of this test's own to bind sockets in, named short because
+    /// the address they go into is a little over a hundred bytes.
+    fn a_directory(name: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("sp-{name}-{unique}"));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        directory
+    }
+
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    /// Run `work` under `umask`, and put the process's own back.
+    ///
+    /// Under a lock because a umask belongs to the process, and the rest of the
+    /// suite is creating files in other threads throughout.
+    fn under_umask<T>(umask: libc::mode_t, work: impl FnOnce() -> T) -> T {
+        static SERIAL: Mutex<()> = Mutex::new(());
+
+        let _serial = SERIAL.lock().unwrap_or_else(|held| held.into_inner());
+        // SAFETY: `umask(2)` cannot fail, and the lock is what keeps the rest
+        // of the suite out of the window it is changed in.
+        let previous = unsafe { libc::umask(umask) };
+        let result = work();
+        unsafe { libc::umask(previous) };
+
+        result
+    }
+
+    /// The security fix, at the point where it is a fix and not an outcome.
+    ///
+    /// `bind(2)` makes its node at `0777 & ~umask` and the kernel checks that
+    /// mode at `connect(2)`, so a socket that is chmod-ed to 0600 one syscall
+    /// after it is bound is connectable — by anybody, under `UMask=0000` — in
+    /// between, and the connection that wins survives the chmod. Which is why
+    /// the socket is bound inside a directory nobody else may traverse: it is
+    /// this mode, not the socket's own, that holds during the window.
+    ///
+    /// Checked instead of the race itself because the window is far too short
+    /// to catch by racing a connect against it, and a test that only sometimes
+    /// notices a hole is not one that keeps it closed.
+    #[tokio::test]
+    async fn binds_where_nobody_else_may_enter_whatever_the_umask() {
+        let directory = a_directory("staged");
+
+        for umask in [0o000, 0o002, 0o022, 0o077] {
+            let path = directory.join(format!("{umask:o}"));
+            let staging = under_umask(umask, || staging_dir(&path)).unwrap();
+
+            assert_eq!(mode_of(&staging), STAGING_MODE, "under umask {umask:o}");
+            // And it is a mode this process can still bind its own socket in.
+            under_umask(umask, || UnixListener::bind(staging.join("s"))).unwrap();
+
+            std::fs::remove_dir_all(&staging).unwrap();
+        }
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// What the staging is in aid of, from the outside: however permissive the
+    /// umask, the socket an operator's command connects to is owner-only.
+    #[tokio::test]
+    async fn binds_owner_only_under_a_permissive_umask() {
+        let directory = a_directory("umask");
+
+        for umask in [0o000, 0o002, 0o022] {
+            let path = directory.join(format!("{umask:o}"));
+
+            under_umask(umask, || bind_socket(&path)).unwrap();
+
+            assert_eq!(mode_of(&path), SOCKET_MODE, "under umask {umask:o}");
+        }
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Nothing of the staging is left lying next to the socket — an operator
+    /// looking at `/run` sees what they configured and nothing else.
+    #[tokio::test]
+    async fn leaves_nothing_but_the_socket_behind() {
+        let directory = a_directory("staging");
+        let path = directory.join("s");
+
+        let _listener = bind_socket(&path).unwrap();
+
+        let left: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("s")], "{left:?}");
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A socket from a run that did not get to clean up after itself is not a
+    /// reason to refuse to start — and it is replaced in one step, so there is
+    /// no instant at which the path an operator's command names is missing.
+    #[tokio::test]
+    async fn replaces_a_stale_socket() {
+        let directory = a_directory("stale");
+        let path = directory.join("s");
+
+        let stale = bind_socket(&path).unwrap();
+        drop(stale);
+        let _listener = bind_socket(&path).unwrap();
+
+        assert_eq!(mode_of(&path), SOCKET_MODE);
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Pointing `--operator` at something that is not a socket is a typo, and
+    /// the file it names is somebody's.
+    #[tokio::test]
+    async fn refuses_a_path_that_is_not_a_socket() {
+        let directory = a_directory("occupied");
+        let path = directory.join("s");
+        std::fs::write(&path, "not a socket").unwrap();
+
+        let error = bind_socket(&path).unwrap_err().to_string();
+
+        assert!(error.contains("not a socket"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not a socket");
+
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }
