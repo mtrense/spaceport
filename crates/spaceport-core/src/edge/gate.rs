@@ -44,6 +44,7 @@ use super::service::{ConnInfo, Scheme};
 use crate::app::store::App;
 use crate::app::{Auth, canonical_path};
 use crate::secret::Secret;
+use crate::uri::query_encode;
 
 /// The app-domain session cookie's name. The `__Host-` prefix carries the
 /// same promise it does on [`super::home::SESSION_COOKIE`] — `Secure`,
@@ -559,23 +560,6 @@ pub(super) fn authority(hostname: &str, https_port: u16) -> String {
         443 => hostname.to_owned(),
         port => format!("{hostname}:{port}"),
     }
-}
-
-/// `value` as one query-string value: everything but the unreserved characters
-/// percent-encoded. Stricter than a URL needs and exactly as strict as never
-/// having to reason about which delimiter survives where.
-pub(crate) fn query_encode(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                encoded.push(byte as char);
-            }
-            byte => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-
-    encoded
 }
 
 /// A 303: fetched with GET whatever the request was, which is what every hop

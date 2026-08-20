@@ -15,6 +15,7 @@ pub mod secret;
 pub mod setup;
 pub mod state;
 pub mod status;
+pub(crate) mod uri;
 
 pub use app::{AppId, AppManifest};
 pub use config::Config;

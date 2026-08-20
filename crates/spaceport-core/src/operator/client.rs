@@ -5,6 +5,13 @@
 //! hyper connection directly rather than carrying a pooled client. Always over
 //! the unix socket [`super`] describes, which is why nothing here presents a
 //! credential: the socket's mode already said who may ask.
+//!
+//! Every URI here is built by interpolation, and a value an operator typed goes
+//! through [`query_encode`] on the way in. A value that names itself — an app
+//! id, a pattern, a uuid — is a type whose parser already refused everything a
+//! URI reserves, and those say so where they are used; a value that is a
+//! free-form string is encoded, because there is nothing else standing between
+//! what was typed and what the far end reads as a parameter.
 
 use std::fmt::Write as _;
 use std::future::Future;
@@ -28,6 +35,7 @@ use crate::auth::{Condition, RevokeScope, Role, RoleAtApp, SessionId, UserId, Us
 use crate::events::{Category, Event, Level};
 use crate::secret::Secret;
 use crate::status::Status;
+use crate::uri::query_encode;
 
 /// Ask a running spaceport to apply `manifest` as the app named `id`.
 ///
@@ -56,13 +64,13 @@ pub async fn apply(
 ///
 /// Without `revision`, it runs the newest image it has finished building.
 ///
-/// A commit sha is hex and needs no encoding, which is the same argument
-/// [`list`] makes for a pattern: nothing here can carry a character a query
-/// string would swallow, and a spaceport asked for a revision that is not one
-/// answers that it has no build of it.
+/// A commit sha is hex, but nothing checks that before it is sent — it is a
+/// free-form string an operator typed, so it is encoded like every other one.
+/// A spaceport asked for a revision that is not one answers that it has no
+/// build of it, which is what should happen to a value that is not a sha.
 pub async fn deploy(operator: &Operator, id: &AppId, revision: Option<&str>) -> Result<String> {
     let uri = match revision {
-        Some(revision) => format!("/apps/{id}/deployment?revision={revision}"),
+        Some(revision) => format!("/apps/{id}/deployment?revision={}", query_encode(revision)),
         None => format!("/apps/{id}/deployment"),
     };
 
@@ -118,14 +126,18 @@ pub async fn resume(operator: &Operator, id: &AppId) -> Result<String> {
 /// mentioned", and sending `deploy=false` for a re-track that only corrected a
 /// manifest path would quietly stop an app deploying itself.
 ///
-/// The values go into the query string as they are, which is what every other
-/// call here does and is enough for these: a full name and a slug are github's
-/// own characters, a path is a path, and a branch may hold `/`, which a query
-/// string carries. It is not enough for a branch holding `&`, `#` or `%` —
-/// unusual, and permitted by git — and the answer to that is an encoder this
-/// crate does not have and will not gain a dependency for over a branch nobody
-/// has yet. Such a branch is refused by the spaceport as a repository or a
-/// branch it cannot find rather than silently tracking something else.
+/// Every one of these four values is a free-form string an operator typed, so
+/// every one of them is encoded on the way into the query string. What that
+/// buys is not politeness about odd branch names: an unencoded value ends the
+/// parameter it is in and begins the next one, so a manifest path of
+/// `spaceport.yaml&deploy=true` would arm the app for automatic deployment
+/// without ever going near the flag that asks for it — and `deny_unknown_fields`
+/// at the far end cannot help, because the field being smuggled in is a real
+/// one. Encoded, a value arrives as the one value it was, whatever it held.
+///
+/// So a branch holding `&`, `#`, `%` or a space — unusual, and permitted by git
+/// — now travels honestly and comes back as a branch the spaceport could not
+/// find, which is the truth about it.
 pub async fn track(
     operator: &Operator,
     id: &AppId,
@@ -135,16 +147,7 @@ pub async fn track(
     manifest_path: Option<&str>,
     deploy: Option<bool>,
 ) -> Result<String> {
-    let mut uri = format!("/apps/{id}/tracking?repository={repository}&connection={connection}");
-    if let Some(branch) = branch {
-        let _ = write!(uri, "&branch={branch}");
-    }
-    if let Some(manifest_path) = manifest_path {
-        let _ = write!(uri, "&manifest_path={manifest_path}");
-    }
-    if let Some(deploy) = deploy {
-        let _ = write!(uri, "&deploy={deploy}");
-    }
+    let uri = tracking_uri(id, repository, connection, branch, manifest_path, deploy);
 
     send_to(
         operator,
@@ -152,6 +155,39 @@ pub async fn track(
         builder("PUT", &uri).body(Full::default())?,
     )
     .await
+}
+
+/// The URI [`track`] sends, apart from it so that what it comes to for a given
+/// set of arguments can be asked without a spaceport to send it to — and so
+/// that the route on the other side can be tested against the very string this
+/// builds rather than against one a test wrote out by hand.
+pub(super) fn tracking_uri(
+    id: &AppId,
+    repository: &str,
+    connection: &str,
+    branch: Option<&str>,
+    manifest_path: Option<&str>,
+    deploy: Option<bool>,
+) -> String {
+    let mut uri = format!(
+        "/apps/{id}/tracking?repository={}&connection={}",
+        query_encode(repository),
+        query_encode(connection),
+    );
+    if let Some(branch) = branch {
+        let _ = write!(uri, "&branch={}", query_encode(branch));
+    }
+    if let Some(manifest_path) = manifest_path {
+        let _ = write!(uri, "&manifest_path={}", query_encode(manifest_path));
+    }
+    // Not encoded and needing no encoding: this one is not a string anybody
+    // typed, it is `true` or `false`. It is here at all only when the caller
+    // answered the question — see above.
+    if let Some(deploy) = deploy {
+        let _ = write!(uri, "&deploy={deploy}");
+    }
+
+    uri
 }
 
 /// Ask for the apps it is running, optionally only those matching `pattern`.
@@ -328,8 +364,14 @@ pub async fn connections(operator: &Operator) -> Result<Vec<wire::ConnectionRow>
 }
 
 /// Ask for everything it knows about the connection named `slug`.
+///
+/// The slug is encoded for the reason [`track`] gives, in the path rather than
+/// the query: nothing has held it to a slug's alphabet, and a `/` or a `?` in
+/// an unencoded segment addresses a different route entirely. Encoded, a slug
+/// that is not one comes back as a connection that does not exist.
 pub async fn connection(operator: &Operator, slug: &str) -> Result<wire::Connection> {
-    let request = builder("GET", &format!("/connections/{slug}")).body(Full::default())?;
+    let request =
+        builder("GET", &format!("/connections/{}", query_encode(slug))).body(Full::default())?;
 
     send_json_to(operator, Pace::Quick, request).await
 }
@@ -337,7 +379,8 @@ pub async fn connection(operator: &Operator, slug: &str) -> Result<wire::Connect
 /// Ask it to forget the connection named `slug`, and everything cached under
 /// it.
 pub async fn forget_connection(operator: &Operator, slug: &str) -> Result<String> {
-    let request = builder("DELETE", &format!("/connections/{slug}")).body(Full::default())?;
+    let request =
+        builder("DELETE", &format!("/connections/{}", query_encode(slug))).body(Full::default())?;
 
     send_to(operator, Pace::Quick, request).await
 }
@@ -461,9 +504,10 @@ pub async fn auth_session_list(operator: &Operator, user: &UserRef) -> Result<wi
 /// when absent) from now.
 ///
 /// The duration travels as the operator spelled it for [`auth_session_mint`]'s
-/// reason: the server's parser stays the authority. Everything else is safe in
-/// a path as a grant's arguments are — one shared alphabet, and an `@` is an
-/// ordinary path character.
+/// reason: the server's parser stays the authority. Travelling as they spelled
+/// it is why it is encoded — the whole point is that this side did not look at
+/// it. Everything else is safe in a path as a grant's arguments are — one
+/// shared alphabet, and an `@` is an ordinary path character.
 pub async fn auth_api_key_mint(
     operator: &Operator,
     user: &UserRef,
@@ -471,7 +515,10 @@ pub async fn auth_api_key_mint(
     expires: Option<&str>,
 ) -> Result<String> {
     let uri = match expires {
-        Some(expires) => format!("/auth/users/{user}/api-keys/{grants}?expires={expires}"),
+        Some(expires) => format!(
+            "/auth/users/{user}/api-keys/{grants}?expires={}",
+            query_encode(expires)
+        ),
         None => format!("/auth/users/{user}/api-keys/{grants}"),
     };
 
@@ -489,15 +536,20 @@ pub async fn auth_api_key_mint(
 ///
 /// The duration travels as the operator spelled it and is parsed at the far
 /// end, where the refusal can come from the same parser every manifest goes
-/// through — two parsers would be two opinions about what `90m` means. Its
-/// alphabet is digits and letters, which a query string carries as they are.
+/// through — two parsers would be two opinions about what `90m` means. Which
+/// means this side has not established that it is digits and letters at all, so
+/// it is encoded: a value nobody here has checked is exactly the value that
+/// must not be able to write a second parameter.
 pub async fn auth_session_mint(
     operator: &Operator,
     user: &UserRef,
     expires: Option<&str>,
 ) -> Result<String> {
     let uri = match expires {
-        Some(expires) => format!("/auth/users/{user}/sessions?expires={expires}"),
+        Some(expires) => format!(
+            "/auth/users/{user}/sessions?expires={}",
+            query_encode(expires)
+        ),
         None => format!("/auth/users/{user}/sessions"),
     };
 
@@ -683,13 +735,21 @@ pub struct Watch {
 impl Watch {
     /// The query string that asks for exactly this.
     ///
-    /// Nothing here needs escaping: a pattern is app-id characters and `*`, a
-    /// category is lowercase and dots, and the rest are a word and a number.
+    /// Every value goes through the encoder, though none of them has ever
+    /// needed it — a pattern is app-id characters and `*`, a category is
+    /// lowercase and dots, and the rest are a word and a number. It is one
+    /// place that builds parameters out of values, and a place like that is
+    /// better off encoding unconditionally than resting on what each of its
+    /// callers happens to pass today.
     fn query(&self) -> String {
         let mut query = String::new();
         let mut add = |name: &str, value: &dyn std::fmt::Display| {
             let separator = if query.is_empty() { '?' } else { '&' };
-            let _ = write!(query, "{separator}{name}={value}");
+            let _ = write!(
+                query,
+                "{separator}{name}={}",
+                query_encode(&value.to_string())
+            );
         };
 
         if let Some(app) = &self.app {
@@ -1131,6 +1191,117 @@ mod tests {
         });
 
         (path, held)
+    }
+
+    /// The app every tracking here is about.
+    fn an_app() -> AppId {
+        "site".parse().unwrap()
+    }
+
+    /// THE REGRESSION GUARD, this side of the wire. A manifest path is a
+    /// free-form string, and an unencoded `&` in one ends the parameter it is
+    /// in and starts another — so `spaceport.yaml&deploy=true` used to arm the
+    /// app for automatic deployment, and every push after it went to production
+    /// without anybody asking. Nothing at the far end can catch that: `deploy`
+    /// is a field the route really has.
+    #[test]
+    fn a_manifest_path_cannot_arm_the_app() {
+        let uri = tracking_uri(
+            &an_app(),
+            "an-organisation/site",
+            "spaceport-acme",
+            Some("main"),
+            Some("spaceport.yaml&deploy=true"),
+            None,
+        );
+
+        assert_eq!(
+            uri,
+            "/apps/site/tracking?repository=an-organisation%2Fsite&connection=spaceport-acme\
+             &branch=main&manifest_path=spaceport.yaml%26deploy%3Dtrue"
+        );
+        // Said the other way round, in the terms the finding was in: there is
+        // no such parameter, at any value.
+        assert!(!uri.contains("&deploy="), "{uri}");
+    }
+
+    /// The same trick through each of the other three, since all four are
+    /// strings an operator typed and only one of them was reported.
+    #[test]
+    fn no_argument_of_a_tracking_can_write_a_parameter_of_its_own() {
+        for hostile in [
+            "an-organisation/site&deploy=true",
+            "spaceport-acme&deploy=true",
+        ] {
+            let uri = tracking_uri(
+                &an_app(),
+                hostile,
+                hostile,
+                Some(hostile),
+                Some(hostile),
+                None,
+            );
+
+            assert!(!uri.contains("&deploy="), "{uri}");
+            // Four parameters went in and four came out: the `&`s in the uri
+            // are the ones this built, not ones a value smuggled in.
+            assert_eq!(uri.matches('&').count(), 3, "{uri}");
+        }
+    }
+
+    /// A branch may hold any of these, and git will not stop anybody. What
+    /// travels has to be the branch that was typed rather than a request that
+    /// happens to parse.
+    #[test]
+    fn a_branch_survives_every_character_a_uri_reserves() {
+        let uri = tracking_uri(
+            &an_app(),
+            "an-organisation/site",
+            "spaceport-acme",
+            Some("feature/a&b#c%d e+f"),
+            None,
+            None,
+        );
+
+        assert!(
+            uri.ends_with("&branch=feature%2Fa%26b%23c%25d%20e%2Bf"),
+            "{uri}"
+        );
+    }
+
+    /// The three answers, still three. An encoder that also had opinions about
+    /// absence would be the same bug pointing the other way: a re-track that
+    /// only corrected a manifest path must not disarm an app.
+    #[test]
+    fn the_switch_is_mentioned_only_when_the_caller_answered() {
+        let tracking = |deploy| {
+            tracking_uri(
+                &an_app(),
+                "an-organisation/site",
+                "spaceport-acme",
+                None,
+                None,
+                deploy,
+            )
+        };
+
+        assert!(!tracking(None).contains("deploy"), "{}", tracking(None));
+        assert!(tracking(Some(true)).ends_with("&deploy=true"));
+        assert!(tracking(Some(false)).ends_with("&deploy=false"));
+    }
+
+    /// The stream's query is built by one closure over every filter, which is
+    /// the sort of place that is worth encoding whether or not today's callers
+    /// need it to.
+    #[test]
+    fn a_watch_encodes_what_it_asks_for() {
+        let watch = Watch {
+            app: Some("*".parse().unwrap()),
+            history: 20,
+            ..Watch::default()
+        };
+
+        assert_eq!(watch.query(), "?app=%2A&history=20");
     }
 
     /// A path nothing has ever bound, for the tests that only ask what a

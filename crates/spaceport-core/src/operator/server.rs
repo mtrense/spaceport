@@ -6960,6 +6960,59 @@ container:
         call(router, request).await
     }
 
+    /// The same, for a URI built rather than written out — the CLI's own, so
+    /// that what the route is asked is the string an operator's arguments
+    /// actually come to.
+    async fn track_at(router: &Router, uri: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+
+        call(router, request).await
+    }
+
+    /// THE REGRESSION GUARD, both sides of the wire at once. `client::track`
+    /// used to interpolate its arguments unencoded, so a manifest path of
+    /// `spaceport.yaml&deploy=true` reached here as a `deploy` parameter and
+    /// armed the app: every push from then on went straight to production
+    /// without the operator ever being asked. Nothing in [`TrackQuery`] could
+    /// have caught it — `deny_unknown_fields` refuses fields that do not exist,
+    /// and this one does.
+    ///
+    /// So this goes through the client's builder rather than a query somebody
+    /// typed here: a test that wrote the encoded string out by hand would still
+    /// pass on the day the encoding was taken back out.
+    #[tokio::test]
+    async fn a_manifest_path_that_looks_like_a_parameter_does_not_arm_the_app() {
+        let (router, _, tracking, _, _) = tracking_parts().await;
+
+        let (status, body) = track_at(
+            &router,
+            &crate::operator::client::tracking_uri(
+                &"site".parse().unwrap(),
+                "an-organisation/site",
+                "spaceport-acme",
+                Some("main"),
+                Some("spaceport.yaml&deploy=true"),
+                None,
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let tracked = tracking
+            .by_app(&"site".parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!tracked.automatic, "{body}");
+        // And the path was recorded whole, rather than being cut at the `&`:
+        // the value travelled as the one value it was.
+        assert_eq!(tracked.manifest_path, "spaceport.yaml&deploy=true");
+    }
+
     /// Whether anything went out to github for a repository, which is the whole
     /// question when a branch was given explicitly.
     fn repositories_read(github: &FakeGitHub) -> Vec<String> {

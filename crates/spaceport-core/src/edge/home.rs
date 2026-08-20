@@ -38,7 +38,6 @@ use serde::Deserialize;
 use time::{Duration, OffsetDateTime};
 use tracing::{debug, warn};
 
-use super::gate::query_encode;
 use super::service::ConnInfo;
 use crate::app::manifest::Host;
 use crate::app::{AppId, AppStore, Auth};
@@ -51,6 +50,7 @@ use crate::connections::github::{
     Client, ConnectionRepository, Nudge, TrackingRepository, Transport, api, register, webhook,
 };
 use crate::secret::Secret;
+use crate::uri::query_encode;
 
 /// What the pages on spaceport's own host are served out of.
 ///
