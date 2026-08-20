@@ -13,12 +13,23 @@
 //! transaction is the JWT cache purge, which follows the commit under the same
 //! "commit, then purge" discipline every other revocation lever keeps.
 //!
-//! Resolution order is the spec's, written down once: a stored identity for
-//! (connection, external id) wins — a returning login is the same user even if
-//! every email changed — then an exact match on a GitHub-*verified* email, and
-//! only then a fresh `github:<login>` user. Linking by unverified email is the
-//! attack this module exists to refuse: anybody can type anybody's address
-//! into their GitHub settings, and only the verified flag says GitHub checked.
+//! Resolution is the spec's, and it is one rule rather than a ladder: a stored
+//! identity for (connection, external id) names the user, and a login with no
+//! stored identity is a stranger who may become a fresh `github:<login>` user
+//! if a mapping rule says so. Nothing else resolves anybody.
+//!
+//! What is deliberately *absent* here is linking by email, which this module
+//! used to do and which the spec now forbids in as many words. A GitHub login
+//! asserts one thing — that the person controls account `external_id` right
+//! now. The addresses GitHub lists beside it are a claim about somebody else's
+//! credential: the mailbox is the *email* connection's credential, proven there
+//! by a code that has to arrive today. Accepting GitHub's `verified` flag in
+//! its place accepted a stored assertion, made at some past moment and never
+//! revalidated, as proof of present control — so anyone who had ever held an
+//! address a spaceport user was recorded under could sign in as them, skipping
+//! the one-time code and every limit around it. For the same reason a login
+//! never *writes* `users.email`: minting the email connection's credential out
+//! of a GitHub claim is the same confusion pointed the other way.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -51,10 +62,6 @@ pub struct SsoLogin {
     pub external_id: String,
     /// The renameable handle beside it, which also names an auto-created user.
     pub external_login: String,
-    /// The addresses GitHub asserts as verified, in linking preference order —
-    /// the primary address first, so the one a person actually reads is the
-    /// one a fresh user record stores.
-    pub verified_emails: Vec<String>,
     /// The snapshot [`evaluate`] judges and `mapping test` later replays.
     pub attributes: Attributes,
 }
@@ -311,12 +318,21 @@ impl SsoRepository {
     }
 }
 
-/// Whom this login is about, if spaceport already knows: the identity link
-/// first, an exact verified-email match second.
+/// Whom this login is about, if spaceport already knows: the stored identity
+/// link, and nothing else.
+///
+/// One lookup rather than a ladder, because the login only ever proved one
+/// thing. Everything else GitHub said — the handle, the organisations, the
+/// addresses — is either a renameable label or a claim about a credential this
+/// connection does not own, and none of it names a user. A person spaceport has
+/// no identity row for is a stranger here even when the operator has an account
+/// waiting for them under an address GitHub happens to list; the way that
+/// account gets its GitHub identity is a deliberate binding made from a session
+/// that is already authenticated, not a guess made during this one.
 fn resolve(transaction: &Transaction<'_>, login: &SsoLogin) -> Result<Option<UserRecord>> {
-    // A returning identity wins outright, whatever their emails say now: the
-    // external id is the IdP's stable name for the account, and a person who
-    // changed every address on it is still that person.
+    // Whatever their emails or handle say now: the external id is the IdP's
+    // stable name for the account, and a person who changed every label on it
+    // is still that person.
     let linked: Option<String> = transaction
         .query_row(
             "SELECT user_id FROM idp_identities WHERE connection = ?1 AND external_id = ?2",
@@ -335,40 +351,6 @@ fn resolve(transaction: &Transaction<'_>, login: &SsoLogin) -> Result<Option<Use
         }
     }
 
-    // Then a verified email, compared case-insensitively: RFC 5321 makes the
-    // domain case-insensitive and receivers fold the local part in practice,
-    // so `Alice@Example.com` typed by an operator and `alice@example.com`
-    // asserted by GitHub are one mailbox — refusing to link them would strand
-    // the user behind a capital letter nobody can see. Only *verified*
-    // addresses are consulted; an unverified one is a string anybody can type
-    // into their GitHub settings, and linking on it would hand out accounts.
-    // Should a suspended and a live user somehow share the address, the live
-    // one is preferred — matching the suspended one would refuse a login the
-    // operator has no reason to expect refused.
-    for email in &login.verified_emails {
-        let matched = transaction
-            .query_row(
-                "SELECT user_id, user_slug, email, suspended, created_at
-                 FROM users WHERE lower(email) = lower(?1)
-                 ORDER BY suspended, user_slug LIMIT 1",
-                rusqlite::params![email],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .optional()
-            .context("looking a user up by verified email")?;
-        if let Some(row) = matched {
-            return Ok(Some(record(row)?));
-        }
-    }
-
     Ok(None)
 }
 
@@ -379,9 +361,14 @@ fn resolve(transaction: &Transaction<'_>, login: &SsoLogin) -> Result<Option<Use
 /// *dropped-and-recreated* GitHub account once linked to, or an operator's own
 /// deliberate creation. Resolution already said this login is nobody spaceport
 /// knows, so taking the existing row over would be handing one person
-/// another's entitlements — a suffix costs an ugly slug and nothing else. The
-/// primary verified email rides onto the record exactly as `user create
-/// --email` stores one, so the future email flow can reach this user too.
+/// another's entitlements — a suffix costs an ugly slug and nothing else.
+///
+/// The row is created with no email, and that is the point rather than an
+/// omission: `users.email` is what the email connection signs people in by, and
+/// filling it from an address GitHub reported would hand this account a second
+/// way in that spaceport never verified and cannot revoke by revoking anything
+/// of GitHub's. An operator who wants this person to be able to sign in by
+/// email sets `--email` themselves, having decided the address is theirs.
 fn create(
     transaction: &Transaction<'_>,
     login: &SsoLogin,
@@ -403,12 +390,11 @@ fn create(
         Some(_) => suffixed,
     };
 
-    let email = login.verified_emails.first().cloned();
     transaction
         .execute(
             "INSERT INTO users (user_id, user_slug, email, suspended, created_at)
-             VALUES (?1, ?2, ?3, 0, ?4)",
-            rusqlite::params![id.as_str(), slug.as_str(), email, at],
+             VALUES (?1, ?2, NULL, 0, ?3)",
+            rusqlite::params![id.as_str(), slug.as_str(), at],
         )
         .context("creating a user for an sso login")?;
     record_in(
@@ -417,22 +403,16 @@ fn create(
         "user.created",
         Some(id),
         &login.connection,
-        Some(&match &email {
-            Some(email) => format!(
-                "slug `{slug}`, email `{email}`, auto-created for github login `{}`",
-                login.external_login
-            ),
-            None => format!(
-                "slug `{slug}`, auto-created for github login `{}`",
-                login.external_login
-            ),
-        }),
+        Some(&format!(
+            "slug `{slug}`, auto-created for github login `{}`",
+            login.external_login
+        )),
     )?;
 
     Ok(UserRecord {
         id: id.clone(),
         slug: slug.clone(),
-        email,
+        email: None,
         suspended: false,
         created_at: at.to_owned(),
     })
@@ -446,12 +426,42 @@ fn create(
 /// Written here rather than through that repository because it must share this
 /// commit — a snapshot that landed without its re-sync is exactly the record
 /// the module comment refuses to leave behind.
+///
+/// Re-linking is refused outright, and loudly. With resolution down to the
+/// identity lookup this cannot be reached — a user resolved by (connection,
+/// external id) holds that very row, and a freshly created one holds none — so
+/// the check is an invariant rather than a branch anybody takes. It is written
+/// anyway because of what the delete below would otherwise do if some later
+/// path did reach it: silently move somebody else's GitHub account onto this
+/// user, which is how an email-shaped resolution turned a one-off address into
+/// standing access. A login is not the place to re-decide whose account this
+/// is; that binding is deliberate, made from an authenticated session, and
+/// anything else is a bug that should stop the transaction rather than commit.
 fn record_identity_in(
     transaction: &Transaction<'_>,
     user: &UserId,
     login: &SsoLogin,
     at: &str,
 ) -> Result<()> {
+    let held: Option<String> = transaction
+        .query_row(
+            "SELECT external_id FROM idp_identities WHERE user_id = ?1 AND connection = ?2",
+            rusqlite::params![user.as_str(), login.connection],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("checking which identity a user already holds on this connection")?;
+    if let Some(held) = held
+        && held != login.external_id
+    {
+        return Err(anyhow!(
+            "refusing to re-link user `{user}` on connection `{}`: it already holds external id \
+             `{held}` and this login carries `{}`",
+            login.connection,
+            login.external_id
+        ));
+    }
+
     let attributes =
         serde_json::to_string(&login.attributes).context("writing an identity's attributes")?;
 
@@ -705,14 +715,24 @@ mod tests {
             .collect()
     }
 
-    fn octocat(emails: &[&str], attrs: &[(&str, &[&str])]) -> SsoLogin {
+    fn octocat(attrs: &[(&str, &[&str])]) -> SsoLogin {
         SsoLogin {
             connection: "spaceport-acme".to_owned(),
             external_id: "1001".to_owned(),
             external_login: "octocat".to_owned(),
-            verified_emails: emails.iter().map(|email| (*email).to_owned()).collect(),
             attributes: attributes(attrs),
         }
+    }
+
+    /// Bind the octocat account to an existing user, as the deliberate linking
+    /// step does — the only way an operator-made account is reachable by a
+    /// GitHub login now that no address resolves anybody. Tests about what a
+    /// *returning* login does start here.
+    async fn link_octocat(db: &Db, user: &UserId) {
+        IdentityRepository::new(db.clone())
+            .record(user, "spaceport-acme", "1001", "octocat", &attributes(&[]))
+            .await
+            .unwrap();
     }
 
     fn signed_in(outcome: SsoOutcome) -> FreshSession {
@@ -737,27 +757,23 @@ mod tests {
     }
 
     /// The whole auto-create path in one pass: a stranger's login makes a
-    /// `github:<login>` user carrying the primary verified email, and the
-    /// creation is in the log with the connection as its origin.
+    /// `github:<login>` user, and the creation is in the log with the
+    /// connection as its origin. The record carries *no* email — the address
+    /// is the email connection's credential and a GitHub login does not get to
+    /// mint one, so an operator who wants this person signing in by code has
+    /// to say so with `--email`.
     #[tokio::test]
-    async fn a_stranger_becomes_a_prefixed_user_with_their_primary_email() {
+    async fn a_stranger_becomes_a_prefixed_user_with_no_email_credential() {
         let (db, users, sso, _, log) = repositories();
         plant_connection(&db, "spaceport-acme").await;
         plant_octocat_rule(&db).await;
 
-        let fresh = signed_in(
-            sso.login(octocat(
-                &["octocat@acme.example"],
-                &[("login", &["octocat"])],
-            ))
-            .await
-            .unwrap(),
-        );
+        let fresh = signed_in(sso.login(octocat(&[("login", &["octocat"])])).await.unwrap());
 
         let listed = users.list(None).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].slug.as_str(), "github:octocat");
-        assert_eq!(listed[0].email.as_deref(), Some("octocat@acme.example"));
+        assert_eq!(listed[0].email, None);
         assert_eq!(listed[0].id, fresh.user);
         let created = log
             .entries(None)
@@ -770,61 +786,74 @@ mod tests {
         assert!(created.detail.unwrap().contains("auto-created"), "");
     }
 
-    /// A verified email links to the operator-made user rather than creating a
-    /// double — and case-insensitively, because two spellings of one mailbox
-    /// are not two people.
+    /// The credential boundary, from the side that used to be a hole: a GitHub
+    /// login that arrives carrying an address an existing user is recorded
+    /// under does *not* become that user. Whoever holds a mailbox proves it to
+    /// the email connection, with a code, today — GitHub's word that somebody
+    /// verified the address at some unrecoverable past moment is a claim about
+    /// a credential this connection does not own. Here no rule matches the
+    /// login either, so the stranger is refused outright rather than quietly
+    /// inheriting alice's account and her manual grants.
     #[tokio::test]
-    async fn a_verified_email_links_to_the_existing_user_whatever_its_case() {
+    async fn a_verified_email_does_not_reach_the_user_recorded_under_it() {
         let (db, users, sso, _, _) = repositories();
         plant_connection(&db, "spaceport-acme").await;
         let alice = users
-            .create(&"alice".parse().unwrap(), Some("Octocat@Acme.example"))
+            .create(&"alice".parse().unwrap(), Some("octocat@acme.example"))
             .await
             .unwrap();
 
-        let fresh = signed_in(
-            sso.login(octocat(&["octocat@acme.example"], &[]))
-                .await
-                .unwrap(),
-        );
+        let outcome = sso.login(octocat(&[])).await.unwrap();
 
-        assert_eq!(fresh.user, alice.id);
-        assert_eq!(users.list(None).await.unwrap().len(), 1);
+        assert!(matches!(outcome, SsoOutcome::Unmapped), "signed in");
+        // Alice is untouched: still there, still hers, and no identity of
+        // somebody else's GitHub account hanging off her.
+        let listed = users.list(None).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, alice.id);
+        let identities = IdentityRepository::new(db);
+        assert!(identities.for_user(&alice.id).await.unwrap().is_empty());
+    }
+
+    /// And the same address is no shortcut past the create-gate either: with a
+    /// rule that does match, the login makes its *own* user rather than
+    /// landing in the one holding the address.
+    #[tokio::test]
+    async fn a_verified_email_does_not_short_circuit_the_create_gate() {
+        let (db, users, sso, _, _) = repositories();
+        plant_connection(&db, "spaceport-acme").await;
+        plant_octocat_rule(&db).await;
+        let alice = users
+            .create(&"alice".parse().unwrap(), Some("octocat@acme.example"))
+            .await
+            .unwrap();
+
+        let fresh = signed_in(sso.login(octocat(&[("login", &["octocat"])])).await.unwrap());
+
+        assert_ne!(fresh.user, alice.id);
+        assert_eq!(users.list(None).await.unwrap().len(), 2);
     }
 
     /// The returning-identity rule: once linked, the external id names the
-    /// user even when every email moved elsewhere — a rename or an address
-    /// change must not fork the account.
+    /// user even when every label around it moved — a rename or an address
+    /// change must not fork the account. Eve holds the address this login
+    /// would once have been resolved by, which is now simply not a question
+    /// anybody asks.
     #[tokio::test]
-    async fn a_returning_identity_wins_over_a_changed_email() {
+    async fn a_returning_identity_names_the_user_whatever_the_labels_say() {
         let (db, users, sso, _, _) = repositories();
         plant_connection(&db, "spaceport-acme").await;
         let carol = users
             .create(&"carol".parse().unwrap(), Some("carol@acme.example"))
             .await
             .unwrap();
-        let identities = IdentityRepository::new(db.clone());
-        identities
-            .record(
-                &carol.id,
-                "spaceport-acme",
-                "1001",
-                "octocat",
-                &attributes(&[]),
-            )
-            .await
-            .unwrap();
-        // A second user now holds the email GitHub asserts.
+        link_octocat(&db, &carol.id).await;
         users
             .create(&"eve".parse().unwrap(), Some("octocat@acme.example"))
             .await
             .unwrap();
 
-        let fresh = signed_in(
-            sso.login(octocat(&["octocat@acme.example"], &[]))
-                .await
-                .unwrap(),
-        );
+        let fresh = signed_in(sso.login(octocat(&[])).await.unwrap());
 
         assert_eq!(fresh.user, carol.id);
     }
@@ -842,11 +871,7 @@ mod tests {
             .await
             .unwrap();
 
-        let fresh = signed_in(
-            sso.login(octocat(&[], &[("login", &["octocat"])]))
-                .await
-                .unwrap(),
-        );
+        let fresh = signed_in(sso.login(octocat(&[("login", &["octocat"])])).await.unwrap());
 
         assert_ne!(fresh.user, squatter.id);
         let listed = users.list(None).await.unwrap();
@@ -883,10 +908,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let alice = users
-            .create(&"alice".parse().unwrap(), Some("octocat@acme.example"))
-            .await
-            .unwrap();
+        let alice = users.create(&"alice".parse().unwrap(), None).await.unwrap();
+        link_octocat(&db, &alice.id).await;
         entitlements
             .grant(
                 &UserRef::Slug("alice".parse().unwrap()),
@@ -912,10 +935,10 @@ mod tests {
         .unwrap();
 
         signed_in(
-            sso.login(octocat(
-                &["octocat@acme.example"],
-                &[("org", &["acme-corp"]), ("team", &["review"])],
-            ))
+            sso.login(octocat(&[
+                ("org", &["acme-corp"]),
+                ("team", &["review"]),
+            ]))
             .await
             .unwrap(),
         );
@@ -976,16 +999,8 @@ mod tests {
             .await
             .unwrap();
 
-        signed_in(
-            sso.login(octocat(&[], &[("org", &["acme-corp"])]))
-                .await
-                .unwrap(),
-        );
-        signed_in(
-            sso.login(octocat(&[], &[("org", &["acme-corp"])]))
-                .await
-                .unwrap(),
-        );
+        signed_in(sso.login(octocat(&[("org", &["acme-corp"])])).await.unwrap());
+        signed_in(sso.login(octocat(&[("org", &["acme-corp"])])).await.unwrap());
 
         assert_eq!(users.list(None).await.unwrap().len(), 1);
         let synced = log
@@ -1004,17 +1019,15 @@ mod tests {
     async fn a_suspended_users_login_is_refused_and_logged() {
         let (db, users, sso, _, log) = repositories();
         plant_connection(&db, "spaceport-acme").await;
-        users
-            .create(&"alice".parse().unwrap(), Some("octocat@acme.example"))
-            .await
-            .unwrap();
+        let alice = users.create(&"alice".parse().unwrap(), None).await.unwrap();
+        link_octocat(&db, &alice.id).await;
         users
             .suspend(&UserRef::Slug("alice".parse().unwrap()))
             .await
             .unwrap();
 
         let outcome = sso
-            .login(octocat(&["octocat@acme.example"], &[]))
+            .login(octocat(&[("org", &["acme-corp"])]))
             .await
             .unwrap();
 
@@ -1028,10 +1041,13 @@ mod tests {
             .unwrap();
         assert_eq!(failed.origin, "spaceport-acme");
         assert!(failed.detail.unwrap().contains("suspended"), "");
-        // And no identity was written for them.
+        // And their snapshot did not move: the login carried an `org` the
+        // stored identity has never seen, and it still has not — resume must
+        // restore exactly the state suspend froze.
         let identities = IdentityRepository::new(db);
-        let alice = &users.list(None).await.unwrap()[0];
-        assert!(identities.for_user(&alice.id).await.unwrap().is_empty());
+        let held = identities.for_user(&alice.id).await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert!(held[0].attributes.is_empty(), "{:?}", held[0].attributes);
     }
 
     /// The create-gate: a stranger no rule of the connection matches is refused
@@ -1057,10 +1073,7 @@ mod tests {
             .unwrap();
 
         let outcome = sso
-            .login(octocat(
-                &["octocat@acme.example"],
-                &[("org", &["some-other-org"])],
-            ))
+            .login(octocat(&[("org", &["some-other-org"])]))
             .await
             .unwrap();
 
@@ -1085,26 +1098,62 @@ mod tests {
     }
 
     /// The guard against over-gating: the rule check stands in front of
-    /// *creation* and nothing else. A user spaceport already knows — here by
-    /// verified email, as an operator-made account is reached — signs in with
-    /// the slate they have even when no rule matches them at all, because
-    /// operator-made accounts never match one and a member who fell out of an
-    /// org for an afternoon must still get through the door.
+    /// *creation* and nothing else. A user spaceport already knows — that is,
+    /// one whose GitHub identity is on file — signs in with the slate they
+    /// have even when no rule matches them at all, because operator-made
+    /// accounts never match one and a member who fell out of an org for an
+    /// afternoon must still get through the door.
     #[tokio::test]
-    async fn an_existing_user_who_matches_no_rule_still_signs_in() {
+    async fn a_linked_user_who_matches_no_rule_still_signs_in() {
         let (db, users, sso, _, _) = repositories();
         plant_connection(&db, "spaceport-acme").await;
-        let alice = users
-            .create(&"alice".parse().unwrap(), Some("octocat@acme.example"))
+        let alice = users.create(&"alice".parse().unwrap(), None).await.unwrap();
+        link_octocat(&db, &alice.id).await;
+
+        let fresh = signed_in(sso.login(octocat(&[])).await.unwrap());
+
+        assert_eq!(fresh.user, alice.id);
+    }
+
+    /// The re-link refusal, at its own level. No login can reach it — a user
+    /// is only ever resolved by the very identity they hold — so it is tested
+    /// against `record_identity_in` directly rather than through a `login`
+    /// call that would have to be given a broken resolution first. That is the
+    /// honest shape for an invariant: assert it where it is stated, so the day
+    /// some future linking path calls in here, this says what it must not do.
+    #[tokio::test]
+    async fn recording_an_identity_refuses_to_rebind_a_user_who_holds_another() {
+        let (db, users, _, _, _) = repositories();
+        plant_connection(&db, "spaceport-acme").await;
+        let alice = users.create(&"alice".parse().unwrap(), None).await.unwrap();
+        link_octocat(&db, &alice.id).await;
+
+        let alice_id = alice.id.clone();
+        let refused = db
+            .call(move |connection| {
+                let transaction = connection.transaction()?;
+                // Somebody else's GitHub account, arriving for alice.
+                let mut login = octocat(&[]);
+                login.external_id = "2002".to_owned();
+
+                Ok(record_identity_in(
+                    &transaction,
+                    &alice_id,
+                    &login,
+                    "2026-01-01T00:00:00Z",
+                )
+                .is_err())
+            })
             .await
             .unwrap();
 
-        let fresh = signed_in(
-            sso.login(octocat(&["octocat@acme.example"], &[]))
-                .await
-                .unwrap(),
-        );
-
-        assert_eq!(fresh.user, alice.id);
+        assert!(refused, "the re-link was allowed");
+        // And the binding alice actually holds is untouched.
+        let held = IdentityRepository::new(db)
+            .for_user(&alice.id)
+            .await
+            .unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].external_id, "1001");
     }
 }

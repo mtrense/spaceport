@@ -1258,14 +1258,13 @@ async fn github_callback(
     let asked = async {
         let token = client.exchange_user_code(&code).await?;
         let user = client.user(&token).await?;
-        let emails = client.user_emails(&token).await?;
         let orgs = client.user_orgs(&token).await?;
         let teams = client.user_teams(&token).await?;
 
-        anyhow::Ok((user, emails, orgs, teams))
+        anyhow::Ok((user, orgs, teams))
     }
     .await;
-    let (user, emails, orgs, teams) = match asked {
+    let (user, orgs, teams) = match asked {
         Ok(answers) => answers,
         Err(error) => {
             warn!(error = %format!("{error:#}"), "a github login could not be read back");
@@ -1301,27 +1300,19 @@ async fn github_callback(
         attributes.insert("team".to_owned(), values);
     }
 
-    // The verified addresses, primary first, so linking prefers — and a fresh
-    // record stores — the address the person actually reads.
-    let mut verified: Vec<String> = emails
-        .iter()
-        .filter(|email| email.verified && email.primary)
-        .chain(
-            emails
-                .iter()
-                .filter(|email| email.verified && !email.primary),
-        )
-        .map(|email| email.email.clone())
-        .collect();
-    verified.dedup();
-
+    // The addresses are deliberately not read: `/user/emails` is not asked for
+    // and its scope is not needed. What GitHub proved by finishing this
+    // exchange is that the person holds account `user.id`, and nothing about
+    // any mailbox — the email connection proves that itself, with a code, when
+    // somebody signs in that way. Sending the addresses on would only invite
+    // the far side to resolve by them again, which is the takeover this flow
+    // was carrying.
     let outcome = home
         .sso
         .login(SsoLogin {
             connection: connection.slug,
             external_id: user.id.to_string(),
             external_login: user.login,
-            verified_emails: verified,
             attributes,
         })
         .await;
@@ -3372,20 +3363,26 @@ mod tests {
     }
 
     /// The happy path, end to end through the real router: the button leads to
-    /// GitHub, the callback links by verified email to the operator-made user,
-    /// records the snapshot, re-syncs the mapped entitlement, sets the session
-    /// cookie exactly as the code form does, and lands on `next`.
+    /// GitHub, the callback finds the operator-made user by the GitHub account
+    /// bound to it, records the snapshot, re-syncs the mapped entitlement, sets
+    /// the session cookie exactly as the code form does, and lands on `next`.
     #[tokio::test]
-    async fn a_github_login_links_by_verified_email_and_lands_signed_in() {
+    async fn a_github_login_reaches_its_linked_user_and_lands_signed_in() {
         let (home, github, db) = sso_home();
         connect_for_login(&home).await;
         github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
-        github.user_emails_in_pages(&[&[("octocat@acme.example", true, true)]]);
         github.user_belongs_to_orgs(&["acme-corp"]);
         github.user_belongs_to_teams(&[("acme-corp", "authors")]);
         let users = crate::auth::UserRepository::new(db.clone());
-        let alice = users
-            .create(&"alice".parse().unwrap(), Some("octocat@acme.example"))
+        let alice = users.create(&"alice".parse().unwrap(), None).await.unwrap();
+        crate::auth::IdentityRepository::new(db.clone())
+            .record(
+                &alice.id,
+                "spaceport-for-acme",
+                "1001",
+                "octocat",
+                &Default::default(),
+            )
             .await
             .unwrap();
         // A rule matched through the *bare* team spelling, which is the spec's
@@ -3417,7 +3414,7 @@ mod tests {
         for attribute in ["Secure", "HttpOnly", "SameSite=Lax", "Path=/", "Max-Age="] {
             assert!(cookie.contains(attribute), "{cookie}");
         }
-        // No second user was made: the verified email linked to alice, whose
+        // No second user was made: the bound account named alice, whose
         // snapshot now carries the login, the org, and the team both ways.
         assert_eq!(users.list(None).await.unwrap().len(), 1);
         let identities = crate::auth::IdentityRepository::new(db.clone());
@@ -3449,15 +3446,19 @@ mod tests {
         );
     }
 
-    /// An unverified email is a string anybody can type into their GitHub
-    /// settings, so it links nothing: the login makes a fresh `github:` user
-    /// instead of handing over the account the address spells.
+    /// Through the router, the rule that replaced email linking: an address
+    /// GitHub asserts as *verified* — the strongest thing it can say about a
+    /// mailbox — still reaches nobody. The login makes a fresh `github:` user
+    /// rather than handing over the account recorded under that address, and
+    /// the address is not copied onto the new record either, because the
+    /// mailbox is the email connection's credential and this login proved
+    /// nothing about it.
     #[tokio::test]
-    async fn an_unverified_email_creates_a_user_rather_than_linking() {
+    async fn a_verified_email_creates_a_user_rather_than_linking() {
         let (home, github, db) = sso_home();
         connect_for_login(&home).await;
         github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
-        github.user_emails_in_pages(&[&[("octocat@acme.example", false, true)]]);
+        github.user_emails_in_pages(&[&[("octocat@acme.example", true, true)]]);
         let users = crate::auth::UserRepository::new(db.clone());
         let alice = users
             .create(&"alice".parse().unwrap(), Some("octocat@acme.example"))
@@ -3484,9 +3485,26 @@ mod tests {
         assert_eq!(listed.len(), 2);
         let minted = listed.iter().find(|user| user.id != alice.id).unwrap();
         assert_eq!(minted.slug.as_str(), "github:octocat");
-        // The unverified address was not stored either: a record that carried
-        // it would link the next email flow through a string nobody checked.
+        // The address was not stored either: a record carrying it would hand
+        // this account a way in through the email connection that spaceport
+        // never verified and GitHub cannot revoke.
         assert_eq!(minted.email, None);
+        // Alice keeps hers, unlinked and untouched.
+        assert_eq!(
+            listed.iter().find(|user| user.id == alice.id).unwrap().email,
+            Some("octocat@acme.example".to_owned())
+        );
+        // And the callback never even asked: `/user/emails` is off the login
+        // path, so the scope it needs is not one this flow requires.
+        let asked: Vec<String> = github
+            .requests()
+            .into_iter()
+            .map(|request| request.path)
+            .collect();
+        assert!(
+            !asked.iter().any(|path| path.contains("/user/emails")),
+            "{asked:?}"
+        );
     }
 
     /// The returning-identity rule through the router: a recorded identity
@@ -3496,7 +3514,6 @@ mod tests {
         let (home, github, db) = sso_home();
         connect_for_login(&home).await;
         github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
-        github.user_emails_in_pages(&[&[("octocat@acme.example", true, true)]]);
         let users = crate::auth::UserRepository::new(db.clone());
         let carol = users.create(&"carol".parse().unwrap(), None).await.unwrap();
         crate::auth::IdentityRepository::new(db.clone())
@@ -3539,10 +3556,16 @@ mod tests {
         let (home, github, db) = sso_home();
         connect_for_login(&home).await;
         github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
-        github.user_emails_in_pages(&[&[("octocat@acme.example", true, true)]]);
         let users = crate::auth::UserRepository::new(db.clone());
-        users
-            .create(&"alice".parse().unwrap(), Some("octocat@acme.example"))
+        let alice = users.create(&"alice".parse().unwrap(), None).await.unwrap();
+        crate::auth::IdentityRepository::new(db.clone())
+            .record(
+                &alice.id,
+                "spaceport-for-acme",
+                "1001",
+                "octocat",
+                &Default::default(),
+            )
             .await
             .unwrap();
         users
@@ -3580,7 +3603,6 @@ mod tests {
         let (home, github, db) = sso_home();
         connect_for_login(&home).await;
         github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
-        github.user_emails_in_pages(&[&[("octocat@acme.example", true, true)]]);
         github.user_belongs_to_orgs(&["acme-corp"]);
         // A rule that exists and does not match: an empty table would refuse
         // this login for the wrong reason.
@@ -3682,7 +3704,6 @@ mod tests {
         let (home, github, db) = sso_home();
         connect_for_login(&home).await;
         github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
-        github.user_emails_in_pages(&[&[("octocat@acme.example", true, true)]]);
         github.user_belongs_to_orgs(&["acme-corp"]);
         crate::auth::MappingRepository::new(db.clone())
             .add(
@@ -3721,7 +3742,6 @@ mod tests {
         // Thrown out of the organisation, GitHub answers the next login bare.
         github.user_belongs_to_orgs(&[]);
         github.signs_in("another-code", "ghu_a-user-token", 1001, "octocat");
-        github.user_emails_in_pages(&[&[("octocat@acme.example", true, true)]]);
         let state = started(home.clone(), "/auth/github/spaceport-for-acme").await;
         callback_with(home.clone(), &format!("code=another-code&state={state}")).await;
 
