@@ -374,10 +374,15 @@ impl BuildRepository {
     /// refused, a manifest that would not parse, an engine that said no. The
     /// log is what they read second, and is truncated to the tail because the
     /// end of a build is where the failure is.
+    ///
+    /// Both are cut on the way in, and the reason needs it every bit as much as
+    /// the log: it is an error chain carrying whatever the engine printed into
+    /// the failure, and on this path the log column is empty, so a build that
+    /// fails with a single enormous line puts all of it here.
     pub async fn failed(&self, app: &AppId, revision: &str, reason: &str, log: &str) -> Result<()> {
         let app = app.to_string();
         let revision = revision.to_owned();
-        let reason = reason.to_owned();
+        let reason = head(reason);
         let log = tail(log);
         let finished_at = crate::state::now();
 
@@ -1420,6 +1425,43 @@ auth:
         assert!(log.len() <= LOG_LIMIT + LOG_ELISION.len(), "{}", log.len());
         assert!(log.starts_with(LOG_ELISION), "{}", &log[..40]);
         assert!(log.ends_with("the last line\n"));
+    }
+
+    /// The reason needs the same cut the log gets, and needs it more: a build
+    /// that fails on one enormous line leaves the log column empty and puts the
+    /// whole of it in the reason, where nothing else would stop it.
+    #[tokio::test]
+    async fn a_long_failure_reason_is_cut_down_to_its_head() {
+        let repository = repository();
+        repository.request(&build("site", "abc")).await.unwrap();
+        let chatty = format!(
+            "the engine refused\n{}",
+            "context\n".repeat(REASON_LIMIT / 4)
+        );
+
+        repository
+            .failed(&app("site"), "abc", &chatty, "")
+            .await
+            .unwrap();
+
+        let reason = repository
+            .get(&app("site"), "abc")
+            .await
+            .unwrap()
+            .unwrap()
+            .reason
+            .unwrap();
+        assert!(
+            reason.len() <= REASON_LIMIT + REASON_ELISION.len(),
+            "{}",
+            reason.len()
+        );
+        assert!(
+            reason.starts_with("the engine refused\n"),
+            "{}",
+            &reason[..40]
+        );
+        assert!(reason.ends_with(REASON_ELISION));
     }
 
     /// A log that came back empty is no log, which is a different answer from

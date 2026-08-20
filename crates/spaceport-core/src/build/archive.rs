@@ -182,13 +182,22 @@ impl Archives for Downloads {
 /// between a `Location` header and an outbound request, and it deserves tests
 /// that do not depend on anything being reachable.
 fn permitted(url: &str) -> Result<Uri> {
-    let uri: Uri = url.parse().with_context(|| {
-        format!("github gave `{url}` as the archive's location, which is not a url")
-    })?;
+    // None of these say what the url was, and the omission is the point. The
+    // location github gives carries a download token in its query string — it
+    // *is* the credential, which is why [`Archives::fetch`] sends no
+    // `Authorization` beside it. A refusal here becomes the `reason` column of
+    // a failed build, a `warn!` field, and a line in `spaceport stream`, so a
+    // message that quoted the url would write a live credential to all three
+    // and leave it there. What a reader needs is which rule was broken and, at
+    // most, the part of the url that broke it.
+    let uri: Uri = url
+        .parse()
+        .context("github gave an archive location that is not a url")?;
 
     if uri.scheme_str() != Some("https") {
+        let scheme = uri.scheme_str().unwrap_or("no scheme at all");
         bail!(
-            "the archive's location `{url}` is not https, and spaceport will not download over a connection anybody on the path may rewrite"
+            "the archive's location is not https but {scheme}, and spaceport will not download over a connection anybody on the path may rewrite"
         );
     }
 
@@ -198,7 +207,7 @@ fn permitted(url: &str) -> Result<Uri> {
     let host = uri.host().unwrap_or_default();
     if !host.eq_ignore_ascii_case(DOWNLOAD_HOST) {
         bail!(
-            "the archive's location `{url}` is on `{host}` rather than {DOWNLOAD_HOST}, and spaceport downloads from github's own host or from nowhere"
+            "the archive's location is on `{host}` rather than {DOWNLOAD_HOST}, and spaceport downloads from github's own host or from nowhere"
         );
     }
 
@@ -303,6 +312,26 @@ mod tests {
     fn refuses_a_location_that_is_not_a_url_at_all() {
         assert!(permitted("not a url").is_err());
         assert!(permitted("/an-organisation/site.tar.gz").is_err());
+    }
+
+    /// A refusal here is written to `app_builds.reason`, logged as a tracing
+    /// field and published to `spaceport stream`. The location carries the
+    /// download token, so quoting it would put a live credential in all three
+    /// and leave it in the database afterwards.
+    #[test]
+    fn never_quotes_the_location_it_refuses() {
+        let token = "ABCDEFtokenGHIJKL";
+
+        for url in [
+            &format!("https://elsewhere.example/an-organisation/site.tar.gz?token={token}"),
+            &format!("http://codeload.github.com/an-organisation/site.tar.gz?token={token}"),
+            &format!("not a url?token={token}"),
+        ] {
+            let error = format!("{:#}", permitted(url).unwrap_err());
+
+            assert!(!error.contains(token), "{error}");
+            assert!(!error.contains("token="), "{error}");
+        }
     }
 
     #[test]
