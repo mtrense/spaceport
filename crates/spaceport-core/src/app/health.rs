@@ -23,6 +23,21 @@ use std::time::{Duration, Instant};
 /// engine publishes ports, not of the app.
 const SETTLE: Duration = Duration::from_millis(100);
 
+/// The longest a readiness wait may run, however patient the probe asks it to
+/// be.
+///
+/// A backstop against the manifest rather than a tuning knob. `interval: 3600s`
+/// with `failure_threshold: 3600` is a legal probe worth about a hundred and
+/// fifty days of waiting, and the cost of that is not paid by the app that
+/// wrote it: [`wait_until_ready`] is awaited holding the app's working lock,
+/// and the automatic deployer walks armed apps one at a time and awaits each,
+/// so one app can keep every other app on the host from deploying at all.
+///
+/// Half an hour is longer than any honest readiness check — an app that has not
+/// answered a single probe in that time is not warming up — and short enough
+/// that the operator finds out on the same day they applied.
+const MAX_READINESS_WAIT: Duration = Duration::from_secs(30 * 60);
+
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use http::{Request, StatusCode};
@@ -40,15 +55,27 @@ use super::manifest::{Check, Probe};
 /// Returns as soon as it does. Gives up once `failure_threshold` checks in a
 /// row have failed, and says what the last failure was — that message is the
 /// only thing the operator will have to go on.
+///
+/// Gives up on the clock as well, and has to. The two streaks are *consecutive*
+/// counts and each resets the other, so an app that fails, passes, fails,
+/// passes keeps both of them at one for ever — and this function is awaited
+/// holding the app's working lock, which makes "for ever" the supervisor
+/// ignoring that app and the automatic deployer never reaching the next one.
+/// Alternating is not an exotic failure either: it is what a container that
+/// crashes and is restarted by its engine does, and what an app under a load it
+/// half survives does. [`budget`] is what the probe's own numbers say the wait
+/// is worth; passing it means the app is not becoming ready, it is oscillating.
 pub async fn wait_until_ready(addr: SocketAddr, host: &str, readiness: &Probe) -> Result<()> {
     if readiness.kind == Check::None {
         return Ok(());
     }
 
     let started = Instant::now();
+    let budget = budget(readiness);
     sleep(readiness.initial_delay).await;
 
     let (mut passed, mut failed) = (0, 0);
+    let mut last = anyhow!("no check had finished yet");
     loop {
         match check(addr, host, readiness).await {
             Ok(()) => {
@@ -70,11 +97,47 @@ pub async fn wait_until_ready(addr: SocketAddr, host: &str, readiness: &Probe) -
                         started.elapsed(),
                     );
                 }
+                last = error;
             }
+        }
+
+        // Checked here rather than around the whole loop, so that the refusal
+        // can still say what the app last did wrong. A `timeout` wrapping this
+        // would drop that on the floor, and it is the only thing the operator
+        // gets to go on.
+        if started.elapsed() >= budget {
+            bail!(
+                "the app never held a {} check long enough to be ready, and was still flapping after {:.0?}: {last:#}",
+                readiness.kind.as_str(),
+                started.elapsed(),
+            );
         }
 
         sleep(readiness.interval).await;
     }
+}
+
+/// How long [`wait_until_ready`] will wait on a probe before calling it a day.
+///
+/// Derived from the probe rather than fixed, so that a slow app is still given
+/// exactly the patience its manifest asked for: `initial_delay`, plus every
+/// check the failure threshold entitles it to, each costing a whole `timeout`
+/// and the `interval` after it. A wait that runs longer than this has not been
+/// waiting for an app to start — a run of plain failures would have hit
+/// `failure_threshold` and stopped by now, so the only way to still be here is
+/// a pass in between resetting the count.
+///
+/// Saturating throughout, and capped by [`MAX_READINESS_WAIT`], because these
+/// are manifest numbers: `failure_threshold` is a `u32` an operator types, and
+/// multiplying an hour by four billion of them is not an arithmetic this wants
+/// to be exact about.
+fn budget(readiness: &Probe) -> Duration {
+    let per_check = readiness.timeout.saturating_add(readiness.interval);
+
+    readiness
+        .initial_delay
+        .saturating_add(per_check.saturating_mul(readiness.failure_threshold))
+        .min(MAX_READINESS_WAIT)
 }
 
 /// Watch the app at `addr` until it stops working, and say what went wrong.
@@ -404,6 +467,107 @@ mod tests {
             path: Some("/healthz".to_owned()),
             ..quick(Check::Http)
         }
+    }
+
+    /// An app that never answers twice the same way — a container crash-looping
+    /// under its engine's restart policy, seen from out here.
+    async fn alternating_http() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(AtomicU32::new(0));
+
+        let router = Router::new().route(
+            "/healthz",
+            get(move || {
+                let seen = seen.clone();
+                async move {
+                    if seen.fetch_add(1, Ordering::SeqCst).is_multiple_of(2) {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        addr
+    }
+
+    /// The wait that used to have no end. Neither streak ever reaches its
+    /// threshold, because each reset the other — and this is awaited holding
+    /// the app's working lock, so "no end" was the supervisor losing the app
+    /// and the automatic deployer losing every app behind it.
+    #[tokio::test]
+    async fn gives_up_on_an_app_that_flaps_for_ever() {
+        let addr = alternating_http().await;
+        let readiness = Probe {
+            // Never two passes in a row from a server that alternates, so the
+            // only way out is the clock.
+            success_threshold: 2,
+            failure_threshold: 5,
+            timeout: Duration::from_millis(50),
+            ..http_readiness()
+        };
+
+        let started = Instant::now();
+        let err = wait_until_ready(addr, "alpha.test", &readiness)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("still flapping"), "{err}");
+        // It gave up on the budget, not on a streak, and did it near the
+        // budget rather than an iteration or two either side of forever.
+        assert!(
+            started.elapsed() < budget(&readiness) * 3,
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The budget is the probe's own patience, not a number this module picked
+    /// — a manifest that asks to wait longer is waited on longer.
+    #[test]
+    fn the_budget_is_what_the_probe_asked_for() {
+        let readiness = Probe {
+            initial_delay: Duration::from_secs(5),
+            interval: Duration::from_secs(2),
+            timeout: Duration::from_secs(1),
+            failure_threshold: 10,
+            ..quick(Check::Tcp)
+        };
+
+        assert_eq!(budget(&readiness), Duration::from_secs(5 + 10 * 3));
+    }
+
+    /// Until it asks for something no apply can afford. A legal manifest can
+    /// spell a hundred and fifty days, and the app that wrote it is not the one
+    /// that pays for the wait.
+    #[test]
+    fn an_absurd_probe_is_capped_rather_than_honoured() {
+        let readiness = Probe {
+            interval: Duration::from_secs(3600),
+            failure_threshold: 3600,
+            ..quick(Check::Tcp)
+        };
+
+        assert_eq!(budget(&readiness), MAX_READINESS_WAIT);
+    }
+
+    /// Saturating rather than panicking or wrapping: these are numbers an
+    /// operator types, and `u32::MAX` of them is a manifest, not an attack.
+    #[test]
+    fn the_widest_probe_a_manifest_can_spell_still_has_a_budget() {
+        let readiness = Probe {
+            initial_delay: Duration::MAX,
+            interval: Duration::MAX,
+            timeout: Duration::MAX,
+            failure_threshold: u32::MAX,
+            ..quick(Check::Tcp)
+        };
+
+        assert_eq!(budget(&readiness), MAX_READINESS_WAIT);
     }
 
     #[tokio::test]
