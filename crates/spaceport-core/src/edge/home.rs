@@ -150,6 +150,28 @@ const LOGIN_STATE_LIFETIME: Duration = Duration::minutes(10);
 /// the number is only ever reached by a spaceport under attack.
 const MAX_PENDING_LOGINS: usize = 4096;
 
+/// How many unfinished logins one client address may hold at once.
+///
+/// The number that makes [`MAX_PENDING_LOGINS`] safe to have. A ceiling on the
+/// map alone says nothing about *who* filled it, and a map filled by one
+/// address is the whole lockout: four thousand requests from a single client —
+/// an `<img src>` on any page will do, since this is a `GET` — and every other
+/// user is refused for as long as the burst takes to expire.
+///
+/// Charging the map per address is [`MAX_THROTTLED_CLIENTS`]' argument reached
+/// from the other end. That map could evict, because it is keyed by address and
+/// so an eviction only ever spends the evicting client's own budget. This one
+/// is keyed by an opaque state, so eviction has no idea whose entry it is
+/// taking — and the entries it would take first are the *oldest*, which are
+/// precisely the real logins sitting on GitHub's consent screen. So the quota
+/// goes at the front instead: a flood now fills its own eight slots and stops,
+/// and the four thousand behind them stay free for everybody else.
+///
+/// Eight rather than one, because a person with three tabs open, a stale button
+/// they clicked twice and a bounce that never came back is holding several
+/// perfectly honest entries, and none of them is worth a refusal.
+const MAX_PENDING_LOGINS_PER_CLIENT: usize = 8;
+
 /// One login in flight: which connection it went out through, and where the
 /// finished login should land.
 #[derive(Debug, Clone)]
@@ -159,6 +181,10 @@ struct LoginAttempt {
     /// comes back out is a path this host serves and nothing else.
     next: String,
     created_at: OffsetDateTime,
+    /// Who asked for it, so the map can be charged per address rather than in
+    /// one pool anybody may drain. Never read back out into a login — it exists
+    /// for [`MAX_PENDING_LOGINS_PER_CLIENT`] and for the eviction that backs it.
+    client: IpAddr,
 }
 
 /// The SSO logins this spaceport has issued a state for and not yet finished.
@@ -185,17 +211,27 @@ impl LoginAttempts {
         Self::default()
     }
 
-    /// Remember that a login left through `connection` aiming at `next`, and
-    /// hand back the state that names it — or `None` when this spaceport is
-    /// already holding [`MAX_PENDING_LOGINS`] of them.
+    /// Remember that a login left `client` through `connection` aiming at
+    /// `next`, and hand back the state that names it — or `None` when `client`
+    /// is already holding [`MAX_PENDING_LOGINS_PER_CLIENT`] of them.
     ///
-    /// Full means refuse, not evict: the alternative is that whoever fills the
-    /// map decides which of the logins already in flight stops working, and a
-    /// user thrown out mid-sign-in for somebody else's traffic is a worse
-    /// answer than a page telling them to try again. Both are a denial; only
-    /// one of them breaks a promise this spaceport already made.
+    /// A refusal is only ever a client's own doing. That is the point of the
+    /// per-address quota: the previous rule refused on the *map* being full, so
+    /// four thousand requests from one address bought a ten-minute lockout of
+    /// every other user on the spaceport. Now a flood exhausts its own eight
+    /// slots and every address that has not spent theirs is as welcome as it
+    /// ever was — the same shape [`LoginThrottle::permits`] settled on, and for
+    /// the same reason.
+    ///
+    /// The map's own ceiling still stands behind the quota, because five
+    /// hundred addresses could reach it honestly enough. Reaching it takes an
+    /// eviction rather than a refusal, and the one evicted is the oldest entry
+    /// belonging to whichever address is holding the most — so the eviction
+    /// lands on the biggest contributor to the problem, and a user holding a
+    /// single login is untouchable while anybody is holding two.
     fn begin(
         &self,
+        client: IpAddr,
         connection: String,
         next: String,
         now: OffsetDateTime,
@@ -209,8 +245,12 @@ impl LoginAttempts {
 
         sweep(&mut pending, now);
 
-        if pending.len() >= MAX_PENDING_LOGINS {
+        if held_by(&pending, client) >= MAX_PENDING_LOGINS_PER_CLIENT {
             return Ok(None);
+        }
+
+        if pending.len() >= MAX_PENDING_LOGINS {
+            evict_from_the_greediest(&mut pending);
         }
 
         pending.insert(
@@ -219,6 +259,7 @@ impl LoginAttempts {
                 connection,
                 next,
                 created_at: now,
+                client,
             },
         );
 
@@ -248,6 +289,59 @@ impl LoginAttempts {
 /// a real login is never queued behind an arbitrarily long one.
 fn sweep(pending: &mut HashMap<String, LoginAttempt>, now: OffsetDateTime) {
     pending.retain(|_, attempt| now - attempt.created_at < LOGIN_STATE_LIFETIME);
+}
+
+/// How many unfinished logins `client` is holding.
+///
+/// A scan rather than a second map keyed by address. The map is bounded by
+/// [`MAX_PENDING_LOGINS`], so this costs a constant under a lock that is only
+/// ever held across arithmetic — and a second map would have to be kept
+/// truthful by both the sweep and every `take`, which is two more places for
+/// the two to disagree about what is in flight.
+fn held_by(pending: &HashMap<String, LoginAttempt>, client: IpAddr) -> usize {
+    pending
+        .values()
+        .filter(|attempt| attempt.client == client)
+        .count()
+}
+
+/// Make room by dropping the oldest login belonging to whichever address holds
+/// the most of them.
+///
+/// Only ever called on a map the sweep has already been over, so every entry in
+/// it is still live and one of them has to go. Which one is the whole question:
+/// the oldest entry outright would be a real login sitting on GitHub's consent
+/// screen, which is the entry likeliest to be honest and likeliest to be spent
+/// within the second. The address holding the most is the one whose next entry
+/// nobody will miss, and inside it the oldest is the one with the least of its
+/// ten minutes left to be worth anything.
+///
+/// A tie goes to whoever the iteration reaches first, deliberately: at the
+/// point where several addresses are tied for the most entries in a full map,
+/// there is nothing left to choose between them that is worth an allocation.
+fn evict_from_the_greediest(pending: &mut HashMap<String, LoginAttempt>) {
+    let mut counts: HashMap<IpAddr, usize> = HashMap::new();
+    for attempt in pending.values() {
+        *counts.entry(attempt.client).or_default() += 1;
+    }
+
+    let Some(greediest) = counts
+        .into_iter()
+        .max_by_key(|(_, held)| *held)
+        .map(|(client, _)| client)
+    else {
+        return;
+    };
+
+    let oldest = pending
+        .iter()
+        .filter(|(_, attempt)| attempt.client == greediest)
+        .min_by_key(|(_, attempt)| attempt.created_at)
+        .map(|(state, _)| state.clone());
+
+    if let Some(oldest) = oldest {
+        pending.remove(&oldest);
+    }
 }
 
 /// How long a failed redemption is held against whoever sent it.
@@ -975,6 +1069,7 @@ async fn jwks(State(home): State<Arc<Home>>) -> Response {
 /// saw a page.
 async fn github_start(
     State(home): State<Arc<Home>>,
+    conn: Option<Extension<ConnInfo>>,
     Path(slug): Path<String>,
     Query(query): Query<LoginQuery>,
 ) -> Response {
@@ -1007,21 +1102,27 @@ async fn github_start(
     };
 
     let state = match home.logins.begin(
+        client_of(conn.as_deref()),
         connection.slug.clone(),
         safe_next(query.next.as_deref()).to_owned(),
         OffsetDateTime::now_utc(),
     ) {
         Ok(Some(state)) => state,
         Ok(None) => {
-            warn!(
-                limit = MAX_PENDING_LOGINS,
-                "a login start was refused because too many logins are already in flight"
+            // `debug!`, not `warn!`: this is an unauthenticated route, so a
+            // refusal is a line anybody may ask spaceport to write, and the
+            // event ring holds a few hundred. A stranger who can fill it
+            // decides what an operator is still able to see, which is the same
+            // argument the throttle's own refusal makes.
+            debug!(
+                limit = MAX_PENDING_LOGINS_PER_CLIENT,
+                "a login start was refused because this client has too many in flight"
             );
 
             return problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Too many sign-ins are in flight",
-                "This spaceport is holding as many unfinished sign-ins as it will. Nothing was started. Try again in a few minutes.",
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many sign-ins are already in flight",
+                "This spaceport is holding as many unfinished sign-ins for you as it will. Nothing was started. Finish one, or wait a few minutes and try again.",
             );
         }
         Err(error) => {
@@ -3634,44 +3735,134 @@ mod tests {
         assert_eq!(held[0].mapped_rule, None);
     }
 
-    /// One login remembered, with an explicit clock the tests can move.
-    fn begin_at(logins: &LoginAttempts, now: OffsetDateTime) -> Option<String> {
+    /// One login remembered from one address, with an explicit clock the tests
+    /// can move.
+    fn begin_from(logins: &LoginAttempts, client: IpAddr, now: OffsetDateTime) -> Option<String> {
         logins
-            .begin("spaceport-for-acme".to_owned(), "/".to_owned(), now)
+            .begin(client, "spaceport-for-acme".to_owned(), "/".to_owned(), now)
             .unwrap()
     }
+
+    /// A burst from `count` distinct addresses, each spending its whole quota —
+    /// the cheapest way for a test to fill the map legitimately.
+    ///
+    /// Never [`STRANGER`], so that a test can hold a login of its own and know
+    /// the flood is somebody else's traffic rather than more of its own. The
+    /// quota is per address, so a burst that included the caller's would be
+    /// entitled to evict the caller's login and the test would be asserting
+    /// nothing.
+    fn flood(logins: &LoginAttempts, count: u32, now: OffsetDateTime) {
+        for index in 0..count {
+            for _ in 0..MAX_PENDING_LOGINS_PER_CLIENT {
+                begin_from(logins, client(index + 1), now);
+            }
+        }
+    }
+
+    /// The address a test signs in from when the flood is meant to be other
+    /// people. Outside every range [`flood`] uses.
+    const STRANGER: u32 = 0;
 
     fn held(logins: &LoginAttempts) -> usize {
         logins.pending.lock().unwrap().len()
     }
 
-    /// The bound, which is the whole point: an unauthenticated route may be
-    /// walked as often as somebody likes and the map still stops growing.
+    /// The quota, which is the whole point: an unauthenticated `GET` may be
+    /// walked as often as somebody likes and what they fill is their own eight
+    /// slots.
     #[test]
-    fn a_full_map_refuses_rather_than_grows() {
+    fn one_address_may_only_hold_its_own_quota() {
         let logins = LoginAttempts::new();
         let now = OffsetDateTime::now_utc();
-        for _ in 0..MAX_PENDING_LOGINS {
-            assert!(begin_at(&logins, now).is_some());
+        for _ in 0..MAX_PENDING_LOGINS_PER_CLIENT {
+            assert!(begin_from(&logins, client(1), now).is_some());
         }
 
-        assert!(begin_at(&logins, now).is_none());
+        assert!(begin_from(&logins, client(1), now).is_none());
+        assert_eq!(held(&logins), MAX_PENDING_LOGINS_PER_CLIENT);
+    }
+
+    /// The lockout this quota exists to remove. One address hammering the route
+    /// used to fill the map and refuse everybody; now it fills its eight and
+    /// the next user signs in as if nothing were happening.
+    #[test]
+    fn a_flood_from_one_address_locks_nobody_else_out() {
+        let logins = LoginAttempts::new();
+        let now = OffsetDateTime::now_utc();
+        for _ in 0..MAX_PENDING_LOGINS * 2 {
+            begin_from(&logins, client(1), now);
+        }
+
+        assert_eq!(held(&logins), MAX_PENDING_LOGINS_PER_CLIENT);
+        assert!(begin_from(&logins, client(2), now).is_some());
+    }
+
+    /// A login already in flight when the flood arrives still finishes — the
+    /// promise the old refuse-when-full rule was protecting, kept by the quota
+    /// instead and without the lockout that came with it.
+    #[test]
+    fn a_flood_does_not_spend_a_login_already_in_flight() {
+        let logins = LoginAttempts::new();
+        let now = OffsetDateTime::now_utc();
+        let mine = begin_from(&logins, client(STRANGER), now).unwrap();
+
+        // Enough distinct addresses to fill the map several times over, so the
+        // eviction path runs and runs.
+        flood(
+            &logins,
+            (MAX_PENDING_LOGINS * 2 / MAX_PENDING_LOGINS_PER_CLIENT) as u32,
+            now,
+        );
+
+        assert!(logins.take(&mine, now).is_some());
+    }
+
+    /// The map's own ceiling still stands behind the quota, for the five
+    /// hundred addresses that could reach it honestly.
+    #[test]
+    fn the_map_stops_growing_however_many_addresses_arrive() {
+        let logins = LoginAttempts::new();
+        let now = OffsetDateTime::now_utc();
+
+        flood(
+            &logins,
+            (MAX_PENDING_LOGINS * 2 / MAX_PENDING_LOGINS_PER_CLIENT) as u32,
+            now,
+        );
+
         assert_eq!(held(&logins), MAX_PENDING_LOGINS);
     }
 
-    /// Refusing rather than evicting, seen from the other side: a login already
-    /// in flight when the flood arrives still finishes.
+    /// Which entry an eviction takes. A user holding one login is untouchable
+    /// while anybody is holding more than one, so filling the map costs the
+    /// address that filled it and nobody else.
     #[test]
-    fn filling_the_map_does_not_spend_a_login_already_in_flight() {
-        let logins = LoginAttempts::new();
+    fn an_eviction_lands_on_the_address_holding_the_most() {
+        let mut pending = HashMap::new();
         let now = OffsetDateTime::now_utc();
-        let mine = begin_at(&logins, now).unwrap();
+        let mut remember = |state: &str, client: IpAddr, age: i64| {
+            pending.insert(
+                state.to_owned(),
+                LoginAttempt {
+                    connection: "spaceport-for-acme".to_owned(),
+                    next: "/".to_owned(),
+                    created_at: now - Duration::seconds(age),
+                    client,
+                },
+            );
+        };
 
-        for _ in 0..MAX_PENDING_LOGINS * 2 {
-            begin_at(&logins, now);
-        }
+        // The quiet user's is by far the oldest, so an oldest-first eviction
+        // would take it. The greedy address holds more.
+        remember("quiet", client(1), 300);
+        remember("greedy-old", client(2), 200);
+        remember("greedy-new", client(2), 10);
 
-        assert!(logins.take(&mine, now).is_some());
+        evict_from_the_greediest(&mut pending);
+
+        assert!(pending.contains_key("quiet"));
+        assert!(pending.contains_key("greedy-new"));
+        assert!(!pending.contains_key("greedy-old"));
     }
 
     /// The sweep runs on the way in, so a spaceport nobody ever completes a
@@ -3681,14 +3872,14 @@ mod tests {
     fn beginning_a_login_sweeps_the_expired_ones() {
         let logins = LoginAttempts::new();
         let started = OffsetDateTime::now_utc();
-        for _ in 0..MAX_PENDING_LOGINS {
-            begin_at(&logins, started);
+        for _ in 0..MAX_PENDING_LOGINS_PER_CLIENT {
+            begin_from(&logins, client(1), started);
         }
-        assert!(begin_at(&logins, started).is_none());
+        assert!(begin_from(&logins, client(1), started).is_none());
 
         let later = started + LOGIN_STATE_LIFETIME + Duration::seconds(1);
 
-        assert!(begin_at(&logins, later).is_some());
+        assert!(begin_from(&logins, client(1), later).is_some());
         // Every one of the burst's entries went, and only the fresh one is
         // left — no callback traffic involved.
         assert_eq!(held(&logins), 1);
@@ -3841,20 +4032,40 @@ mod tests {
         assert_eq!(attempt.next, "/");
     }
 
-    /// A refused start is a sentence and a 503, not a bounce to GitHub for a
-    /// state this spaceport did not keep.
+    /// A client past its own quota gets a sentence and a 429, not a bounce to
+    /// GitHub for a state this spaceport did not keep.
+    ///
+    /// A request that never crossed a socket is charged to the unspecified
+    /// address, so that is the quota this test has to spend.
     #[tokio::test]
-    async fn starting_a_login_at_capacity_is_refused() {
+    async fn starting_a_login_past_the_clients_quota_is_refused() {
         let (home, _, _) = sso_home();
         connect_for_login(&home).await;
         let now = OffsetDateTime::now_utc();
-        for _ in 0..MAX_PENDING_LOGINS {
-            begin_at(&home.logins, now);
+        for _ in 0..MAX_PENDING_LOGINS_PER_CLIENT {
+            begin_from(&home.logins, client_of(None), now);
         }
 
         let (status, body) = get_path(home, "/auth/github/spaceport-for-acme").await;
 
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert!(body.contains("Nothing was started"), "{body}");
+    }
+
+    /// The other half of that, and the reason the quota is per address: a
+    /// stranger who has spent theirs has not spent anybody else's, so the route
+    /// still answers a user the flood never touched.
+    #[tokio::test]
+    async fn a_client_past_its_quota_does_not_refuse_the_next_one() {
+        let (home, _, _) = sso_home();
+        connect_for_login(&home).await;
+        let now = OffsetDateTime::now_utc();
+        for _ in 0..MAX_PENDING_LOGINS * 2 {
+            begin_from(&home.logins, client(1), now);
+        }
+
+        let (status, _) = get_path(home, "/auth/github/spaceport-for-acme").await;
+
+        assert_eq!(status, StatusCode::SEE_OTHER);
     }
 }
