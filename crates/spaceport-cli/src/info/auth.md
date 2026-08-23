@@ -163,6 +163,19 @@ The full key is shown once, at mint. Only its prefix and last four characters ca
 
 App-to-app calls are this and nothing else for now: first-class service identities are a later iteration, so an app calling another hosted app uses an API key minted for a technical user.
 
+### Writing the client
+
+What the caller has to get right, and what it gets back when it does not. None of this reaches the app — the gate answers it all — but a client that guesses at it fails in ways its author cannot see from the app's logs.
+
+- **The header is `Authorization: Bearer spk_…`, and only that.** The scheme is read case-insensitively, the token is trimmed, and the `spk_` prefix is what engages the key path at all. Any other scheme, or a bearer token that is not spaceport's, is not spaceport's to judge: it falls through to the cookie path, where the rewrite strips it, and the caller is treated as signed out. Send exactly one `Authorization` header — a request carrying several is malformed, and only the first is read rather than searched through for one that pleases us.
+- **A key that is not accepted is `401` with `WWW-Authenticate: Bearer`**, whatever the request looked like: a machine is calling, so there is no redirect and no sign-in page, navigation-shaped or not. The same `401` covers a key that never existed, one that has expired, one whose owner is suspended or dropped, and one minted for a *different* app — deliberately indistinguishable, because telling a caller which of those it is tells an outsider what exists. Nothing is written to the auth event log for a refusal either, so there is no server-side trace to debug a wrong key against; check the mint and its expiry.
+- **`401` is the only status that means "the credential is wrong".** `500` is spaceport failing to check the key — a database hiccup, a signing key it could not load — and `503` is a spaceport with no `edge.hostname` configured, which no key can fix. A client that retries should retry those two and not the `401`.
+- **There is no `403` on this path.** A key grants exactly its role, without intersecting the deployed manifest, so a key naming a role the app never declared still authenticates and still reaches the app — carrying a role that authorises nothing. Whatever the app answers to that is the app's own contract; the mint warned the operator when it happened.
+- **The `401` on this path carries no `X-Spaceport-Login`.** That header belongs to the signed-out browser contract above. There is nothing for a machine to navigate to: keys are minted by an operator, never by a round trip.
+- **Public prefixes are checked before the key is read.** A path under `auth.public_path_prefixes` is served to anyone, key or no key, and the app gets no token for it — so a client that only ever calls a public path is not authenticated at all, however good its key. On an app with `gating: open` the `Bearer spk_…` header is passed through to the app untouched, which is worth knowing before pointing a key at one.
+- **A WebSocket upgrade may carry the key** like any other request, and the identity is fixed at the handshake. The tunnel arms its deadline against the key's expiry, and is cut when the key is revoked or its owner suspended or dropped — so a long-lived socket dies mid-stream on revocation rather than at the next request. Reconnect logic should expect that.
+- **Nothing about the key rotates itself.** It is good until its `--expires`, and the client gets no warning as that approaches: no header, no soft failure, just `401` the morning after. Mint the replacement before the old key lapses — two live keys for one user at one app is fine — and drop the old one once the client has moved.
+
 ## Questions to settle with the app developer
 
 1. Which role names does the app understand, and what does each permit? (They go in the manifest and never change casually.)
