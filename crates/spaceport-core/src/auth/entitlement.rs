@@ -660,7 +660,7 @@ mod tests {
     #[tokio::test]
     async fn grants_and_audits_an_entitlement() {
         let (users, entitlements, _) = repositories();
-        let alice = users.create(&slug("alice"), None).await.unwrap();
+        let alice = users.create(&slug("alice"), None, None).await.unwrap();
 
         let granted = entitlements
             .grant(&by_slug("alice"), &entitlement("reader@blog"))
@@ -682,7 +682,7 @@ mod tests {
     #[tokio::test]
     async fn granting_twice_is_idempotent_and_logged_once() {
         let (users, entitlements, log) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
 
         entitlements
             .grant(&by_slug("alice"), &entitlement("reader@blog"))
@@ -706,7 +706,7 @@ mod tests {
     #[tokio::test]
     async fn granting_over_a_mapped_row_says_where_it_came_from() {
         let (users, entitlements, _) = repositories();
-        let alice = users.create(&slug("alice"), None).await.unwrap();
+        let alice = users.create(&slug("alice"), None, None).await.unwrap();
         plant_mapped(&entitlements, &alice.id, "reader@blog", "rule-7").await;
 
         let again = entitlements
@@ -720,7 +720,7 @@ mod tests {
     #[tokio::test]
     async fn revokes_one_role_and_leaves_the_rest() {
         let (users, entitlements, log) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
         for granted in ["reader@blog", "writer@blog", "reader@wiki"] {
             entitlements
                 .grant(&by_slug("alice"), &entitlement(granted))
@@ -754,7 +754,7 @@ mod tests {
     #[tokio::test]
     async fn revokes_a_whole_app_at_once() {
         let (users, entitlements, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
         for granted in ["reader@blog", "writer@blog", "reader@wiki"] {
             entitlements
                 .grant(&by_slug("alice"), &entitlement(granted))
@@ -780,7 +780,7 @@ mod tests {
     #[tokio::test]
     async fn revokes_everything_with_no_scope() {
         let (users, entitlements, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
         for granted in ["reader@blog", "reader@wiki"] {
             entitlements
                 .grant(&by_slug("alice"), &entitlement(granted))
@@ -807,7 +807,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_to_revoke_a_mapped_entitlement() {
         let (users, entitlements, _) = repositories();
-        let alice = users.create(&slug("alice"), None).await.unwrap();
+        let alice = users.create(&slug("alice"), None, None).await.unwrap();
         plant_mapped(&entitlements, &alice.id, "reader@blog", "rule-7").await;
 
         let error = entitlements
@@ -832,7 +832,7 @@ mod tests {
     #[tokio::test]
     async fn a_broad_revoke_keeps_mapped_rows_and_says_so() {
         let (users, entitlements, _) = repositories();
-        let alice = users.create(&slug("alice"), None).await.unwrap();
+        let alice = users.create(&slug("alice"), None, None).await.unwrap();
         entitlements
             .grant(&by_slug("alice"), &entitlement("writer@blog"))
             .await
@@ -857,7 +857,7 @@ mod tests {
     #[tokio::test]
     async fn a_revoke_that_matches_nothing_says_so() {
         let (users, entitlements, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
 
         let error = entitlements
             .revoke(
@@ -895,8 +895,8 @@ mod tests {
     #[tokio::test]
     async fn dropping_a_user_takes_their_entitlements_with_them() {
         let (users, entitlements, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
-        users.create(&slug("bob"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
+        users.create(&slug("bob"), None, None).await.unwrap();
         entitlements
             .grant(&by_slug("alice"), &entitlement("reader@blog"))
             .await
@@ -910,7 +910,7 @@ mod tests {
 
         // Alice's slate went with her; a recreated `alice` is a different user
         // and starts with nothing.
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
         assert!(
             entitlements
                 .audit(&by_slug("alice"))
@@ -931,7 +931,7 @@ mod tests {
     #[tokio::test]
     async fn suspending_a_user_leaves_their_entitlements_alone() {
         let (users, entitlements, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
         entitlements
             .grant(&by_slug("alice"), &entitlement("reader@blog"))
             .await

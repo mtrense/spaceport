@@ -164,15 +164,28 @@ impl UserRepository {
             .collect())
     }
 
-    /// Create a user under `slug`, minting the id it keeps for life.
+    /// Create a user under `slug`, minting the id it keeps for life, and — if
+    /// `identity` is given — assert in the same breath who they are at a
+    /// connection.
     ///
     /// The id is minted out here and the uniqueness check happens in the
     /// transaction: randomness has no business inside a database lock, and the
     /// slug being free is about the table as it is at the moment of writing.
+    ///
+    /// The binding shares this commit, and that is the whole reason it is a
+    /// parameter rather than a second call the caller makes afterwards:
+    /// `auth user create alice --connect spaceport-acme:octo-alice` either
+    /// leaves alice bound or leaves nothing at all. A create that succeeded
+    /// and a bind that then refused would leave an unbound alice behind whose
+    /// slug the operator would have to drop before retyping the command they
+    /// meant. Resolving the handle to an external id is the caller's job and
+    /// happens before this — a network call has no business inside a database
+    /// lock either.
     pub async fn create(
         &self,
         slug: &UserSlug,
         email: Option<&str>,
+        identity: Option<&super::AssertedIdentity>,
     ) -> Result<UserRecord, UserError> {
         let id = UserId::generate().map_err(UserError::Failed)?;
         let created = UserRecord {
@@ -183,8 +196,10 @@ impl UserRepository {
             created_at: now(),
         };
         let record = created.clone();
+        let identity = identity.cloned();
 
-        self.db
+        let outcome = self
+            .db
             .call(move |connection| {
                 let transaction = connection
                     .transaction()
@@ -215,7 +230,22 @@ impl UserRepository {
                     }),
                 )?;
 
-                transaction.commit().context("committing a new user")
+                if let Some(identity) = &identity
+                    && let Err(refusal) = super::mapping::bind_in(
+                        &transaction,
+                        &record.created_at,
+                        &record.id,
+                        identity,
+                    )
+                {
+                    // Dropped unfinished, so the user row above goes with it:
+                    // the atomicity this parameter exists for.
+                    return Ok(Err(refusal));
+                }
+
+                transaction.commit().context("committing a new user")?;
+
+                Ok(Ok(()))
             })
             .await
             .map_err(|error| match slug_collision(&error) {
@@ -225,6 +255,7 @@ impl UserRepository {
                 )),
                 false => UserError::Failed(error),
             })?;
+        outcome.map_err(UserError::Binding)?;
 
         info!(user = %created.id, slug = %created.slug, "user created");
 
@@ -432,7 +463,7 @@ fn offboard(transaction: &Transaction<'_>, user: &UserId) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::AuthLogRepository;
+    use crate::auth::{AssertedIdentity, AuthLogRepository, IdentityError, IdentityRepository};
 
     fn repositories() -> (UserRepository, AuthLogRepository) {
         let db = Db::in_memory().unwrap();
@@ -442,6 +473,16 @@ mod tests {
 
     fn slug(slug: &str) -> UserSlug {
         slug.parse().unwrap()
+    }
+
+    /// What `--connect <connection>:<login>` becomes once the handle has been
+    /// resolved to the id the binding is keyed by.
+    fn asserted(external_id: &str) -> AssertedIdentity {
+        AssertedIdentity {
+            connection: "spaceport-acme".to_owned(),
+            external_id: external_id.to_owned(),
+            external_login: "octo-alice".to_owned(),
+        }
     }
 
     fn by_slug(name: &str) -> UserRef {
@@ -464,7 +505,7 @@ mod tests {
         let (users, _) = repositories();
 
         let created = users
-            .create(&slug("alice"), Some("alice@example.com"))
+            .create(&slug("alice"), Some("alice@example.com"), None)
             .await
             .unwrap();
 
@@ -478,7 +519,7 @@ mod tests {
     async fn lists_only_the_slugs_a_pattern_asks_for() {
         let (users, _) = repositories();
         for name in ["alice", "bob", "ci-bot"] {
-            users.create(&slug(name), None).await.unwrap();
+            users.create(&slug(name), None, None).await.unwrap();
         }
 
         let listed = users.list(Some(&pattern("ci-*"))).await.unwrap();
@@ -491,9 +532,9 @@ mod tests {
     #[tokio::test]
     async fn refuses_a_slug_a_live_user_holds() {
         let (users, log) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
 
-        let error = users.create(&slug("alice"), None).await.unwrap_err();
+        let error = users.create(&slug("alice"), None, None).await.unwrap_err();
         assert!(matches!(error, UserError::SlugTaken(_)), "{error}");
         // And the refusal changed nothing: one user, one creation logged.
         assert_eq!(users.list(None).await.unwrap().len(), 1);
@@ -503,7 +544,7 @@ mod tests {
     #[tokio::test]
     async fn suspends_and_resumes_by_slug() {
         let (users, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
 
         let suspended = users.suspend(&by_slug("alice")).await.unwrap();
         assert!(suspended.suspended);
@@ -519,7 +560,7 @@ mod tests {
     #[tokio::test]
     async fn resolves_a_user_by_id_too() {
         let (users, _) = repositories();
-        let created = users.create(&slug("alice"), None).await.unwrap();
+        let created = users.create(&slug("alice"), None, None).await.unwrap();
 
         let suspended = users
             .suspend(&UserRef::Id(created.id.clone()))
@@ -548,12 +589,12 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_slug_recreated_yields_a_fresh_id() {
         let (users, _) = repositories();
-        let first = users.create(&slug("alice"), None).await.unwrap();
+        let first = users.create(&slug("alice"), None, None).await.unwrap();
 
         users.drop_user(&by_slug("alice")).await.unwrap();
         assert!(users.list(None).await.unwrap().is_empty());
 
-        let second = users.create(&slug("alice"), None).await.unwrap();
+        let second = users.create(&slug("alice"), None, None).await.unwrap();
         assert_ne!(second.id, first.id);
     }
 
@@ -562,7 +603,7 @@ mod tests {
     #[tokio::test]
     async fn every_mutation_is_recorded_in_the_log() {
         let (users, log) = repositories();
-        let created = users.create(&slug("alice"), None).await.unwrap();
+        let created = users.create(&slug("alice"), None, None).await.unwrap();
         users.suspend(&by_slug("alice")).await.unwrap();
         users.resume(&by_slug("alice")).await.unwrap();
         users.drop_user(&by_slug("alice")).await.unwrap();
@@ -590,8 +631,8 @@ mod tests {
     #[tokio::test]
     async fn the_log_outlives_the_user_it_is_about() {
         let (users, log) = repositories();
-        let alice = users.create(&slug("alice"), None).await.unwrap();
-        let bob = users.create(&slug("bob"), None).await.unwrap();
+        let alice = users.create(&slug("alice"), None, None).await.unwrap();
+        let bob = users.create(&slug("bob"), None, None).await.unwrap();
         users.drop_user(&by_slug("alice")).await.unwrap();
 
         let hers = log.entries(Some(&alice.id)).await.unwrap();
@@ -603,5 +644,72 @@ mod tests {
         let his = log.entries(Some(&bob.id)).await.unwrap();
         assert_eq!(his.len(), 1);
         assert_eq!(his[0].kind, "user.created");
+    }
+
+    /// `auth user create --connect` in one commit: the user, the identity and
+    /// both log entries land together, so the operator never has to type the
+    /// second half of a command they already gave.
+    #[tokio::test]
+    async fn creates_a_user_with_the_identity_they_were_asserted_to_hold() {
+        let (users, log) = repositories();
+        let identities = IdentityRepository::new(users.db.clone());
+
+        let alice = users
+            .create(&slug("alice"), None, Some(&asserted("583231")))
+            .await
+            .unwrap();
+
+        let held = identities.for_user(&alice.id).await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].connection, "spaceport-acme");
+        assert_eq!(held[0].external_id, "583231");
+        assert_eq!(held[0].last_login_at, None);
+        let kinds: Vec<String> = log
+            .entries(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.kind)
+            .collect();
+        assert_eq!(kinds, ["user.created", "identity.bound"]);
+    }
+
+    /// The whole reason the binding shares the create's transaction: a
+    /// conflict must leave no half-made user behind. An alice created and then
+    /// left unbound is a slug the operator has to drop before they can retype
+    /// the command they meant.
+    #[tokio::test]
+    async fn a_create_whose_binding_conflicts_leaves_no_user_behind() {
+        let (users, log) = repositories();
+        let bob = users
+            .create(&slug("bob"), None, Some(&asserted("583231")))
+            .await
+            .unwrap();
+
+        let error = users
+            .create(&slug("alice"), None, Some(&asserted("583231")))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UserError::Binding(IdentityError::AccountBoundElsewhere(_))
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("bob"), "{error}");
+        // No alice, and no `user.created` for one either — the row and its log
+        // entry rolled back together.
+        assert_eq!(users.list(None).await.unwrap().len(), 1);
+        assert_eq!(users.list(None).await.unwrap()[0].id, bob.id);
+        let kinds: Vec<String> = log
+            .entries(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.kind)
+            .collect();
+        assert_eq!(kinds, ["user.created", "identity.bound"]);
     }
 }

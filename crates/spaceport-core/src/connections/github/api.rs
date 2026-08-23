@@ -9,7 +9,10 @@
 //! way people sign in, it also asks the questions a login turns on: who GitHub
 //! says a person is, which of their emails GitHub has verified, and which
 //! organisations and teams they belong to — each asked with a token minted
-//! from the code GitHub hands the login callback.
+//! from the code GitHub hands the login callback. One question is asked as
+//! whichever installation can see the answer — which account, if any, holds a
+//! handle an operator typed — because the endpoint that answers it is public
+//! but an enterprise may hide its members from anybody standing outside it.
 //!
 //! Every one of those goes through [`Transport`], which exists so the tests can
 //! answer in-process. That seam is the same shape as the ACME one: a trait with
@@ -129,6 +132,13 @@ const REFRESH_BEFORE: Duration = Duration::minutes(5);
 /// not enough for an HTML error page. A whole body in a log line is a denial of
 /// service on whoever has to read the log.
 const BODY_LIMIT: usize = 400;
+
+/// How long a github handle is allowed to be.
+///
+/// GitHub's own limit, written down here because [`handle`] is a gate on
+/// operator input rather than a guess at a reasonable length: a bound that was
+/// merely generous would be a bound that let something through.
+const HANDLE_LIMIT: usize = 39;
 
 /// How spaceport reaches GitHub.
 ///
@@ -843,6 +853,130 @@ impl Client {
             .collect())
     }
 
+    /// Who GitHub says holds a handle, if anybody does.
+    ///
+    /// The question an operator asserting a binding creates: an identity is
+    /// keyed by the numeric account id, and a handle typed at the unix socket
+    /// has to be turned into one before anything is written down. Handles are
+    /// renameable and reusable, so a binding stored by the name would follow it
+    /// to whoever holds it next.
+    ///
+    /// Asked as an installation, and the credential is presented for what it
+    /// lets spaceport *see* rather than for any authority it carries. `GET
+    /// /users/{username}` is documented to accept user tokens, installation
+    /// tokens and fine-grained PATs, and to require no permission of any of
+    /// them — the App's own JWT is the one credential it does not accept, since
+    /// a JWT is good only for the App's own endpoints, so [`Self::app_credential`]
+    /// must never be reached for here. What an installation token buys is the
+    /// enterprise case: an enterprise configured to hide its members answers
+    /// `404` to a reader standing outside it, and a `404` is indistinguishable
+    /// from "no such handle" — so an operator binding a colleague would be told
+    /// the colleague does not exist. Presenting a token from inside makes the
+    /// account visible and the answer true. The rate limit improves as a side
+    /// effect, five thousand an hour per installation against sixty an hour per
+    /// source address, but that is not what this is for: a command an operator
+    /// types by hand never comes near either number.
+    ///
+    /// Every installation is tried, in turn, until one of them can see the
+    /// handle. An App may be installed on several organisations and a member
+    /// hidden from one enterprise's installation may be plainly visible to
+    /// another's, so picking a single installation — the first, the one that
+    /// happens to sort lowest — would report "github knows no such account" for
+    /// an account that exists and is bindable, which is precisely the failure
+    /// this is here to remove. The cost is a handful of requests on a command
+    /// an operator types by hand, and only when the earlier installations
+    /// cannot see the handle: the first that answers ends the walk.
+    ///
+    /// A connection with no installations at all falls back to asking with no
+    /// credential. A spaceport whose App nobody has installed yet can still
+    /// bind a public account, and refusing outright would make an operator
+    /// assertion depend on an installation the feature does not otherwise need.
+    ///
+    /// A failure to *list* the installations is a failure of this call, not a
+    /// reason to quietly go out unauthenticated instead. A network that is down
+    /// or a key GitHub no longer accepts would then produce a `404` from the
+    /// public read of a hidden account, and spaceport would tell the operator
+    /// their colleague's handle does not exist — the same confusion this
+    /// change removes, rebuilt one layer down. It is reported as what it is.
+    ///
+    /// A handle no installation can see comes back as `None` rather than as an
+    /// error, the way [`Self::branch_head`] hands back a missing branch and for
+    /// a stronger reason. [`refusal`]'s `404` refuses to say whether a thing is
+    /// absent or ungranted because for a permission-filtered endpoint GitHub
+    /// refuses to; this endpoint needs no permission, so once every installation
+    /// has been asked its `404` means one thing, and the caller can say "no such
+    /// account" under a status that means it.
+    pub async fn user_by_login(&self, login: &str) -> Result<Option<UserRecord>> {
+        // Checked before the value can reach the url, never escaped into it: an
+        // escaped path is still a path spaceport did not mean to ask for, and
+        // refusing everything that is not a handle is what makes a `..` segment
+        // climbing to another endpoint, or a `?` appending parameters to this
+        // one, impossible rather than merely encoded. Checked before the
+        // installations are listed, too, so a handle that is not one costs no
+        // request at all.
+        if !handle(login) {
+            bail!(
+                "`{login}` is not a github handle — a handle is at most {HANDLE_LIMIT} characters of letters, digits and single hyphens, and never begins or ends with one, so check how the account is spelled on github.com"
+            );
+        }
+
+        let installations = self.installations().await.with_context(|| {
+            format!("finding an installation to read the github account `{login}` as")
+        })?;
+
+        if installations.is_empty() {
+            return self.account(login, None).await;
+        }
+
+        for installation in installations {
+            let token = self.installation_token(installation.id).await?;
+            let seen = self
+                .account(login, Some(&Credential::Installation(token)))
+                .await?;
+
+            if seen.is_some() {
+                return Ok(seen);
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// One read of `GET /users/{login}` with whatever credential was chosen for
+    /// it, where `404` is an answer rather than a refusal.
+    ///
+    /// Split out of [`Self::user_by_login`] because that call makes this same
+    /// read once per installation and once more with nothing, and a loop body
+    /// written twice is two places for the `404` to stop meaning "not visible
+    /// from here". `login` has already passed [`handle`] — this is private, and
+    /// its only caller is the gate.
+    async fn account(
+        &self,
+        login: &str,
+        credential: Option<&Credential>,
+    ) -> Result<Option<UserRecord>> {
+        let what = format!("github account `{login}`");
+        let response = self
+            .send(Method::GET, &format!("{API}/users/{login}"), credential)
+            .await
+            .with_context(|| format!("asking github about the {what}"))?;
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        let user: wire::User = decode(&response, &what)?;
+
+        Ok(Some(UserRecord {
+            id: user.id,
+            // GitHub's own spelling rather than the operator's, for the reason
+            // [`RepositoryRecord::full_name`] keeps GitHub's: the API resolves
+            // a handle case-insensitively, and the stored name should be the
+            // one github.com shows.
+            login: user.login,
+        }))
+    }
+
     /// A token that acts as installation `installation_id`, minting one only if
     /// the one in hand is not good for long enough.
     pub async fn installation_token(&self, installation_id: i64) -> Result<Secret> {
@@ -994,6 +1128,32 @@ pub(super) async fn request(
         .with_context(|| format!("preparing a request to `{url}`"))?;
 
     transport.send(request).await
+}
+
+/// Whether a string is shaped like a github handle.
+///
+/// GitHub's grammar, and the reason it is spelled out rather than trusted: the
+/// only caller formats this straight into a request path, so this predicate —
+/// and not an escaping pass — is what stands between an operator's typing and
+/// the url spaceport asks for. ASCII letters and digits, single hyphens between
+/// them and never at either end, at most [`HANDLE_LIMIT`] of them. Nothing in
+/// that alphabet can be a path separator, a `..` segment or the start of a
+/// query string, so those are ruled out by what is allowed rather than by a
+/// list of what is not — a list being the thing somebody eventually finds a
+/// gap in.
+///
+/// `len` rather than a count of characters is right here and only here: every
+/// accepted byte is ASCII, so the two are the same number, and a string where
+/// they differ has already failed the alphabet.
+fn handle(login: &str) -> bool {
+    !login.is_empty()
+        && login.len() <= HANDLE_LIMIT
+        && !login.starts_with('-')
+        && !login.ends_with('-')
+        && !login.contains("--")
+        && login
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 /// Read a response as `T`, or say what GitHub answered instead.
@@ -1759,6 +1919,226 @@ mod tests {
         );
 
         assert!(error.contains("credentials"), "{error}");
+    }
+
+    /// The lookup a binding is built on: the operator types a handle and what
+    /// gets written down is the numeric id, so the id has to survive the trip
+    /// and the login has to come back as github spells it.
+    #[tokio::test]
+    async fn reads_which_account_holds_a_handle() {
+        let github = FakeGitHub::new();
+        github.hosts_account("octocat", 1001);
+
+        let account = client(&github).user_by_login("octocat").await.unwrap();
+
+        assert_eq!(
+            account,
+            Some(UserRecord {
+                id: 1001,
+                login: "octocat".to_owned(),
+            })
+        );
+    }
+
+    /// The one assertion that catches somebody putting the app's own signature
+    /// back on this call, or taking the credential off it again. `GET
+    /// /users/{username}` does not accept an app JWT — a jwt here would be
+    /// refused by real github while every other test in this file went on
+    /// passing — and asking with nothing is what makes a hidden enterprise
+    /// member read as an account that does not exist.
+    #[tokio::test]
+    async fn asks_who_holds_a_handle_as_an_installation_rather_than_as_the_app() {
+        let github = FakeGitHub::new();
+        github.hosts_account("octocat", 1001);
+
+        client(&github).user_by_login("octocat").await.unwrap();
+
+        let read = github
+            .requests()
+            .into_iter()
+            .find(|request| request.path == "/users/octocat")
+            .expect("the account was read");
+        assert_eq!(read.authorization, Authorization::Token);
+    }
+
+    /// The enterprise case this credential exists for: an organisation with
+    /// member privacy turned on denies its people to anybody reading from
+    /// outside, so an account one installation cannot see may be plainly
+    /// visible to another. Stopping at the first installation would tell an
+    /// operator that a colleague they can see on github.com does not exist.
+    #[tokio::test]
+    async fn finds_an_account_only_the_second_installation_is_allowed_to_see() {
+        let github = FakeGitHub::new();
+        github.installations_in_pages(&[&[
+            (7, "an-organisation", "Organization"),
+            (8, "an-enterprise", "Organization"),
+        ]]);
+        github.hosts_account_visible_only_to("octocat", 1001, 8);
+
+        let account = client(&github).user_by_login("octocat").await.unwrap();
+
+        assert_eq!(
+            account,
+            Some(UserRecord {
+                id: 1001,
+                login: "octocat".to_owned(),
+            })
+        );
+        // Both installations were asked, in order — the first is the one that
+        // could not see the account, and skipping it would make this pass for
+        // the wrong reason.
+        let mints: Vec<String> = github
+            .requests()
+            .into_iter()
+            .filter(|request| request.path.ends_with("/access_tokens"))
+            .map(|request| request.path)
+            .collect();
+        assert_eq!(
+            mints,
+            [
+                "/app/installations/7/access_tokens",
+                "/app/installations/8/access_tokens",
+            ]
+        );
+        assert_eq!(
+            github
+                .requests()
+                .into_iter()
+                .filter(|request| request.path == "/users/octocat")
+                .count(),
+            2
+        );
+    }
+
+    /// A handle nobody holds is the likeliest way anybody reaches this — the
+    /// operator mistyped it. The endpoint needs no permission of the token it
+    /// was asked with, so once every installation has answered `404` that `404`
+    /// means one thing, and the caller may say so rather than repeating
+    /// [`refusal`]'s hedge about grants.
+    #[tokio::test]
+    async fn answers_with_nothing_for_a_handle_no_installation_can_see() {
+        let github = FakeGitHub::new();
+        github.installations_in_pages(&[&[
+            (7, "an-organisation", "Organization"),
+            (8, "an-enterprise", "Organization"),
+        ]]);
+
+        let account = client(&github)
+            .user_by_login("nobody-at-all")
+            .await
+            .expect("a handle that is not there is an answer, not a failure");
+
+        assert_eq!(account, None);
+        assert_eq!(
+            github
+                .requests()
+                .into_iter()
+                .filter(|request| request.path == "/users/nobody-at-all")
+                .count(),
+            2
+        );
+    }
+
+    /// A spaceport whose app nobody has installed yet still has public accounts
+    /// to bind, and refusing here would make an operator assertion wait on an
+    /// installation the feature does not otherwise need.
+    #[tokio::test]
+    async fn reads_a_public_account_with_no_credential_when_nothing_has_installed_the_app() {
+        let github = FakeGitHub::new();
+        github.is_installed_nowhere();
+        github.hosts_account("octocat", 1001);
+
+        let account = client(&github).user_by_login("octocat").await.unwrap();
+
+        assert_eq!(
+            account,
+            Some(UserRecord {
+                id: 1001,
+                login: "octocat".to_owned(),
+            })
+        );
+        let read = github
+            .requests()
+            .into_iter()
+            .find(|request| request.path == "/users/octocat")
+            .expect("the account was read");
+        assert_eq!(read.authorization, Authorization::None);
+        assert_eq!(github.minted(), 0);
+    }
+
+    /// Listing the installations failing must not degrade into the
+    /// unauthenticated read, because that read would answer `404` for exactly
+    /// the hidden account this call exists to find — and the operator would be
+    /// told their colleague's handle is unknown rather than that github could
+    /// not be reached.
+    #[tokio::test]
+    async fn fails_rather_than_falling_back_when_the_installations_cannot_be_listed() {
+        let github = FakeGitHub::new();
+        github.refuses_the_app(42);
+
+        let error = format!(
+            "{:#}",
+            client(&github).user_by_login("octocat").await.unwrap_err()
+        );
+
+        assert!(error.contains("finding an installation"), "{error}");
+        assert!(
+            error.contains("does not accept this app's credentials"),
+            "{error}"
+        );
+        assert!(!error.contains("knows no"), "{error}");
+    }
+
+    /// The handle is operator input formatted straight into a path, so anything
+    /// that is not a handle has to be refused *before* a request exists — an
+    /// escaped `../app` is still a request for another endpoint, and a `?` is
+    /// still query parameters spaceport did not mean to send. The empty request
+    /// log is the assertion that matters.
+    #[tokio::test]
+    async fn refuses_a_handle_that_is_not_one_without_asking_github_anything() {
+        for login in [
+            "../app",
+            "foo/bar",
+            "octocat?per_page=1",
+            "-lead",
+            "trail-",
+            "double--hyphen",
+            "octo cat",
+            "",
+            "a-handle-far-longer-than-github-ever-issues-x",
+        ] {
+            let github = FakeGitHub::new();
+
+            let error = format!(
+                "{:#}",
+                client(&github).user_by_login(login).await.unwrap_err()
+            );
+
+            assert!(error.contains("not a github handle"), "{login}: {error}");
+            assert!(
+                github.requests().is_empty(),
+                "`{login}` reached the transport"
+            );
+        }
+    }
+
+    /// The `Option` says "github has no such account" and must not quietly
+    /// swallow anything else: github having a bad afternoon is trouble worth
+    /// failing on, not an answer of "no".
+    #[tokio::test]
+    async fn still_fails_when_the_handle_lookup_goes_wrong_for_some_other_reason() {
+        let github = FakeGitHub::new();
+        // Only the account read is refused, so the failure under test is that
+        // read's rather than the listing that now comes before it.
+        github.refuse_path_with("/users/octocat", StatusCode::INTERNAL_SERVER_ERROR, "");
+
+        let error = format!(
+            "{:#}",
+            client(&github).user_by_login("octocat").await.unwrap_err()
+        );
+
+        assert!(error.contains("github account `octocat`"), "{error}");
+        assert!(error.contains("trying again"), "{error}");
     }
 
     /// The user token is a credential like the installation one, and the same

@@ -685,6 +685,45 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (user_id, connection)
     ) STRICT;
     CREATE UNIQUE INDEX idp_identities_by_external ON idp_identities (connection, external_id);",
+    // 18 — an identity may exist before anyone has ever signed in through it,
+    // so `last_login_at` stops being NOT NULL.
+    //
+    // Step 17 wrote the column as mandatory because a login was the only thing
+    // that could create the row, and a login always has a moment. An operator
+    // at the socket may now assert the binding instead — alice's github account
+    // is attached to alice's user before alice has ever arrived — and such a
+    // row has no last login at all. NULL is the honest word for that, where a
+    // stamped `now()` would be a fiction: `mapping test` replays these rows as
+    // snapshots of what the provider last said, and a made-up timestamp beside
+    // an empty attribute map would read as a real login that returned nothing.
+    //
+    // Every earlier step managed with `ALTER TABLE` because every earlier step
+    // added something. SQLite cannot drop a NOT NULL constraint in place —
+    // there is no `ALTER COLUMN` — so relaxing one means rebuilding the table:
+    // create it beside the old one, copy the rows across, drop the old, take
+    // its name. This is the first step in this list that drops anything, and
+    // the drop is why the unique index is recreated below: `DROP TABLE` takes a
+    // table's indexes with it, and `idp_identities_by_external` is the guard
+    // that stops one github account vouching for two spaceport users.
+    //
+    // Nothing else about the table changes — same columns in the same order,
+    // same STRICT, same composite primary key.
+    "CREATE TABLE idp_identities_rebuilt (
+        user_id        TEXT NOT NULL,
+        connection     TEXT NOT NULL,
+        external_id    TEXT NOT NULL,
+        external_login TEXT NOT NULL,
+        attributes     TEXT NOT NULL,
+        last_login_at  TEXT,
+        PRIMARY KEY (user_id, connection)
+    ) STRICT;
+    INSERT INTO idp_identities_rebuilt
+        (user_id, connection, external_id, external_login, attributes, last_login_at)
+    SELECT user_id, connection, external_id, external_login, attributes, last_login_at
+      FROM idp_identities;
+    DROP TABLE idp_identities;
+    ALTER TABLE idp_identities_rebuilt RENAME TO idp_identities;
+    CREATE UNIQUE INDEX idp_identities_by_external ON idp_identities (connection, external_id);",
 ];
 
 /// The schema version this build writes.
@@ -1378,6 +1417,164 @@ mod tests {
                           last_login_at)
                      VALUES ('aaaaaaaa-8a6e-4c2b-9e77-1d5f6a2b9c40', 'spaceport-acme', '583231',
                              'octo-alice', '{}', '2026-08-16T00:00:00Z')",
+                    [],
+                )
+                .is_err()
+        );
+    }
+
+    /// Whether `column` of `table` still refuses NULL.
+    fn refuses_null(connection: &Connection, table: &str, column: &str) -> bool {
+        connection
+            .query_row(
+                &format!("SELECT \"notnull\" FROM pragma_table_info('{table}') WHERE name = ?1"),
+                [column],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+            == 1
+    }
+
+    /// A database left at step 17, with the identity table as that step wrote
+    /// it — the state the rebuild has to find and carry across.
+    fn stopped_before_the_rebuild() -> Connection {
+        let connection = empty();
+        for migration in &MIGRATIONS[..17] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection.pragma_update(None, "user_version", 17).unwrap();
+        connection
+    }
+
+    /// The rebuild exists to relax one constraint and must change nothing else
+    /// on its way past: same columns, same order, only `last_login_at` newly
+    /// willing to say it has never happened.
+    #[test]
+    fn the_eighteenth_migration_lets_an_identity_have_no_last_login() {
+        let connection = empty();
+        migrate(&connection).unwrap();
+
+        assert_eq!(
+            columns(&connection, "idp_identities"),
+            [
+                "user_id",
+                "connection",
+                "external_id",
+                "external_login",
+                "attributes",
+                "last_login_at"
+            ]
+        );
+        assert!(
+            !refuses_null(&connection, "idp_identities", "last_login_at"),
+            "an operator-bound identity has no last login to record"
+        );
+        // Every other column is still mandatory.
+        assert!(refuses_null(&connection, "idp_identities", "user_id"));
+        assert!(refuses_null(&connection, "idp_identities", "attributes"));
+
+        connection
+            .execute(
+                "INSERT INTO idp_identities
+                     (user_id, connection, external_id, external_login, attributes, last_login_at)
+                 VALUES ('3f29b1d4-8a6e-4c2b-9e77-1d5f6a2b9c40', 'spaceport-acme', '583231',
+                         'octo-alice', '{}', NULL)",
+                [],
+            )
+            .unwrap();
+    }
+
+    /// Rebuilding a table is the one migration shape that can lose rows, so the
+    /// identities an earlier build recorded must arrive on the other side of
+    /// the drop with every column still saying what it said.
+    #[test]
+    fn the_eighteenth_migration_carries_the_recorded_identities_across() {
+        let connection = stopped_before_the_rebuild();
+        connection
+            .execute(
+                "INSERT INTO idp_identities
+                     (user_id, connection, external_id, external_login, attributes, last_login_at)
+                 VALUES ('3f29b1d4-8a6e-4c2b-9e77-1d5f6a2b9c40', 'spaceport-acme', '583231',
+                         'octo-alice', '{\"org\":[\"acme-corp\"]}', '2026-08-16T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(migrate(&connection).unwrap(), LATEST_VERSION);
+
+        let row = connection
+            .query_row(
+                "SELECT user_id, connection, external_id, external_login, attributes,
+                        last_login_at
+                   FROM idp_identities",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "3f29b1d4-8a6e-4c2b-9e77-1d5f6a2b9c40".to_owned(),
+                "spaceport-acme".to_owned(),
+                "583231".to_owned(),
+                "octo-alice".to_owned(),
+                "{\"org\":[\"acme-corp\"]}".to_owned(),
+                Some("2026-08-16T00:00:00Z".to_owned()),
+            )
+        );
+    }
+
+    /// `DROP TABLE` takes a table's indexes with it. If the rebuild forgot to
+    /// recreate `idp_identities_by_external`, nothing would fail loudly — one
+    /// github account would simply become able to vouch for two spaceport
+    /// users, which is the doppelgänger step 17 exists to refuse.
+    #[test]
+    fn the_eighteenth_migration_keeps_both_uniqueness_guards() {
+        let connection = stopped_before_the_rebuild();
+        connection
+            .execute(
+                "INSERT INTO idp_identities
+                     (user_id, connection, external_id, external_login, attributes, last_login_at)
+                 VALUES ('3f29b1d4-8a6e-4c2b-9e77-1d5f6a2b9c40', 'spaceport-acme', '583231',
+                         'octo-alice', '{}', '2026-08-16T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        migrate(&connection).unwrap();
+
+        // The same external account vouching for a second user still trips the
+        // unique index…
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO idp_identities
+                         (user_id, connection, external_id, external_login, attributes,
+                          last_login_at)
+                     VALUES ('aaaaaaaa-8a6e-4c2b-9e77-1d5f6a2b9c40', 'spaceport-acme', '583231',
+                             'octo-alice', '{}', NULL)",
+                    [],
+                )
+                .is_err()
+        );
+        // …and a second row for the same user on the same connection still
+        // trips the primary key the rebuilt table carried over.
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO idp_identities
+                         (user_id, connection, external_id, external_login, attributes,
+                          last_login_at)
+                     VALUES ('3f29b1d4-8a6e-4c2b-9e77-1d5f6a2b9c40', 'spaceport-acme', '999999',
+                             'octo-alice', '{}', NULL)",
                     [],
                 )
                 .is_err()

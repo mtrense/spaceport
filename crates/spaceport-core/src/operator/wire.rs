@@ -303,7 +303,10 @@ pub struct IdentityRow {
     pub external_id: String,
     /// The renameable handle beside it, for the human reading the audit.
     pub external_login: String,
-    pub last_login_at: String,
+    /// When somebody last signed in through it, or `None` when nobody ever
+    /// has — an operator asserted the binding and the person has not arrived
+    /// yet.
+    pub last_login_at: Option<String>,
 }
 
 /// One entitlement the user holds, and whether it reaches anything.

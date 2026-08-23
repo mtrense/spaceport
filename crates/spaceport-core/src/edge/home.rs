@@ -2574,7 +2574,10 @@ mod tests {
     /// A code as the operator socket would have minted one, exposed for the
     /// form to type.
     async fn minted_code(home: &Home, users: &crate::auth::UserRepository, slug: &str) -> String {
-        users.create(&slug.parse().unwrap(), None).await.unwrap();
+        users
+            .create(&slug.parse().unwrap(), None, None)
+            .await
+            .unwrap();
 
         home.sessions
             .mint_code(
@@ -3010,7 +3013,10 @@ mod tests {
         apps.insert(gated_app("blog", "alpha.test", "reader"))
             .unwrap();
         let (home, users, entitlements) = exchange_home(apps);
-        users.create(&"alice".parse().unwrap(), None).await.unwrap();
+        users
+            .create(&"alice".parse().unwrap(), None, None)
+            .await
+            .unwrap();
         entitlements
             .grant(
                 &crate::auth::UserRef::Slug("alice".parse().unwrap()),
@@ -3374,7 +3380,10 @@ mod tests {
         github.user_belongs_to_orgs(&["acme-corp"]);
         github.user_belongs_to_teams(&[("acme-corp", "authors")]);
         let users = crate::auth::UserRepository::new(db.clone());
-        let alice = users.create(&"alice".parse().unwrap(), None).await.unwrap();
+        let alice = users
+            .create(&"alice".parse().unwrap(), None, None)
+            .await
+            .unwrap();
         crate::auth::IdentityRepository::new(db.clone())
             .record(
                 &alice.id,
@@ -3461,7 +3470,11 @@ mod tests {
         github.user_emails_in_pages(&[&[("octocat@acme.example", true, true)]]);
         let users = crate::auth::UserRepository::new(db.clone());
         let alice = users
-            .create(&"alice".parse().unwrap(), Some("octocat@acme.example"))
+            .create(
+                &"alice".parse().unwrap(),
+                Some("octocat@acme.example"),
+                None,
+            )
             .await
             .unwrap();
         // Auto-creation is gated on a rule matching, so a test about what the
@@ -3515,7 +3528,10 @@ mod tests {
         connect_for_login(&home).await;
         github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
         let users = crate::auth::UserRepository::new(db.clone());
-        let carol = users.create(&"carol".parse().unwrap(), None).await.unwrap();
+        let carol = users
+            .create(&"carol".parse().unwrap(), None, None)
+            .await
+            .unwrap();
         crate::auth::IdentityRepository::new(db.clone())
             .record(
                 &carol.id,
@@ -3527,7 +3543,7 @@ mod tests {
             .await
             .unwrap();
         users
-            .create(&"eve".parse().unwrap(), Some("octocat@acme.example"))
+            .create(&"eve".parse().unwrap(), Some("octocat@acme.example"), None)
             .await
             .unwrap();
 
@@ -3557,7 +3573,10 @@ mod tests {
         connect_for_login(&home).await;
         github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
         let users = crate::auth::UserRepository::new(db.clone());
-        let alice = users.create(&"alice".parse().unwrap(), None).await.unwrap();
+        let alice = users
+            .create(&"alice".parse().unwrap(), None, None)
+            .await
+            .unwrap();
         crate::auth::IdentityRepository::new(db.clone())
             .record(
                 &alice.id,

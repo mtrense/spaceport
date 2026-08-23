@@ -158,6 +158,26 @@ fn counted(repositories: usize) -> String {
     }
 }
 
+/// What an identity's last login comes to, said in English.
+///
+/// A binding with no login behind it is a state somebody put the row in
+/// deliberately — an operator asserted it with `auth user connect`, and the
+/// person it names has not arrived yet — so it is said as that rather than as
+/// an absent timestamp. "last login none" would read as a field this side
+/// failed to fill in, and an operator who had just typed `connect` would go
+/// looking for what went wrong with a row that is exactly as it should be.
+///
+/// Only the login half is written here: the connection, the handle and the
+/// numeric id are printed by the caller either way, because the id is what the
+/// binding is keyed by and a row nobody has signed in through is precisely the
+/// one where an operator wants to check it against github.
+fn signed_in(last_login_at: Option<&str>) -> String {
+    match last_login_at {
+        Some(at) => format!("last login {at}"),
+        None => "bound by an operator — nobody has signed in through it yet".to_owned(),
+    }
+}
+
 /// `spaceport auth audit`: the report, and then what the user actually holds.
 pub fn audit(audit: &wire::Audit, colour: Colour) -> String {
     let mut fields = vec![
@@ -192,11 +212,11 @@ pub fn audit(audit: &wire::Audit, colour: Colour) -> String {
                 fields.push((
                     "sso",
                     format!(
-                        "`{}` as `{}` (id {}), last login {}",
+                        "`{}` as `{}` (id {}), {}",
                         identity.connection,
                         identity.external_login,
                         identity.external_id,
-                        identity.last_login_at,
+                        signed_in(identity.last_login_at.as_deref()),
                     ),
                 ));
             }
@@ -298,12 +318,22 @@ mod tests {
             id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
             suspended: false,
             email: Some("ada@example.com".to_owned()),
-            sso: vec![wire::IdentityRow {
-                connection: "spaceport-ci".to_owned(),
-                external_id: "4242".to_owned(),
-                external_login: "ada-gh".to_owned(),
-                last_login_at: "2026-02-02T00:00:00Z".to_owned(),
-            }],
+            sso: vec![
+                wire::IdentityRow {
+                    connection: "spaceport-ci".to_owned(),
+                    external_id: "4242".to_owned(),
+                    external_login: "ada-gh".to_owned(),
+                    last_login_at: Some("2026-02-02T00:00:00Z".to_owned()),
+                },
+                // The other state a row can be in, in the same fixture: an
+                // operator asserted this one and its owner has not arrived.
+                wire::IdentityRow {
+                    connection: "spaceport-acme".to_owned(),
+                    external_id: "1701".to_owned(),
+                    external_login: "ada-acme".to_owned(),
+                    last_login_at: None,
+                },
+            ],
             access: vec!["wiki".parse().unwrap()],
             entitlements: vec![
                 wire::EntitlementRow {
@@ -348,6 +378,7 @@ id      00000000-0000-4000-8000-000000000001
 status  active
 email   ada@example.com
 sso     `spaceport-ci` as `ada-gh` (id 4242), last login 2026-02-02T00:00:00Z
+sso     `spaceport-acme` as `ada-acme` (id 1701), bound by an operator — nobody has signed in through it yet
 access  wiki
 
 ENTITLEMENT  ORIGIN                 ACCESS                             GRANTED
@@ -532,5 +563,52 @@ reader@blog  mapped by rule `a1b2`  no — role not declared by the app  2026-02
         audited.email = None;
 
         assert!(!audit(&audited, Colour::No).contains("email"));
+    }
+
+    /// The two states an identity row can be in, told apart in words: a login
+    /// has a date, and a binding nobody has arrived through says who put it
+    /// there. An operator who has just run `auth user connect` must not read
+    /// their own successful command as a field that failed to fill in — and
+    /// the numeric id, which is what the binding is keyed by, is printed either
+    /// way, because a row with no login behind it is the one worth checking
+    /// against github.
+    #[test]
+    fn says_a_binding_nobody_has_signed_in_through_is_a_binding() {
+        let mut audited = audited();
+        // The entitlement that reaches nothing is the only coloured thing in
+        // the fixture, and this test is about what the sso lines are not.
+        audited.entitlements.truncate(1);
+        let block = audit(&audited, Colour::Yes);
+
+        assert!(
+            block.contains("`spaceport-ci` as `ada-gh` (id 4242), last login 2026-02-02T00:00:00Z"),
+            "{block:?}",
+        );
+        assert!(
+            block.contains(
+                "`spaceport-acme` as `ada-acme` (id 1701), bound by an operator — nobody has \
+                 signed in through it yet"
+            ),
+            "{block:?}",
+        );
+        // Neither is a fault: an assertion waiting on its owner is exactly what
+        // an operator asked for.
+        assert!(!block.contains(RED) && !block.contains(YELLOW), "{block:?}");
+    }
+
+    /// An identity the operator has never heard of is not the same thing as an
+    /// identity nobody has signed in through, and the report must not spell
+    /// them the same way.
+    #[test]
+    fn keeps_no_identity_apart_from_an_unused_one() {
+        let mut audited = audited();
+        audited.sso.clear();
+
+        let block = audit(&audited, Colour::No);
+        assert!(
+            block.contains("sso     none — no IdP login recorded"),
+            "{block:?}"
+        );
+        assert!(!block.contains("bound by an operator"), "{block:?}");
     }
 }

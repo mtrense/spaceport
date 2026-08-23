@@ -35,10 +35,10 @@ use crate::app::manifest::VarName;
 use crate::app::secrets::Set;
 use crate::app::{App, AppId, AppManifest, AppRecord, AppRepository, DataDir, Pattern, health};
 use crate::auth::{
-    AuthLogRepository, Condition, EntitlementError, EntitlementRepository, Granted,
-    IdentityRepository, JwtSigner, MappingError, MappingRepository, RevokeScope, Revoked, Role,
-    RoleAtApp, RolesAtApp, SessionError, SessionId, SessionRepository, UserError, UserId, UserRef,
-    UserRepository, evaluate,
+    AssertedIdentity, AuthLogRepository, Condition, EntitlementError, EntitlementRepository,
+    Granted, IdentityError, IdentityRepository, JwtSigner, MappingError, MappingRepository,
+    RevokeScope, Revoked, Role, RoleAtApp, RolesAtApp, SessionError, SessionId, SessionRepository,
+    UserError, UserId, UserRef, UserRepository, evaluate,
 };
 use crate::build::repository::{Build, BuildRepository, BuildState};
 use crate::connections::github::{
@@ -214,6 +214,10 @@ fn router(instance: Arc<Instance>, events: Arc<EventBus>, shutdown: Cancellation
         .route("/auth/users/{user}/suspend", post(suspend_user))
         .route("/auth/users/{user}/resume", post(resume_user))
         .route("/auth/users/{user}/audit", get(audit_user))
+        .route(
+            "/auth/users/{user}/identities/{connection}",
+            put(connect_user).delete(disconnect_user),
+        )
         .route(
             "/auth/users/{user}/sessions",
             get(list_sessions)
@@ -3802,9 +3806,19 @@ fn user_status(suspended: bool) -> &'static str {
 /// minted here — so a slug that already exists is a 409, not a replacement.
 /// Replacing would quietly hand the same name a new UUID, which is exactly the
 /// confusion the never-reused rule exists to prevent.
+///
+/// `?connect=<connection>:<login>` attaches an IdP identity to the user being
+/// minted, so that `spaceport auth user create alice --connect
+/// spaceport-acme:octocat` is one operator command, one round trip and one
+/// commit. Not a create followed by a bind, because a bind that failed after
+/// the create would leave a half-made alice for the operator to clean up
+/// before they could try again.
 async fn create_user(
     State(users): State<Arc<UserRepository>>,
+    State(connections): State<Arc<ConnectionRepository>>,
+    State(github): State<Arc<dyn Transport>>,
     UrlPath(slug): UrlPath<String>,
+    Query(query): Query<ConnectQuery>,
     body: String,
 ) -> Response {
     let slug: crate::auth::UserSlug = match slug.parse() {
@@ -3827,16 +3841,280 @@ async fn create_user(
         }
     };
 
-    match users.create(&slug, email).await {
+    // Asked of github here, before `create` is called at all, and refused here
+    // too — which is the whole point of handing the identity to `create`
+    // rather than binding it afterwards. A handle github does not know must
+    // leave no user behind, so that the operator's next attempt is the same
+    // create again and never a repair; and once the answer is in hand, the
+    // user row and the identity row land in a single transaction down there.
+    let identity = match &query.connect {
+        Some(connect) => {
+            let (connection, login) = match connect_pair(connect) {
+                Ok(pair) => pair,
+                Err(refusal) => return refuse(StatusCode::BAD_REQUEST, &refusal),
+            };
+
+            match asserted_identity(&connections, github, connection, login).await {
+                Ok(identity) => Some(identity),
+                Err(refusal) => return refusal,
+            }
+        }
+        None => None,
+    };
+
+    match users.create(&slug, email, identity.as_ref()).await {
         Ok(created) => {
             let mut body = format!("user `{slug}` created\n  id     {}\n", created.id);
             if let Some(email) = &created.email {
                 body.push_str(&format!("  email  {email}\n"));
             }
+            // The numeric id and not only the handle that was typed, because
+            // the id is what the binding is keyed by — see [`connect_user`].
+            if let Some(identity) = &identity {
+                body.push_str(&format!("  bound  {}\n", bound_as(identity)));
+            }
 
             (StatusCode::OK, body).into_response()
         }
         Err(error) => refuse_user(error),
+    }
+}
+
+/// The `?connect=` an operator's `--connect` becomes: a connection slug and a
+/// handle in one parameter.
+///
+/// One parameter rather than two, because they are one assertion — a
+/// connection with no handle beside it, or the other way round, is not half an
+/// instruction but a mistyped whole one, and a single value is what lets this
+/// route say so in one sentence.
+#[derive(Debug, Deserialize)]
+struct ConnectQuery {
+    connect: Option<String>,
+}
+
+/// Split `<connection>:<login>` into its halves, or say what shape was meant.
+///
+/// On the *first* colon: a connection slug is a GitHub App slug and never
+/// holds one, so everything after it belongs to the handle. Splitting on the
+/// last would make a value carrying two colons quietly mean something other
+/// than it reads like, and a handle that cannot hold a colon anyway is better
+/// refused by github than silently re-cut here. Neither half may be empty,
+/// because `:octocat` and `spaceport-acme:` are both somebody who meant to
+/// type more.
+fn connect_pair(connect: &str) -> Result<(&str, &str), String> {
+    match connect.split_once(':') {
+        Some((connection, login)) if !connection.is_empty() && !login.is_empty() => {
+            Ok((connection, login))
+        }
+        _ => Err(format!(
+            "`{connect}` is not a connection and a handle — write the two with a colon between them, as in `spaceport-acme:octocat`, where the first half is the slug `spaceport connect list` prints"
+        )),
+    }
+}
+
+/// Turn the handle an operator typed into the identity a binding is keyed by,
+/// by asking github who holds it — or hand back the refusal they should read
+/// instead.
+///
+/// Shared by the two routes that bind, because both ask github the same
+/// question for the same reason, and a second spelling of it would be a second
+/// opinion about which accounts this spaceport is willing to bind.
+///
+/// The connection does two jobs here, and they are worth telling apart. Its
+/// slug is what the binding *records* — a login through that connection is the
+/// one this assertion speaks about. Its installations are what decide the
+/// *answer*: the lookup reads github as each of them in turn (see
+/// [`Client::user_by_login`]), so an account an enterprise hides from the
+/// public resolves when this connection's app is installed where it can see
+/// them, and does not when it is not. Pointing at the wrong connection can
+/// therefore make a handle that plainly exists look unknown — which is the
+/// operator's to get right, the same way the half after the colon is.
+async fn asserted_identity(
+    connections: &ConnectionRepository,
+    github: Arc<dyn Transport>,
+    connection: &str,
+    login: &str,
+) -> Result<AssertedIdentity, Response> {
+    let connection = match connections.by_slug(connection).await {
+        Ok(Some(connection)) => connection,
+        Ok(None) => return Err(refuse(StatusCode::NOT_FOUND, &unconnected(connection))),
+        Err(error) => {
+            return Err(refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not read the connection `{connection}`: {error:#}"),
+            ));
+        }
+    };
+
+    let client = match Client::new(&connection, github) {
+        Ok(client) => client,
+        Err(error) => {
+            return Err(refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not act as `{}`: {error:#}", connection.slug),
+            ));
+        }
+    };
+
+    match client.user_by_login(login).await {
+        Ok(Some(account)) => Ok(AssertedIdentity {
+            connection: connection.slug,
+            // As text, because it is an opaque key out of somebody else's
+            // id-space and nothing here ever does arithmetic on it.
+            external_id: account.id.to_string(),
+            // GitHub's spelling of the handle rather than the operator's: the
+            // lookup resolves case-insensitively, and what an audit shows
+            // should be what github.com shows.
+            external_login: account.login,
+        }),
+        // Loudly, and under a status that means it. A binding is keyed by the
+        // id, so a handle nobody holds could only ever be written as a
+        // dangling row that silently never matches a login — the same failure
+        // mode as a `--when` clause with a typo in the attribute name, and
+        // this is the one place it can still be caught.
+        Ok(None) => Err(refuse(
+            StatusCode::NOT_FOUND,
+            &format!(
+                "github knows no account `{login}` — nothing was written, so check how the handle is spelled on github.com and give the command again"
+            ),
+        )),
+        // The far end's own sentence under the status [`track`] gives it, and
+        // one case it over-attributes on purpose: a handle that is not shaped
+        // like a handle is refused by the client before any request goes out,
+        // and arrives here too. Keeping the shape check on that side is what
+        // makes a `..` or a `?` in the value impossible rather than merely
+        // encoded, and the sentence it carries names the spelling to fix, so
+        // an operator reads the right thing either way.
+        Err(error) => Err(refuse(StatusCode::BAD_GATEWAY, &format!("{error:#}"))),
+    }
+}
+
+/// How a binding reads to a person: the connection, the handle, and the id it
+/// is actually keyed by.
+///
+/// One phrasing for both routes and the audit, because an operator comparing
+/// what `connect` said with what `audit` shows should not have to translate
+/// between two.
+fn bound_as(identity: &AssertedIdentity) -> String {
+    format!(
+        "`{}` as `{}` (id {})",
+        identity.connection, identity.external_login, identity.external_id
+    )
+}
+
+/// What to say about an identity's last login, including when there has not
+/// been one.
+///
+/// A binding nobody has signed in through yet is a state an operator put the
+/// row in on purpose, so it reads as that rather than as a missing timestamp.
+/// The same sentence is in the CLI's own renderer: this one answers `curl` and
+/// that one answers `spaceport auth audit`, and two spellings of one fact
+/// would leave an operator wondering which of them knows something.
+fn signed_in(last_login_at: Option<&str>) -> String {
+    match last_login_at {
+        Some(at) => format!("last login {at}"),
+        None => "bound by an operator — nobody has signed in through it yet".to_owned(),
+    }
+}
+
+/// `PUT /auth/users/{ref}/identities/{connection}` with the github handle as
+/// the body: assert that this user is that account.
+///
+/// The handle travels in the body for the reason the email does in
+/// [`create_user`] — one rule about where a value an operator typed goes,
+/// rather than one rule per route and a query string quietly eating characters
+/// in the difference.
+///
+/// The account is resolved to github's numeric id *before* anything is
+/// written, and the answer names that id rather than only the handle: the id
+/// is what the row is keyed by, handles are renameable and reusable, and an
+/// operator should be able to see the thing their binding will actually be
+/// matched on.
+///
+/// Nothing is granted here. A binding says who somebody is, not what they may
+/// do — `spaceport auth grant` remains the only thing that answers the second
+/// question.
+async fn connect_user(
+    State(entitlements): State<Arc<EntitlementRepository>>,
+    State(identities): State<Arc<IdentityRepository>>,
+    State(connections): State<Arc<ConnectionRepository>>,
+    State(github): State<Arc<dyn Transport>>,
+    UrlPath((user, connection)): UrlPath<(String, String)>,
+    body: String,
+) -> Response {
+    let user: UserRef = match user.parse() {
+        Ok(user) => user,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    // Resolved through the audit read rather than a resolver of this route's
+    // own, so an unknown user gets exactly the refusal every other command
+    // gives — the argument [`mapping_test`] makes.
+    let (user, _) = match entitlements.audit(&user).await {
+        Ok(audited) => audited,
+        Err(error) => return refuse_entitlement(error),
+    };
+
+    let login = body.trim();
+    if login.is_empty() {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "no github handle was given — `spaceport auth user connect` takes the account to bind, as in `spaceport auth user connect alice spaceport-acme:octocat`",
+        );
+    }
+
+    let identity = match asserted_identity(&connections, github, &connection, login).await {
+        Ok(identity) => identity,
+        Err(refusal) => return refusal,
+    };
+
+    match identities.bind(&user.id, &identity).await {
+        Ok(()) => (
+            StatusCode::OK,
+            format!(
+                "user `{}` is {}\n  the binding is keyed by the id, so renaming the handle on github does not break it\n  nothing was granted — `spaceport auth grant {}` is still what gives them access\n",
+                user.slug,
+                bound_as(&identity),
+                user.slug,
+            ),
+        )
+            .into_response(),
+        Err(error) => refuse_user(UserError::Binding(error)),
+    }
+}
+
+/// `DELETE /auth/users/{ref}/identities/{connection}`: this user is nobody at
+/// that connection any more.
+///
+/// Only the link goes. The user, their entitlements and their sessions are
+/// untouched, because a binding never granted any of them — and a binding that
+/// was not there to remove is a 404 rather than a quiet success, since an
+/// operator told a link is gone has to be able to believe it was there.
+async fn disconnect_user(
+    State(entitlements): State<Arc<EntitlementRepository>>,
+    State(identities): State<Arc<IdentityRepository>>,
+    UrlPath((user, connection)): UrlPath<(String, String)>,
+) -> Response {
+    let user: UserRef = match user.parse() {
+        Ok(user) => user,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    let (user, _) = match entitlements.audit(&user).await {
+        Ok(audited) => audited,
+        Err(error) => return refuse_entitlement(error),
+    };
+
+    match identities.unbind(&user.id, &connection).await {
+        Ok(()) => (
+            StatusCode::OK,
+            format!(
+                "user `{}` holds no identity at `{connection}` any more\n  their entitlements and sessions are untouched — the binding granted none of them\n  a login through `{connection}` will no longer resolve to this user\n",
+                user.slug,
+            ),
+        )
+            .into_response(),
+        Err(error) => refuse_user(UserError::Binding(error)),
     }
 }
 
@@ -3907,12 +4185,21 @@ async fn drop_user(
 }
 
 /// One mapping from what went wrong to whose problem it is, for every verb on
-/// the user pool: a mistyped name is a 404, a slug already held is a 409, and
-/// a store that would not answer is a 500.
+/// the user pool: a mistyped name is a 404, a slug already held or an identity
+/// already bound is a 409, and a store that would not answer is a 500.
 fn refuse_user(error: UserError) -> Response {
     let status = match &error {
-        UserError::Unknown(_) => StatusCode::NOT_FOUND,
-        UserError::SlugTaken(_) => StatusCode::CONFLICT,
+        UserError::Unknown(_) | UserError::Binding(IdentityError::NotBound(_)) => {
+            StatusCode::NOT_FOUND
+        }
+        UserError::SlugTaken(_)
+        | UserError::Binding(
+            IdentityError::AccountBoundElsewhere(_) | IdentityError::AlreadyBound(_),
+        ) => StatusCode::CONFLICT,
+        UserError::Binding(IdentityError::Failed(_)) => {
+            warn!(%error, "an identity binding failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
         UserError::Failed(_) => {
             warn!(%error, "a user command failed");
             StatusCode::INTERNAL_SERVER_ERROR
@@ -4727,11 +5014,11 @@ async fn audit_user(
                 out.field(
                     "sso",
                     format!(
-                        "`{}` as `{}` (id {}), last login {}",
+                        "`{}` as `{}` (id {}), {}",
                         identity.connection,
                         identity.external_login,
                         identity.external_id,
-                        identity.last_login_at,
+                        signed_in(identity.last_login_at.as_deref()),
                     ),
                 );
             }
@@ -5092,11 +5379,11 @@ async fn mapping_test(
     let mut body = String::new();
     for identity in &held {
         body.push_str(&format!(
-            "via `{}` as `{}` (id {}), last login {}\n",
+            "via `{}` as `{}` (id {}), {}\n",
             identity.connection,
             identity.external_login,
             identity.external_id,
-            identity.last_login_at,
+            signed_in(identity.last_login_at.as_deref()),
         ));
         for (attr, values) in &identity.attributes {
             body.push_str(&format!("  {attr} = {}\n", values.join(", ")));
@@ -10530,6 +10817,266 @@ container:
             "{audit}"
         );
         assert!(!audit.contains("no IdP login recorded"), "{audit}");
+    }
+
+    /// Bind a github account to a user the way `spaceport auth user connect`
+    /// does — the handle in the body, exactly as the client sends it.
+    async fn connect_identity(
+        router: &Router,
+        user: &str,
+        connection: &str,
+        login: &str,
+    ) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/auth/users/{user}/identities/{connection}"))
+            .body(Body::from(login.to_owned()))
+            .unwrap();
+
+        call(router, request).await
+    }
+
+    /// What `idp_identities` actually holds for `user`, read behind the routes
+    /// rather than through the audit's prose: the whole question these tests
+    /// ask is what was *stored*, and a renderer agreeing with itself would
+    /// prove nothing about the row.
+    async fn identities_of(
+        db: &Db,
+        user: &crate::auth::UserId,
+    ) -> Vec<crate::auth::IdentityRecord> {
+        crate::auth::IdentityRepository::new(db.clone())
+            .for_user(user)
+            .await
+            .unwrap()
+    }
+
+    /// Whether anything at all was asked of github, which is the whole
+    /// question when a refusal was supposed to come before the round trip.
+    fn asked_github_about_an_account(github: &FakeGitHub) -> bool {
+        github
+            .requests()
+            .iter()
+            .any(|request| request.path.starts_with("/users/"))
+    }
+
+    /// THE PROPERTY THE WHOLE FEATURE RESTS ON. A binding is keyed by github's
+    /// numeric user id and never by the handle an operator typed: handles are
+    /// renameable and reusable, so a row stored under the name would follow
+    /// that name to whoever holds it next and quietly hand a stranger somebody
+    /// else's user. The handle is stored beside the id only so that a human
+    /// reading an audit recognises the account.
+    #[tokio::test]
+    async fn binds_an_account_by_its_numeric_id_and_not_by_the_handle() {
+        let (router, db, github) = router_github_alice_and_blog().await;
+        plant_connection(&db, "spaceport-acme").await;
+        github.hosts_account("octocat", 583231);
+
+        let (status, body) = connect_identity(&router, "alice", "spaceport-acme", "octocat").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // The answer names the id, so that an operator sees the thing their
+        // binding will be matched on rather than only the name they typed.
+        assert!(
+            body.contains("`spaceport-acme` as `octocat` (id 583231)"),
+            "{body}"
+        );
+        let alice: crate::auth::UserId = alice_id(&router).await.parse().unwrap();
+        let held = identities_of(&db, &alice).await;
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].external_id, "583231");
+        assert_eq!(held[0].external_login, "octocat");
+        // And nobody has signed in through it — said honestly rather than
+        // stamped with the moment of the assertion.
+        assert_eq!(held[0].last_login_at, None);
+    }
+
+    /// A dangling binding would silently never match a login, which is the
+    /// same failure mode as a `--when` clause with a typo in it — so the
+    /// handle is resolved against github first, and a refusal writes nothing.
+    #[tokio::test]
+    async fn refuses_a_handle_github_does_not_know_and_writes_nothing() {
+        let (router, db, _) = router_github_alice_and_blog().await;
+        plant_connection(&db, "spaceport-acme").await;
+
+        let (status, body) = connect_identity(&router, "alice", "spaceport-acme", "ghost").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("github knows no account `ghost`"), "{body}");
+        assert!(body.contains("nothing was written"), "{body}");
+        let alice: crate::auth::UserId = alice_id(&router).await.parse().unwrap();
+        assert!(identities_of(&db, &alice).await.is_empty());
+    }
+
+    /// A slug this spaceport has never connected is the operator's mistake and
+    /// is answered as one — before any request goes out, because github has
+    /// nothing to say about a connection that does not exist here.
+    #[tokio::test]
+    async fn refuses_a_connection_this_spaceport_does_not_have() {
+        let (router, _, github) = router_github_alice_and_blog().await;
+        github.hosts_account("octocat", 583231);
+
+        let (status, body) = connect_identity(&router, "alice", "spaceport-ghost", "octocat").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("is not connected"), "{body}");
+        assert!(body.contains("spaceport connect list"), "{body}");
+        assert!(!asked_github_about_an_account(&github));
+    }
+
+    /// A user who does not exist is a 404 too, and again before the round
+    /// trip: the user is resolved first for exactly that reason.
+    #[tokio::test]
+    async fn refuses_to_bind_an_identity_onto_nobody() {
+        let (router, db, github) = router_github_alice_and_blog().await;
+        plant_connection(&db, "spaceport-acme").await;
+        github.hosts_account("octocat", 583231);
+
+        let (status, body) = connect_identity(&router, "ghost", "spaceport-acme", "octocat").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("no user answers to `ghost`"), "{body}");
+        assert!(!asked_github_about_an_account(&github));
+    }
+
+    /// THE ATOMICITY `--connect` EXISTS FOR. The lookup happens before the
+    /// user is minted, so a handle github does not know leaves no half-made
+    /// user for the operator to clean up before they can try the command
+    /// again.
+    #[tokio::test]
+    async fn a_create_whose_connect_github_cannot_confirm_leaves_no_user_behind() {
+        let (router, db, _) = router_github_alice_and_blog().await;
+        plant_connection(&db, "spaceport-acme").await;
+
+        let (status, body) = user_command(
+            &router,
+            "PUT",
+            "/auth/users/bob?connect=spaceport-acme:ghost",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("github knows no account `ghost`"), "{body}");
+        let (_, listed) = user_command(&router, "GET", "/auth/users").await;
+        assert!(!listed.contains("bob"), "{listed}");
+        // Nor did the attempt leave a line in the log claiming a user was
+        // created: the transaction never opened.
+        let (_, log) = user_command(&router, "GET", "/auth/log").await;
+        assert_eq!(log.matches("user.created").count(), 1, "{log}");
+    }
+
+    /// The success side of the same commit, driven through the URI the client
+    /// builds rather than one written out here — so that what the route is
+    /// asked is the string an operator's `--connect` actually comes to.
+    #[tokio::test]
+    async fn a_create_with_a_connect_writes_the_user_and_the_binding_together() {
+        let (router, db, github) = router_github_alice_and_blog().await;
+        plant_connection(&db, "spaceport-acme").await;
+        github.hosts_account("octocat", 583231);
+
+        let (status, body) = user_command(
+            &router,
+            "PUT",
+            &crate::operator::client::create_user_uri(
+                &"bob".parse().unwrap(),
+                Some(("spaceport-acme", "octocat")),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("user `bob` created"), "{body}");
+        assert!(
+            body.contains("`spaceport-acme` as `octocat` (id 583231)"),
+            "{body}"
+        );
+        let bob: crate::auth::UserId = id_in(&body).parse().unwrap();
+        let held = identities_of(&db, &bob).await;
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].external_id, "583231");
+        // One command, one commit: both events are in the log under the user
+        // the create minted.
+        let (_, log) = user_command(&router, "GET", &format!("/auth/log?user={bob}")).await;
+        assert!(log.contains("user.created"), "{log}");
+        assert!(log.contains("identity.bound"), "{log}");
+    }
+
+    /// Half an assertion is a mistyped whole one, so it is refused with the
+    /// shape that was meant rather than read as a connection with an empty
+    /// handle — which github would then be asked about.
+    #[tokio::test]
+    async fn refuses_a_connect_that_is_not_a_connection_and_a_handle() {
+        let (router, db, github) = router_github_alice_and_blog().await;
+        plant_connection(&db, "spaceport-acme").await;
+
+        for malformed in ["spaceport-acme", ":octocat", "spaceport-acme:", ""] {
+            let (status, body) = user_command(
+                &router,
+                "PUT",
+                &format!("/auth/users/bob?connect={malformed}"),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST, "`{malformed}`: {body}");
+            assert!(body.contains("spaceport-acme:octocat"), "{body}");
+        }
+
+        assert!(!asked_github_about_an_account(&github));
+        let (_, listed) = user_command(&router, "GET", "/auth/users").await;
+        assert!(!listed.contains("bob"), "{listed}");
+    }
+
+    /// An operator told a link is gone has to be able to believe it was there,
+    /// so removing nothing is a refusal rather than a quiet success.
+    #[tokio::test]
+    async fn refuses_to_unbind_an_identity_that_was_never_bound() {
+        let (router, db, _) = router_github_alice_and_blog().await;
+        plant_connection(&db, "spaceport-acme").await;
+
+        let (status, body) = user_command(
+            &router,
+            "DELETE",
+            "/auth/users/alice/identities/spaceport-acme",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("holds no identity"), "{body}");
+    }
+
+    /// The round trip an operator makes to re-point somebody at a different
+    /// account: disconnect, then connect again — deliberately two commands.
+    #[tokio::test]
+    async fn unbinds_an_identity_and_leaves_everything_it_never_granted() {
+        let (router, db, github) = router_github_alice_and_blog().await;
+        plant_connection(&db, "spaceport-acme").await;
+        github.hosts_account("octocat", 583231);
+        github.hosts_account("octodog", 42424);
+        connect_identity(&router, "alice", "spaceport-acme", "octocat").await;
+        user_command(&router, "PUT", "/auth/users/alice/entitlements/reader@blog").await;
+
+        let (status, body) = user_command(
+            &router,
+            "DELETE",
+            "/auth/users/alice/identities/spaceport-acme",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("holds no identity"), "{body}");
+        let alice: crate::auth::UserId = alice_id(&router).await.parse().unwrap();
+        assert!(identities_of(&db, &alice).await.is_empty());
+        // The entitlement stayed: a binding never granted it, so taking the
+        // binding back must not take it away either.
+        let (_, audit) = user_command(&router, "GET", "/auth/users/alice/audit").await;
+        assert!(audit.contains("reader"), "{audit}");
+        // And the connection is free for the other account now.
+        let (status, body) = connect_identity(&router, "alice", "spaceport-acme", "octodog").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            identities_of(&db, &alice).await[0].external_id,
+            "42424",
+            "{body}"
+        );
     }
 
     /// A directory of this test's own to bind sockets in, named short because

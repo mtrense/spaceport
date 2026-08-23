@@ -406,22 +406,100 @@ pub async fn auth_user_list(
     .await
 }
 
-/// Ask it to create a user under `slug`, minting the id it keeps for life.
+/// Ask it to create a user under `slug`, minting the id it keeps for life, and
+/// optionally binding the github account `connect` names in the same commit.
 ///
 /// The email goes in the body rather than the uri, because an address may
 /// carry a `+` that a query string would silently read as a space — and an
 /// absent address is an empty body. The slug is safe in the path: its alphabet
 /// is the app id's.
+///
+/// Patient rather than quick when it binds, and patient either way: a create
+/// with `--connect` waits on a round trip to github.com, which every other
+/// auth command is spared. The quick deadline is sized for a write to a local
+/// database, so a slow network would spend it and report a spaceport that had
+/// stopped answering — a lie about which end was struggling. One pace for both
+/// shapes of the call, because the caller reading the error should not have to
+/// know which arguments changed the clock.
 pub async fn auth_user_create(
     operator: &Operator,
     slug: &UserSlug,
     email: Option<&str>,
+    connect: Option<(&str, &str)>,
 ) -> Result<String> {
-    let request = builder("PUT", &format!("/auth/users/{slug}"))
+    let request = builder("PUT", &create_user_uri(slug, connect))
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(Full::new(Bytes::from(email.unwrap_or("").to_owned())))?;
 
-    send_to(operator, Pace::Quick, request).await
+    send_to(operator, Pace::Patient, request).await
+}
+
+/// The URI [`auth_user_create`] sends, apart from it for [`tracking_uri`]'s
+/// reason: what a connection and a handle come to can then be asked without a
+/// spaceport to send it to, and the route can be tested against the very
+/// string this builds.
+pub(super) fn create_user_uri(slug: &UserSlug, connect: Option<(&str, &str)>) -> String {
+    let mut uri = format!("/auth/users/{slug}");
+
+    // The pair encoded whole, colon and all. The far end splits on the first
+    // colon it reads, so the only colon that may reach it is the one written
+    // here — encoding the halves separately and joining them afterwards would
+    // let a value carrying one write a second.
+    if let Some((connection, login)) = connect {
+        let _ = write!(
+            uri,
+            "?connect={}",
+            query_encode(&format!("{connection}:{login}"))
+        );
+    }
+
+    uri
+}
+
+/// Ask it to assert that the user `user` names is the github account `login`
+/// at `connection`.
+///
+/// The handle goes in the body for the reason the email does above: one rule
+/// about where a value an operator typed travels, rather than one per route.
+/// The connection is a path segment, encoded because it is a string somebody
+/// typed and a segment is not the place to find out it held a `/`.
+///
+/// Patient for [`auth_user_create`]'s reason, and here without an alternative:
+/// this call is a round trip to github.com every time.
+pub async fn auth_user_connect(
+    operator: &Operator,
+    user: &UserRef,
+    connection: &str,
+    login: &str,
+) -> Result<String> {
+    let request = builder(
+        "PUT",
+        &format!("/auth/users/{user}/identities/{}", query_encode(connection)),
+    )
+    .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+    .body(Full::new(Bytes::from(login.to_owned())))?;
+
+    send_to(operator, Pace::Patient, request).await
+}
+
+/// Ask it to take that assertion back: the user `user` names is nobody at
+/// `connection` any more.
+///
+/// Patient with the other two, though this one asks github nothing — the three
+/// identity commands share a clock so that an operator never has to work out
+/// which of them was allowed longer and why.
+pub async fn auth_user_disconnect(
+    operator: &Operator,
+    user: &UserRef,
+    connection: &str,
+) -> Result<String> {
+    let request = builder(
+        "DELETE",
+        &format!("/auth/users/{user}/identities/{}", query_encode(connection)),
+    )
+    .body(Full::default())?;
+
+    send_to(operator, Pace::Patient, request).await
 }
 
 /// Ask it to suspend the user `user` names — a slug or a user id, and the far
@@ -1302,6 +1380,40 @@ mod tests {
         };
 
         assert_eq!(watch.query(), "?app=%2A&history=20");
+    }
+
+    /// A create without `--connect` asks for nothing it was not given: the
+    /// parameter is absent rather than present and empty, which the far end
+    /// would read as a malformed assertion and refuse.
+    #[test]
+    fn a_create_mentions_a_connection_only_when_one_was_named() {
+        let slug: UserSlug = "alice".parse().unwrap();
+
+        assert_eq!(create_user_uri(&slug, None), "/auth/users/alice");
+        assert_eq!(
+            create_user_uri(&slug, Some(("spaceport-acme", "octocat"))),
+            "/auth/users/alice?connect=spaceport-acme%3Aoctocat"
+        );
+    }
+
+    /// The colon the far end splits on is the one this side wrote, and no
+    /// other. A handle is github's to validate, so anything at all may be
+    /// typed here — and a value that could write a second colon, or a `&` and
+    /// a parameter after it, would have the route bind an account nobody
+    /// named.
+    #[test]
+    fn a_connect_pair_cannot_write_a_parameter_or_a_second_colon_of_its_own() {
+        let uri = create_user_uri(
+            &"alice".parse().unwrap(),
+            Some(("spaceport-acme&suspend=true", "octo:cat")),
+        );
+
+        assert!(!uri.contains("&suspend="), "{uri}");
+        // One `?`, one `connect=`, and exactly one colon in what travels —
+        // this one's, percent-encoded, with the value's own encoded beside it.
+        assert_eq!(uri.matches('?').count(), 1, "{uri}");
+        assert!(!uri.contains(':'), "{uri}");
+        assert_eq!(uri.matches("%3A").count(), 2, "{uri}");
     }
 
     /// A path nothing has ever bound, for the tests that only ask what a

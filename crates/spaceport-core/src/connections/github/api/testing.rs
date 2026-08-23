@@ -6,7 +6,12 @@
 //! branch of it is at, and the mint
 //! that turns an installation into a token — and, since the App became the way
 //! people sign in, one scripted person: the code exchange that turns their
-//! authorization code into a token, and the `/user` family that token opens.
+//! authorization code into a token, and the `/user` family that token opens —
+//! and, separately from that person, whichever accounts a test says this GitHub
+//! hosts, read by handle the way an operator asserting a binding reads one —
+//! each of them public, or visible only through the one installation a test
+//! hid it behind, which is what an enterprise's member privacy looks like from
+//! outside.
 //! Requests never leave the process; the client is handed this as
 //! its [`Transport`] and there is no socket anywhere.
 //!
@@ -130,6 +135,11 @@ struct State {
     minted: usize,
     /// Answer every request with this status and body instead.
     refusal: Option<(StatusCode, String)>,
+    /// Answer just this one path with this status and body, and everything else
+    /// as usual. Apart from [`Self::refusal`] because a call that is really
+    /// several requests — list the installations, mint a token, then ask —
+    /// cannot be tested for what one of them does if all of them fail.
+    path_refusal: Option<(String, StatusCode, String)>,
     /// Refuse only what this app signs for, whoever else is being answered.
     refused_app: Option<i64>,
     /// Headers added to a refusal, for the rate limit's sake.
@@ -139,6 +149,22 @@ struct State {
     /// The app a manifest conversion hands back, for the tests that create one
     /// the way GitHub's manifest flow does.
     converted: Option<Value>,
+    /// The accounts `/users/{login}` knows, by handle.
+    ///
+    /// Empty to begin with, because a handle nothing has been said about is one
+    /// this GitHub answers `404` for — which is exactly what a mistyped handle
+    /// really gets, and what the operator-asserted binding reads as "no such
+    /// account".
+    accounts: HashMap<String, Account>,
+    /// Which installation each token minted here acts as, by the token itself.
+    ///
+    /// Kept so that an endpoint can answer differently depending on *whose*
+    /// token arrived, rather than merely on whether one did. Reading the
+    /// installation back out of the token's own text would work — the mint
+    /// spells it into the string — but it would make a fixture's shape into a
+    /// protocol, and a test that ever handed in a token of its own would get a
+    /// silent no-match instead of a miss.
+    minted_tokens: HashMap<String, i64>,
     /// The one person this GitHub will sign in, once a test scripts them.
     ///
     /// None to begin with, because a code exchange nothing has been said about
@@ -146,6 +172,26 @@ struct State {
     /// `200`-with-`error` answer, not as a path the fake forgot.
     user: Option<ScriptedUser>,
     requests: Vec<Recorded>,
+}
+
+/// An account `/users/{login}` holds, and who is allowed to see that it does.
+///
+/// Visibility is a property of the account rather than a separate list of
+/// hidden handles, because on real GitHub it is one: an enterprise with member
+/// privacy turned on does not hide the *handle*, it answers `404` to everybody
+/// reading from outside it. Modelling it as "the installations this is visible
+/// to, or everybody" lets one fixture say both things, and a test that says
+/// nothing about visibility gets the public account it meant.
+struct Account {
+    id: i64,
+    /// The installation whose token this account is visible to, or `None` for
+    /// an account anybody may read — including a request carrying no credential
+    /// at all.
+    ///
+    /// One installation rather than a set, because the thing worth modelling is
+    /// an account *some* installation can see and the others cannot, and a set
+    /// would only make a test spell out the arms it does not care about.
+    visible_to: Option<i64>,
 }
 
 /// A person a test has told this GitHub about: the code that signs them in,
@@ -199,10 +245,13 @@ impl FakeGitHub {
                 token_lifetime: TOKEN_LIFETIME,
                 minted: 0,
                 refusal: None,
+                path_refusal: None,
                 refused_app: None,
                 refusal_headers: Vec::new(),
                 endless: false,
                 converted: None,
+                accounts: HashMap::new(),
+                minted_tokens: HashMap::new(),
                 user: None,
                 requests: Vec::new(),
             }),
@@ -319,6 +368,17 @@ impl FakeGitHub {
         self.state.lock().unwrap().refusal = Some((status, body.to_owned()));
     }
 
+    /// Answer requests for exactly this path with this status and body, and go
+    /// on answering everything else.
+    ///
+    /// What [`Self::refuse_with`] cannot express, now that one client call may
+    /// be several requests: a test about what happens when the *last* of them
+    /// has a bad afternoon needs the earlier ones to work, and a GitHub that
+    /// refused everything would only ever exercise the first.
+    pub(crate) fn refuse_path_with(&self, path: &str, status: StatusCode, body: &str) {
+        self.state.lock().unwrap().path_refusal = Some((path.to_owned(), status, body.to_owned()));
+    }
+
     /// Stop accepting the credentials of the app `app_id`, and go on answering
     /// for every other app registered here.
     ///
@@ -360,6 +420,55 @@ impl FakeGitHub {
             "html_url": format!("https://github.com/apps/{slug}"),
         }));
         state.apps = vec![app(id, slug, name, "an-organisation")];
+    }
+
+    /// Say that `/users/{login}` answers, and with which numeric id.
+    ///
+    /// Apart from [`Self::signs_in`] on purpose, and the two are not the same
+    /// fact. That one scripts a person who signs in — a code, a token, and the
+    /// `/user` family that token opens — whereas this is a public read of an
+    /// account that may never have signed in at all and may never do so: it is
+    /// the account an operator names when binding somebody's github handle to a
+    /// user they created by hand. Making one script the other would mean a test
+    /// about binding a stranger had to invent a login for them.
+    pub(crate) fn hosts_account(&self, login: &str, id: i64) {
+        self.state.lock().unwrap().accounts.insert(
+            login.to_owned(),
+            Account {
+                id,
+                visible_to: None,
+            },
+        );
+    }
+
+    /// Say that `/users/{login}` answers only for a request carrying
+    /// installation `installation_id`'s token, and `404`s for everybody else.
+    ///
+    /// The enterprise this feature exists for: an organisation with member
+    /// privacy turned on shows its people to readers inside it and denies they
+    /// exist to readers outside. An App installed on two organisations sees
+    /// such an account through one installation and not the other, which is why
+    /// the visibility names an installation rather than being a flag — a flag
+    /// could only say "hidden from everybody", and an account hidden from
+    /// everybody is indistinguishable from one this GitHub was never told about.
+    pub(crate) fn hosts_account_visible_only_to(&self, login: &str, id: i64, installation_id: i64) {
+        self.state.lock().unwrap().accounts.insert(
+            login.to_owned(),
+            Account {
+                id,
+                visible_to: Some(installation_id),
+            },
+        );
+    }
+
+    /// Say that this App has been installed nowhere at all.
+    ///
+    /// The shape of a freshly connected spaceport whose App nobody has accepted
+    /// yet — which is a state a connection really passes through, and the one
+    /// where a call that would rather speak as an installation has none to
+    /// borrow.
+    pub(crate) fn is_installed_nowhere(&self) {
+        self.state.lock().unwrap().installations = Vec::new();
     }
 
     /// Script the person this GitHub signs in: `code` is what the login
@@ -476,6 +585,15 @@ impl FakeGitHub {
             return response.body(Bytes::from(body)).unwrap();
         }
 
+        if let Some((refused, status, body)) = state.path_refusal.clone()
+            && path == refused
+        {
+            return Response::builder()
+                .status(status)
+                .body(Bytes::from(body))
+                .unwrap();
+        }
+
         match path.split('/').collect::<Vec<_>>().as_slice() {
             // GitHub answers `/app` for whoever signed the request, so this
             // reads the `iss` claim off the token — without verifying it, for
@@ -588,12 +706,18 @@ impl FakeGitHub {
                 let expires_at = (OffsetDateTime::now_utc() + state.token_lifetime)
                     .format(&Rfc3339)
                     .unwrap();
+                // Unguessable in reality; here only distinct, so a test can
+                // tell a reused token from a re-minted one.
+                let token = format!("ghs-token-{installation}-{}", state.minted);
+                // Remembered against the installation it acts as, so that an
+                // endpoint answering per-installation can tell who arrived.
+                if let Ok(installation_id) = installation.parse::<i64>() {
+                    state.minted_tokens.insert(token.clone(), installation_id);
+                }
 
                 ok(
                     json!({
-                        // Unguessable in reality; here only distinct, so a test
-                        // can tell a reused token from a re-minted one.
-                        "token": format!("ghs-token-{installation}-{}", state.minted),
+                        "token": token,
                         "expires_at": expires_at,
                     }),
                     None,
@@ -669,6 +793,33 @@ impl FakeGitHub {
                 }
                 None => unauthorized(),
             },
+            // One account by handle. The endpoint needs no permission, so an
+            // account nothing has been said about the visibility of answers
+            // whoever asks — but one a test has hidden behind an installation
+            // answers only that installation's token, which is how an
+            // enterprise with member privacy really behaves. Nothing here
+            // refuses a request for carrying the *wrong* credential: on real
+            // GitHub a token this endpoint does not want is still a token it
+            // reads the public account with.
+            ["", "users", login] => match state.accounts.get(*login) {
+                Some(account) if visible(account, &state, request) => ok(
+                    json!({
+                        "id": account.id,
+                        "login": login,
+                        // A field spaceport does not know, for the same reason
+                        // `/app` carries one.
+                        "html_url": format!("https://github.com/{login}"),
+                    }),
+                    None,
+                ),
+                // A handle nobody has been told about — a typo, a renamed
+                // account, a deleted one — or one this reader may not see,
+                // which GitHub deliberately makes the same answer.
+                _ => Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Bytes::from_static(br#"{"message":"Not Found"}"#))
+                    .unwrap(),
+            },
             // The manifest conversion, which carries no credential at all: the
             // one-time code in the path is the whole of it.
             ["", "app-manifests", _code, "conversions"] => match state.converted.clone() {
@@ -737,6 +888,29 @@ fn signed_in<'a>(state: &'a State, request: &Request<Bytes>) -> Option<&'a Scrip
             .and_then(|value| value.to_str().ok())
             == Some(format!("Bearer {}", user.token).as_str())
     })
+}
+
+/// Whether the reader making this request may see that `account` exists.
+///
+/// An account no test has hidden is visible to everybody, credential or none.
+/// A hidden one is visible only through the installation it was hidden behind,
+/// which is the reader standing inside the enterprise.
+fn visible(account: &Account, state: &State, request: &Request<Bytes>) -> bool {
+    account
+        .visible_to
+        .is_none_or(|installation| presented_by(state, request) == Some(installation))
+}
+
+/// The installation whose minted token a request presents, if it presents one.
+fn presented_by(state: &State, request: &Request<Bytes>) -> Option<i64> {
+    let token = request
+        .headers()
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("token ")?;
+
+    state.minted_tokens.get(token).copied()
 }
 
 /// GitHub's `401`, which is what a wrong or missing user token gets.

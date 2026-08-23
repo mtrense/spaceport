@@ -1197,7 +1197,7 @@ mod tests {
     #[tokio::test]
     async fn a_minted_code_redeems_into_a_listed_session() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
 
         let minted = mint(&sessions, "alice").await;
         let fresh = sessions.redeem(&minted.code).await.unwrap();
@@ -1215,7 +1215,7 @@ mod tests {
     #[tokio::test]
     async fn a_code_redeems_exactly_once() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
         let minted = mint(&sessions, "alice").await;
 
         sessions.redeem(&minted.code).await.unwrap();
@@ -1233,8 +1233,8 @@ mod tests {
     #[tokio::test]
     async fn a_guess_that_matches_no_code_charges_none_of_them() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
-        users.create(&slug("bob"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
+        users.create(&slug("bob"), None, None).await.unwrap();
         let alice = mint(&sessions, "alice").await;
         let bob = mint(&sessions, "bob").await;
 
@@ -1257,8 +1257,8 @@ mod tests {
     #[tokio::test]
     async fn a_failed_guess_at_a_known_code_charges_that_code_alone() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
-        users.create(&slug("bob"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
+        users.create(&slug("bob"), None, None).await.unwrap();
         let alice = mint(&sessions, "alice").await;
         let bob = mint(&sessions, "bob").await;
         suspend_behind_the_cascade(&sessions).await;
@@ -1277,8 +1277,8 @@ mod tests {
     #[tokio::test]
     async fn five_failed_attempts_kill_the_code_they_were_aimed_at_and_no_other() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
-        users.create(&slug("bob"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
+        users.create(&slug("bob"), None, None).await.unwrap();
         let alice = mint(&sessions, "alice").await;
         let bob = mint(&sessions, "bob").await;
         suspend_behind_the_cascade(&sessions).await;
@@ -1306,7 +1306,7 @@ mod tests {
     #[tokio::test]
     async fn a_code_survives_four_failed_attempts() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
         let minted = mint(&sessions, "alice").await;
         suspend_behind_the_cascade(&sessions).await;
 
@@ -1325,7 +1325,7 @@ mod tests {
     #[tokio::test]
     async fn an_expired_code_is_refused() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
         let minted = mint(&sessions, "alice").await;
         expire(&sessions, "login_codes", "code_expires_at").await;
 
@@ -1339,7 +1339,7 @@ mod tests {
     #[tokio::test]
     async fn an_expired_session_is_neither_listed_nor_logged_out() {
         let (users, sessions, log) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
         let minted = mint(&sessions, "alice").await;
         let fresh = sessions.redeem(&minted.code).await.unwrap();
         expire(&sessions, "sessions", "expires_at").await;
@@ -1360,7 +1360,7 @@ mod tests {
     #[tokio::test]
     async fn suspending_a_user_kills_their_sessions_and_pending_codes() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
         let spent = mint(&sessions, "alice").await;
         sessions.redeem(&spent.code).await.unwrap();
         let pending = mint(&sessions, "alice").await;
@@ -1380,7 +1380,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_a_user_takes_their_sessions_and_codes_with_them() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
         let minted = mint(&sessions, "alice").await;
         sessions.redeem(&minted.code).await.unwrap();
         mint(&sessions, "alice").await;
@@ -1394,7 +1394,7 @@ mod tests {
     #[tokio::test]
     async fn minting_for_a_suspended_user_is_refused() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
         users.suspend(&by_slug("alice")).await.unwrap();
 
         let error = sessions
@@ -1428,7 +1428,7 @@ mod tests {
     #[tokio::test]
     async fn drops_one_session_by_id_and_leaves_the_other() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
         let first = mint(&sessions, "alice").await;
         let first = sessions.redeem(&first.code).await.unwrap();
         let second = mint(&sessions, "alice").await;
@@ -1449,7 +1449,7 @@ mod tests {
     #[tokio::test]
     async fn drops_every_session_when_no_id_is_named() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
         for _ in 0..2 {
             let minted = mint(&sessions, "alice").await;
             sessions.redeem(&minted.code).await.unwrap();
@@ -1469,7 +1469,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_a_session_the_user_does_not_have_says_so() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
 
         let ghost: SessionId = "00000000000000aa".parse().unwrap();
         let error = sessions
@@ -1483,7 +1483,7 @@ mod tests {
     #[tokio::test]
     async fn logout_drops_the_session_the_token_names() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
         let minted = mint(&sessions, "alice").await;
         let fresh = sessions.redeem(&minted.code).await.unwrap();
 
@@ -1500,7 +1500,7 @@ mod tests {
     #[tokio::test]
     async fn every_mutation_is_recorded_in_the_log() {
         let (users, sessions, log) = repositories();
-        let alice = users.create(&slug("alice"), None).await.unwrap();
+        let alice = users.create(&slug("alice"), None, None).await.unwrap();
         let minted = mint(&sessions, "alice").await;
         let _ = sessions.redeem(&Secret::new("wrongcod")).await;
         sessions.redeem(&minted.code).await.unwrap();
@@ -1562,7 +1562,7 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_and_a_dead_code_refuse_identically() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
         let minted = mint(&sessions, "alice").await;
         sessions.redeem(&minted.code).await.unwrap();
 
@@ -1577,7 +1577,7 @@ mod tests {
     #[tokio::test]
     async fn minting_sweeps_expired_codes_away() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("alice"), None).await.unwrap();
+        users.create(&slug("alice"), None, None).await.unwrap();
         mint(&sessions, "alice").await;
         expire(&sessions, "login_codes", "code_expires_at").await;
 

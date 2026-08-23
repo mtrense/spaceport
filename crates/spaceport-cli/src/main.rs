@@ -17,9 +17,9 @@ use spaceport_core::app::{
     reconcile, supervise,
 };
 use spaceport_core::auth::{
-    AuthLogRepository, Condition, EntitlementRepository, IdentityRepository, JwtCache, JwtSigner,
-    MappingRepository, RevokeScope, RoleAtApp, RolesAtApp, SessionId, SessionRepository,
-    SsoRepository, UserId, UserRef, UserRepository, UserSlug, jwt,
+    AccountAtConnection, AuthLogRepository, Condition, EntitlementRepository, IdentityRepository,
+    JwtCache, JwtSigner, MappingRepository, RevokeScope, RoleAtApp, RolesAtApp, SessionId,
+    SessionRepository, SsoRepository, UserId, UserRef, UserRepository, UserSlug, jwt,
 };
 use spaceport_core::build;
 use spaceport_core::build::dir::BuildDir;
@@ -579,6 +579,33 @@ enum UserCommand {
     List(UserListArgs),
     /// Create a user, minting the id it keeps for life.
     Create(UserCreateArgs),
+    /// Assert that a user is a particular account at an IdP connection.
+    ///
+    /// This is an operator stating, under their own authority, who this
+    /// spaceport user is at that connection — the same kind of assertion
+    /// `--email` is, and it lands in the auth event log as one. The handle is
+    /// resolved to the IdP's stable id for the account at that moment and the
+    /// binding is stored against the id, never the handle: handles are
+    /// renameable and reusable, and a link made on one would follow the name
+    /// to whoever holds it next. A handle the IdP does not know is refused
+    /// outright, rather than stored as a binding that would silently never
+    /// match anybody.
+    ///
+    /// It grants nothing. Entitlements still come from `grant` or from the
+    /// mapping rules, and nothing a JWT already carries changes. What it does
+    /// is let that person sign in through the connection and arrive as this
+    /// user, with no mapping rule needing to match them — which is what makes
+    /// it the thing to run after creating an account by hand, before its owner
+    /// first signs in and a stranger is minted beside it.
+    Connect(UserConnectArgs),
+    /// Take that assertion back: the user is nobody at that connection.
+    ///
+    /// Only the link goes — the user, their entitlements and their sessions
+    /// are untouched, because the binding never granted any of them. This is
+    /// also what to run before re-pointing a user at a different account
+    /// there: a user holds at most one identity per connection, so `connect`
+    /// over an existing binding is refused rather than silently re-aimed.
+    Disconnect(UserDisconnectArgs),
     /// Suspend a user, keeping the record but letting nothing in.
     Suspend(UserRefArgs),
     /// Let a suspended user back in.
@@ -609,6 +636,44 @@ struct UserCreateArgs {
     /// IdP login links through.
     #[arg(long, value_name = "ADDR")]
     email: Option<String>,
+
+    /// The account this user is at an IdP connection, as
+    /// `<connection>:<login>`.
+    ///
+    /// `spaceport auth user connect` folded into the creation, and everything
+    /// its help says holds here. Folded rather than left to a second command
+    /// because the two writes share one commit: the handle is resolved before
+    /// anything is written, and a handle the IdP does not know fails the whole
+    /// command — so there is never a user sitting there unbound because the
+    /// second half of the job was refused.
+    #[arg(long, value_name = "CONNECTION:LOGIN")]
+    connect: Option<AccountAtConnection>,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
+struct UserConnectArgs {
+    /// The user, as a slug or a user id.
+    user: UserRef,
+
+    /// The account they are, as `<connection>:<login>` — the connection as
+    /// `spaceport connect list` prints it, and the handle at it.
+    account: AccountAtConnection,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
+struct UserDisconnectArgs {
+    /// The user, as a slug or a user id.
+    user: UserRef,
+
+    /// The connection to forget them at, as `spaceport connect list` prints
+    /// it. `spaceport auth audit <user>` says which they hold.
+    connection: String,
 
     #[command(flatten)]
     server: ServerArgs,
@@ -1055,6 +1120,8 @@ async fn main() -> Result<()> {
             AuthCommand::User(args) => match args.command {
                 UserCommand::List(args) => user_list(args, colour).await,
                 UserCommand::Create(args) => user_create(args, colour).await,
+                UserCommand::Connect(args) => user_connect(args, colour).await,
+                UserCommand::Disconnect(args) => user_disconnect(args, colour).await,
                 UserCommand::Suspend(args) => user_suspend(args, colour).await,
                 UserCommand::Resume(args) => user_resume(args, colour).await,
                 UserCommand::Drop(args) => user_drop(args, colour).await,
@@ -1676,7 +1743,45 @@ async fn user_create(args: UserCreateArgs, colour: Colour) -> Result<()> {
     print!(
         "{}",
         render::prose::block(
-            &client::auth_user_create(&args.server.operator()?, &args.slug, args.email.as_deref())
+            &client::auth_user_create(
+                &args.server.operator()?,
+                &args.slug,
+                args.email.as_deref(),
+                args.connect
+                    .as_ref()
+                    .map(|account| (account.connection.as_str(), account.login.as_str())),
+            )
+            .await?,
+            colour
+        )
+    );
+
+    Ok(())
+}
+
+async fn user_connect(args: UserConnectArgs, colour: Colour) -> Result<()> {
+    print!(
+        "{}",
+        render::prose::block(
+            &client::auth_user_connect(
+                &args.server.operator()?,
+                &args.user,
+                &args.account.connection,
+                &args.account.login,
+            )
+            .await?,
+            colour
+        )
+    );
+
+    Ok(())
+}
+
+async fn user_disconnect(args: UserDisconnectArgs, colour: Colour) -> Result<()> {
+    print!(
+        "{}",
+        render::prose::block(
+            &client::auth_user_disconnect(&args.server.operator()?, &args.user, &args.connection)
                 .await?,
             colour
         )
@@ -2351,6 +2456,83 @@ mod tests {
         assert_eq!(
             timeout_from(Ok("2m".to_owned())).unwrap(),
             Duration::from_secs(120),
+        );
+    }
+
+    /// Clap's own audit of the whole tree — duplicate flags, arguments that
+    /// name a group nothing defines, a subcommand whose short flag collides
+    /// with its parent's. Every one of those panics the first time an operator
+    /// runs the command that carries it, and only that operator would find out.
+    #[test]
+    fn offers_a_command_tree_clap_can_build() {
+        use clap::CommandFactory as _;
+
+        Cli::command().debug_assert();
+    }
+
+    /// The identity commands, parsed the way they are typed: the
+    /// `<connection>:<login>` argument is split before anything crosses the
+    /// socket, on `connect` and folded into `create` alike.
+    #[test]
+    fn reads_which_account_at_which_connection_an_operator_asserted() {
+        let parsed = Cli::try_parse_from([
+            "spaceport",
+            "auth",
+            "user",
+            "connect",
+            "alice",
+            "spaceport-for-acme:octo-alice",
+        ])
+        .unwrap();
+        let Command::Auth {
+            command:
+                AuthCommand::User(UserArgs {
+                    command: UserCommand::Connect(args),
+                }),
+        } = parsed.command
+        else {
+            panic!("`auth user connect` parsed as something else");
+        };
+        assert_eq!(args.user.to_string(), "alice");
+        assert_eq!(args.account.connection, "spaceport-for-acme");
+        assert_eq!(args.account.login, "octo-alice");
+
+        let parsed = Cli::try_parse_from([
+            "spaceport",
+            "auth",
+            "user",
+            "create",
+            "alice",
+            "--connect",
+            "spaceport-for-acme:octo-alice",
+        ])
+        .unwrap();
+        let Command::Auth {
+            command:
+                AuthCommand::User(UserArgs {
+                    command: UserCommand::Create(args),
+                }),
+        } = parsed.command
+        else {
+            panic!("`auth user create` parsed as something else");
+        };
+        assert_eq!(
+            args.connect.map(|account| account.to_string()).as_deref(),
+            Some("spaceport-for-acme:octo-alice"),
+        );
+
+        // And a handle with no connection in front of it never becomes a
+        // request: there would be nothing to resolve it against.
+        assert!(
+            Cli::try_parse_from([
+                "spaceport",
+                "auth",
+                "user",
+                "connect",
+                "alice",
+                "octo-alice"
+            ])
+            .is_err()
         );
     }
 

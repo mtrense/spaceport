@@ -16,6 +16,21 @@
 //! and `mapping test` says so in as many words rather than pretending an
 //! empty answer is a real one.
 //!
+//! An identity may also arrive without a login behind it: an operator who
+//! knows that alice is `octo-alice` at a connection may assert the binding
+//! themselves, with `auth user connect` or with `auth user create --connect`,
+//! so that alice's first login lands on the account they already prepared
+//! rather than minting a stranger beside it. Such a row carries no attributes
+//! and no last login, and says so — see [`IdentityRecord::last_login_at`].
+//!
+//! A binding deliberately grants nothing. It says who somebody is, never what
+//! they may do: no entitlement is written, no mapping rule is consulted, and
+//! no cached JWT is purged, because nothing a JWT already carries got narrower
+//! or wider. Whatever a bound user may reach is exactly what an operator
+//! granted them by hand or what a mapping rule gives them at their next
+//! login — and that separation is the point, since a binding is an assertion
+//! about identity made at the unix socket, not an authorisation decision.
+//!
 //! [`evaluate`] is the one piece both halves meet in, and it is deliberately a
 //! pure function: the login re-sync that lands later must apply exactly the
 //! judgement `mapping test` previews, and two implementations would be two
@@ -31,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use super::log::{OPERATOR_ORIGIN, record_in};
-use super::{Role, UserId, uuid_v4};
+use super::{IdentityError, Role, UserId, uuid_v4};
 use crate::app::AppId;
 use crate::state::{Db, now};
 
@@ -596,6 +611,96 @@ impl MappingRepository {
     }
 }
 
+/// One account at one connection, as `auth user connect` names it:
+/// `<connection>:<login>`.
+///
+/// A type of its own rather than a bare `String` the handler pulls apart, for
+/// [`super::entitlement::RoleAtApp`]'s reason and one more: the spelling is
+/// parsed in exactly one place, and a parse the CLI runs is a parse that makes
+/// `--help` and the refusal honest. Clap prints the type's name where the
+/// value goes and rejects a malformed one with the sentence below, so an
+/// operator who typed `octo-alice` learns which connection they forgot to name
+/// before anything reaches the socket — a `String` argument would have carried
+/// the same mistake across it and let the far end explain it after a round trip
+/// to github.com.
+///
+/// The connection half is held to nothing beyond being non-empty, exactly as
+/// `mapping add --via` is: which slugs exist is the connection store's
+/// knowledge, and this side guessing at the alphabet github mints app slugs in
+/// would only refuse a connection that works.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountAtConnection {
+    /// The connection slug, as `spaceport connect list` prints it.
+    pub connection: String,
+    /// The handle at that connection — what a human recognises the account by,
+    /// and never what the binding it becomes is keyed on: see
+    /// [`AssertedIdentity::external_id`].
+    pub login: String,
+}
+
+impl FromStr for AccountAtConnection {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let Some((connection, login)) = s.split_once(':') else {
+            bail!(
+                "`{s}` does not name an account at a connection — one looks like \
+                 `spaceport-for-acme:octo-alice`, where the first half is a connection as \
+                 `spaceport connect list` prints it"
+            );
+        };
+        if connection.is_empty() {
+            bail!("`{s}` names no connection — one looks like `spaceport-for-acme:octo-alice`");
+        }
+        if login.is_empty() {
+            bail!("`{s}` names no account at `{connection}` — the handle goes after the colon");
+        }
+        // Split on the *first* colon, and then refuse a second rather than
+        // folding it into the handle: no IdP spaceport speaks to mints handles
+        // carrying one, so a second colon is a mistyped value, and a binding
+        // made from it would resolve against github, fail, and blame a handle
+        // the operator never meant to assert.
+        if login.contains(':') {
+            bail!("`{s}` carries a second colon — a handle has none, so this names no account");
+        }
+
+        Ok(Self {
+            connection: connection.to_owned(),
+            login: login.to_owned(),
+        })
+    }
+}
+
+impl fmt::Display for AccountAtConnection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.connection, self.login)
+    }
+}
+
+/// The identity an operator asserts somebody holds: which connection, which
+/// account there, under which handle.
+///
+/// A struct rather than three more arguments, for the reason
+/// [`super::sso::SsoLogin`] gives: three strings in a row is a call site that
+/// swapped two and still compiled. It lives here rather than beside the user
+/// pool because both writers need it — [`IdentityRepository::bind`] on its
+/// own, and [`super::UserRepository::create`] inside the commit that mints the
+/// user — and a second spelling in the other module would be a second opinion
+/// about what an assertion carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssertedIdentity {
+    /// The connection slug, as `spaceport connect list` prints it — a GitHub
+    /// App slug, never the literal `github`, because a host may hold several.
+    pub connection: String,
+    /// The IdP's stable id for the account, as text. What the binding is
+    /// *keyed* by: handles are renameable and reassignable, and a binding made
+    /// on one would follow the name to whoever holds it next.
+    pub external_id: String,
+    /// The handle beside it, resolved at the moment of the assertion, so that
+    /// a human reading an audit recognises the account the id names.
+    pub external_login: String,
+}
+
 /// One identity as the `idp_identities` table stores it, minus the user it
 /// belongs to — a read is always about one user, exactly as an entitlement
 /// read is.
@@ -611,7 +716,13 @@ pub struct IdentityRecord {
     /// What the IdP asserted at the last login: the snapshot `mapping test`
     /// replays.
     pub attributes: Attributes,
-    pub last_login_at: String,
+    /// When somebody last signed in through this identity, or `None` when
+    /// nobody ever has — an operator asserted the binding with `auth user
+    /// connect` and the person it names has not arrived yet. Absent rather
+    /// than stamped with the moment of the assertion, because a timestamp
+    /// there would claim a login that never happened, and `mapping test`
+    /// would then replay an empty snapshot as though a login had carried it.
+    pub last_login_at: Option<String>,
 }
 
 /// The `idp_identities` table, in the vocabulary of recording a login and
@@ -697,7 +808,7 @@ impl IdentityRepository {
     pub async fn for_user(&self, user: &UserId) -> Result<Vec<IdentityRecord>> {
         let user = user.clone();
 
-        let rows: Vec<(String, String, String, String, String)> = self
+        let rows: Vec<(String, String, String, String, Option<String>)> = self
             .db
             .call(move |connection| {
                 let mut statement = connection
@@ -749,6 +860,270 @@ impl IdentityRepository {
             )
             .collect())
     }
+
+    /// Assert that `user` is `identity`, on its own commit — the write
+    /// `spaceport auth user connect` makes.
+    ///
+    /// The wrapper around [`bind_in`] for the caller that has nothing else to
+    /// write; creating a user with the binding attached goes the other way
+    /// round, through [`super::UserRepository::create`], so that the user and
+    /// the identity share one commit.
+    pub async fn bind(
+        &self,
+        user: &UserId,
+        identity: &AssertedIdentity,
+    ) -> Result<(), IdentityError> {
+        let user = user.clone();
+        let identity = identity.clone();
+        let logged = identity.clone();
+
+        let outcome = self
+            .db
+            .call(move |db| {
+                let transaction = db.transaction().context("beginning to bind an identity")?;
+
+                if let Err(refusal) = bind_in(&transaction, &now(), &user, &identity) {
+                    // Dropped unfinished rather than committed: a refusal must
+                    // leave the table exactly as it found it, and the read that
+                    // found the conflict happened inside this very transaction.
+                    return Ok(Err(refusal));
+                }
+
+                transaction
+                    .commit()
+                    .context("committing an identity binding")?;
+
+                Ok(Ok(()))
+            })
+            .await
+            .map_err(IdentityError::Failed)?;
+        outcome?;
+
+        info!(
+            connection = %logged.connection,
+            external_login = %logged.external_login,
+            "identity bound"
+        );
+
+        Ok(())
+    }
+
+    /// Take back a binding: `user` is nobody at `connection` any more.
+    ///
+    /// The write `spaceport auth user disconnect` makes, and the one an
+    /// operator must make before re-pointing a user at a different account
+    /// there. Only the link goes — the user, their entitlements and their
+    /// sessions are untouched, because a binding never granted any of them.
+    /// A binding that was not there to remove is [`IdentityError::NotBound`]
+    /// rather than a quiet success: an operator told that a link is gone has
+    /// to be able to believe it was there.
+    pub async fn unbind(&self, user: &UserId, connection: &str) -> Result<(), IdentityError> {
+        let user = user.clone();
+        let connection_slug = connection.to_owned();
+        let named = connection.to_owned();
+
+        let outcome = self
+            .db
+            .call(move |db| {
+                let transaction = db
+                    .transaction()
+                    .context("beginning to unbind an identity")?;
+
+                // Read before deleting, so the log entry can name the account
+                // that was let go — after the delete, this row is the only
+                // place that pairing existed.
+                let held: Option<(String, String)> = transaction
+                    .query_row(
+                        "SELECT external_id, external_login FROM idp_identities
+                         WHERE user_id = ?1 AND connection = ?2",
+                        rusqlite::params![user.as_str(), connection_slug],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .context("looking an identity binding up")?;
+                let Some((external_id, external_login)) = held else {
+                    return Ok(Err(IdentityError::NotBound(anyhow!(
+                        "user `{user}` holds no identity at connection `{connection_slug}` — \
+                         `spaceport auth audit {user}` says which they hold"
+                    ))));
+                };
+
+                transaction
+                    .execute(
+                        "DELETE FROM idp_identities WHERE user_id = ?1 AND connection = ?2",
+                        rusqlite::params![user.as_str(), connection_slug],
+                    )
+                    .context("unbinding an identity")?;
+
+                record_in(
+                    &transaction,
+                    &now(),
+                    "identity.unbound",
+                    Some(&user),
+                    OPERATOR_ORIGIN,
+                    Some(&binding_detail(
+                        &connection_slug,
+                        &external_login,
+                        &external_id,
+                    )),
+                )?;
+
+                transaction
+                    .commit()
+                    .context("committing an identity unbinding")?;
+
+                Ok(Ok(()))
+            })
+            .await
+            .map_err(IdentityError::Failed)?;
+        outcome?;
+
+        info!(connection = %named, "identity unbound");
+
+        Ok(())
+    }
+}
+
+/// Assert that `user` is `identity`, inside the caller's transaction.
+///
+/// A function over a transaction for [`record_in`]'s reason turned round: the
+/// binding and the `identity.bound` entry that records it must commit
+/// together, and so must whatever else the caller is writing — creating a user
+/// with `--connect` is one commit or it is a user whose binding silently did
+/// not happen.
+///
+/// The two conflicts are *read* first, in this transaction, rather than left to
+/// the unique indexes and untangled from a constraint violation afterwards.
+/// That is [`IdentityRepository::record`]'s argument in the other direction:
+/// two uniqueness claims can each be the one that fires — the external account
+/// already vouching for somebody else, and this user already being somebody
+/// else here — and a single `ON CONFLICT` clause can catch only one of them,
+/// so an insert-then-map would have to guess which refusal to print. They are
+/// different refusals with different remedies, and each gets its own sentence.
+///
+/// Asserting a binding that already exists is not an error. It refreshes the
+/// stored handle and records the assertion, rather than being dropped as a
+/// no-op: the handle is renameable, so re-asserting is exactly how an operator
+/// corrects one that has moved on, and the log records the commands that were
+/// given — [`super::UserRepository::suspend`] makes the same argument about a
+/// second suspend. What it never touches is `last_login_at`: an assertion is
+/// not a login, so an identity somebody has signed in through keeps the
+/// timestamp that says so.
+pub(super) fn bind_in(
+    transaction: &Transaction<'_>,
+    at: &str,
+    user: &UserId,
+    identity: &AssertedIdentity,
+) -> Result<(), IdentityError> {
+    let AssertedIdentity {
+        connection,
+        external_id,
+        external_login,
+    } = identity;
+
+    let vouches_for: Option<String> = transaction
+        .query_row(
+            "SELECT user_id FROM idp_identities WHERE connection = ?1 AND external_id = ?2",
+            rusqlite::params![connection, external_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("checking who an external account already vouches for")
+        .map_err(IdentityError::Failed)?;
+
+    if let Some(holder) = &vouches_for
+        && holder != user.as_str()
+    {
+        let named = names(transaction, holder).map_err(IdentityError::Failed)?;
+        return Err(IdentityError::AccountBoundElsewhere(anyhow!(
+            "`{external_login}` (`{external_id}`) at connection `{connection}` is already user \
+             `{named}` — one external account vouches for one user, so disconnect it there first"
+        )));
+    }
+
+    let holds: Option<String> = transaction
+        .query_row(
+            "SELECT external_id FROM idp_identities WHERE user_id = ?1 AND connection = ?2",
+            rusqlite::params![user.as_str(), connection],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("checking which identity a user already holds on this connection")
+        .map_err(IdentityError::Failed)?;
+
+    if let Some(held) = &holds
+        && held != external_id
+    {
+        let named = names(transaction, user.as_str()).map_err(IdentityError::Failed)?;
+        return Err(IdentityError::AlreadyBound(anyhow!(
+            "user `{named}` is already external id `{held}` at connection `{connection}` — \
+             re-pointing a binding is never implicit, so run `spaceport auth user disconnect \
+             {named} {connection}` first"
+        )));
+    }
+
+    match vouches_for {
+        // The same assertion again: only the renameable half can have moved,
+        // and the login timestamp is none of an assertion's business.
+        Some(_) => transaction
+            .execute(
+                "UPDATE idp_identities SET external_login = ?3
+                 WHERE connection = ?1 AND external_id = ?2",
+                rusqlite::params![connection, external_id, external_login],
+            )
+            .context("refreshing an asserted identity's handle"),
+        // Never signed in through, and asserting nothing about them: no
+        // attributes to replay, and a `last_login_at` of NULL that says as
+        // much rather than claiming a login that did not happen.
+        None => transaction
+            .execute(
+                "INSERT INTO idp_identities
+                     (user_id, connection, external_id, external_login, attributes,
+                      last_login_at)
+                 VALUES (?1, ?2, ?3, ?4, '{}', NULL)",
+                rusqlite::params![user.as_str(), connection, external_id, external_login],
+            )
+            .context("binding an identity"),
+    }
+    .map_err(IdentityError::Failed)?;
+
+    record_in(
+        transaction,
+        at,
+        "identity.bound",
+        Some(user),
+        OPERATOR_ORIGIN,
+        Some(&binding_detail(connection, external_login, external_id)),
+    )
+    .map_err(IdentityError::Failed)?;
+
+    Ok(())
+}
+
+/// What a binding's log entry says: the connection, the handle a human
+/// recognises, and the id the row is actually keyed by — worded once, because
+/// `identity.bound` and `identity.unbound` are the same fact arriving and
+/// leaving.
+fn binding_detail(connection: &str, external_login: &str, external_id: &str) -> String {
+    format!("connection `{connection}`, `{external_login}` (`{external_id}`)")
+}
+
+/// The slug a refusal calls a user by, falling back to the id.
+///
+/// A refusal names whoever the operator would have to go and fix, and they
+/// typed a slug — but a row whose user has no slug to find is not a reason to
+/// refuse to explain the conflict, so the id stands in.
+fn names(transaction: &Transaction<'_>, user: &str) -> Result<String> {
+    let slug: Option<String> = transaction
+        .query_row(
+            "SELECT user_slug FROM users WHERE user_id = ?1",
+            rusqlite::params![user],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("naming the user a binding conflicts with")?;
+
+    Ok(slug.unwrap_or_else(|| user.to_owned()))
 }
 
 /// Delete every identity of `user`, inside the caller's transaction.
@@ -875,6 +1250,16 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// What an operator asserts, already resolved to a numeric id — the
+    /// handle-to-id lookup happens against the IdP, above this seam.
+    fn asserted(connection: &str, external_id: &str, external_login: &str) -> AssertedIdentity {
+        AssertedIdentity {
+            connection: connection.to_owned(),
+            external_id: external_id.to_owned(),
+            external_login: external_login.to_owned(),
+        }
+    }
+
     fn attributes(pairs: &[(&str, &[&str])]) -> Attributes {
         pairs
             .iter()
@@ -973,6 +1358,47 @@ mod tests {
         for broken in ["org", "=value", "org="] {
             assert!(broken.parse::<Condition>().is_err(), "accepted `{broken}`");
         }
+    }
+
+    /// `<connection>:<login>`, the spelling `auth user connect` takes: the
+    /// colon splits a connection from a handle, and both halves have to be
+    /// there.
+    #[test]
+    fn parses_an_account_at_a_connection() {
+        let parsed = "spaceport-for-acme:octo-alice"
+            .parse::<AccountAtConnection>()
+            .unwrap();
+        assert_eq!(parsed.connection, "spaceport-for-acme");
+        assert_eq!(parsed.login, "octo-alice");
+        assert_eq!(parsed.to_string(), "spaceport-for-acme:octo-alice");
+    }
+
+    /// Every way of getting it wrong that clap has to catch before a round
+    /// trip to github.com happens: a bare handle names no connection to
+    /// resolve it against, an empty half names nobody, and a second colon
+    /// makes a handle no IdP could ever mint.
+    #[test]
+    fn refuses_a_value_that_names_no_account_at_a_connection() {
+        for broken in [
+            "octo-alice",
+            "",
+            ":octo-alice",
+            "spaceport-for-acme:",
+            "spaceport-for-acme:octo:alice",
+        ] {
+            assert!(
+                broken.parse::<AccountAtConnection>().is_err(),
+                "accepted `{broken}`",
+            );
+        }
+
+        // And the refusal shows the shape, because an operator who mistyped it
+        // once has nothing else to go on.
+        let err = "octo-alice"
+            .parse::<AccountAtConnection>()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("spaceport-for-acme:octo-alice"), "{err}");
     }
 
     #[tokio::test]
@@ -1116,8 +1542,8 @@ mod tests {
     async fn dropping_a_rule_takes_its_entitlements_and_only_its() {
         let (db, users, mappings, _, log) = repositories();
         plant_connection(&db, "spaceport-acme").await;
-        let alice = users.create(&slug("alice"), None).await.unwrap();
-        let bob = users.create(&slug("bob"), None).await.unwrap();
+        let alice = users.create(&slug("alice"), None, None).await.unwrap();
+        let bob = users.create(&slug("bob"), None, None).await.unwrap();
         let added = mappings
             .add(
                 "spaceport-acme",
@@ -1250,7 +1676,7 @@ mod tests {
     #[tokio::test]
     async fn records_an_identity_and_reads_it_back() {
         let (_, users, _, identities, _) = repositories();
-        let alice = users.create(&slug("alice"), None).await.unwrap();
+        let alice = users.create(&slug("alice"), None, None).await.unwrap();
 
         identities
             .record(
@@ -1269,11 +1695,8 @@ mod tests {
         assert_eq!(held[0].external_id, "583231");
         assert_eq!(held[0].external_login, "octo-alice");
         assert_eq!(held[0].attributes["org"], ["acme-corp"]);
-        assert!(
-            held[0].last_login_at.ends_with('Z'),
-            "{}",
-            held[0].last_login_at
-        );
+        let stamped = held[0].last_login_at.as_deref().unwrap();
+        assert!(stamped.ends_with('Z'), "{stamped}");
     }
 
     /// A re-login replaces the snapshot rather than sitting beside it: one
@@ -1281,7 +1704,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_login_replaces_the_snapshot() {
         let (_, users, _, identities, _) = repositories();
-        let alice = users.create(&slug("alice"), None).await.unwrap();
+        let alice = users.create(&slug("alice"), None, None).await.unwrap();
         identities
             .record(
                 &alice.id,
@@ -1316,7 +1739,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_a_user_takes_their_identity_and_suspending_does_not() {
         let (_, users, _, identities, _) = repositories();
-        let alice = users.create(&slug("alice"), None).await.unwrap();
+        let alice = users.create(&slug("alice"), None, None).await.unwrap();
         identities
             .record(
                 &alice.id,
@@ -1336,5 +1759,230 @@ mod tests {
             .await
             .unwrap();
         assert!(identities.for_user(&alice.id).await.unwrap().is_empty());
+    }
+
+    /// An operator's assertion, as the table keeps one: the account it names
+    /// and nothing else — no attributes to replay and no login to claim.
+    #[tokio::test]
+    async fn binds_an_identity_nobody_has_signed_in_through() {
+        let (_, users, _, identities, log) = repositories();
+        let alice = users.create(&slug("alice"), None, None).await.unwrap();
+
+        identities
+            .bind(
+                &alice.id,
+                &asserted("spaceport-acme", "583231", "octo-alice"),
+            )
+            .await
+            .unwrap();
+
+        let held = identities.for_user(&alice.id).await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].external_id, "583231");
+        assert_eq!(held[0].external_login, "octo-alice");
+        assert!(held[0].attributes.is_empty());
+        assert_eq!(held[0].last_login_at, None);
+        // And the assertion is in the log, as the operator's own act.
+        let entries = log.entries(None).await.unwrap();
+        assert_eq!(entries[1].kind, "identity.bound");
+        assert_eq!(entries[1].origin, OPERATOR_ORIGIN);
+        assert_eq!(entries[1].user.as_deref(), Some(alice.id.as_str()));
+        let detail = entries[1].detail.as_deref().unwrap();
+        assert!(detail.contains("spaceport-acme"), "{detail}");
+        assert!(detail.contains("octo-alice"), "{detail}");
+        assert!(detail.contains("583231"), "{detail}");
+    }
+
+    /// One external account vouches for one user. Binding it a second time
+    /// would leave two users a single login could resolve to, which is the
+    /// ambiguity the whole feature exists to avoid.
+    #[tokio::test]
+    async fn refuses_an_account_that_already_vouches_for_somebody_else() {
+        let (_, users, _, identities, log) = repositories();
+        let alice = users.create(&slug("alice"), None, None).await.unwrap();
+        let bob = users.create(&slug("bob"), None, None).await.unwrap();
+        identities
+            .bind(
+                &alice.id,
+                &asserted("spaceport-acme", "583231", "octo-alice"),
+            )
+            .await
+            .unwrap();
+
+        let error = identities
+            .bind(&bob.id, &asserted("spaceport-acme", "583231", "octo-alice"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, IdentityError::AccountBoundElsewhere(_)),
+            "{error}"
+        );
+        // Named by the slug the operator would have to go and fix.
+        assert!(error.to_string().contains("alice"), "{error}");
+        // And the refusal wrote nothing: bob holds nothing, and only alice's
+        // binding was ever logged.
+        assert!(identities.for_user(&bob.id).await.unwrap().is_empty());
+        assert_eq!(identities.for_user(&alice.id).await.unwrap().len(), 1);
+        let bound = log
+            .entries(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.kind == "identity.bound")
+            .count();
+        assert_eq!(bound, 1);
+    }
+
+    /// Re-pointing a user at a different account is never implicit: the
+    /// delete-then-insert that would make it work silently moves somebody's
+    /// identity from under them, so the operator has to say `disconnect`.
+    #[tokio::test]
+    async fn refuses_a_second_account_where_the_user_already_has_one() {
+        let (_, users, _, identities, _) = repositories();
+        let alice = users.create(&slug("alice"), None, None).await.unwrap();
+        identities
+            .bind(
+                &alice.id,
+                &asserted("spaceport-acme", "583231", "octo-alice"),
+            )
+            .await
+            .unwrap();
+
+        let error = identities
+            .bind(&alice.id, &asserted("spaceport-acme", "99", "octo-other"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, IdentityError::AlreadyBound(_)), "{error}");
+        assert!(error.to_string().contains("disconnect"), "{error}");
+        // The binding she had is the binding she still has.
+        let held = identities.for_user(&alice.id).await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].external_id, "583231");
+    }
+
+    /// The same assertion again is not a refusal — it is how an operator
+    /// corrects a handle that has been renamed. What it must never do is claim
+    /// a login: the timestamp a real sign-in left stands.
+    #[tokio::test]
+    async fn asserting_the_same_binding_again_refreshes_only_the_handle() {
+        let (_, users, _, identities, log) = repositories();
+        let alice = users.create(&slug("alice"), None, None).await.unwrap();
+        identities
+            .record(
+                &alice.id,
+                "spaceport-acme",
+                "583231",
+                "octo-alice",
+                &attributes(&[("org", &["acme-corp"])]),
+            )
+            .await
+            .unwrap();
+
+        identities
+            .bind(
+                &alice.id,
+                &asserted("spaceport-acme", "583231", "octo-renamed"),
+            )
+            .await
+            .unwrap();
+
+        let held = identities.for_user(&alice.id).await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].external_login, "octo-renamed");
+        assert!(held[0].last_login_at.is_some());
+        assert_eq!(held[0].attributes["org"], ["acme-corp"]);
+        // And the command that was given is recorded, as every command is.
+        let entries = log.entries(None).await.unwrap();
+        assert_eq!(entries.last().unwrap().kind, "identity.bound");
+    }
+
+    #[tokio::test]
+    async fn unbinds_an_identity_and_records_that_it_went() {
+        let (_, users, _, identities, log) = repositories();
+        let alice = users.create(&slug("alice"), None, None).await.unwrap();
+        identities
+            .bind(
+                &alice.id,
+                &asserted("spaceport-acme", "583231", "octo-alice"),
+            )
+            .await
+            .unwrap();
+
+        identities
+            .unbind(&alice.id, "spaceport-acme")
+            .await
+            .unwrap();
+
+        assert!(identities.for_user(&alice.id).await.unwrap().is_empty());
+        let last = log.entries(None).await.unwrap().pop().unwrap();
+        assert_eq!(last.kind, "identity.unbound");
+        assert_eq!(last.origin, OPERATOR_ORIGIN);
+        // The entry names the account that was let go, because after the
+        // delete this is the only place that pairing survives.
+        assert!(
+            last.detail.as_deref().unwrap().contains("583231"),
+            "{:?}",
+            last.detail
+        );
+    }
+
+    /// Told apart from a success, so an operator is never told that a link
+    /// they never made has been taken away.
+    #[tokio::test]
+    async fn unbinding_what_was_never_bound_says_so() {
+        let (_, users, _, identities, log) = repositories();
+        let alice = users.create(&slug("alice"), None, None).await.unwrap();
+
+        let error = identities
+            .unbind(&alice.id, "spaceport-acme")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, IdentityError::NotBound(_)), "{error}");
+        assert!(error.to_string().contains("spaceport-acme"), "{error}");
+        // Nothing happened, so nothing is logged as having happened.
+        let kinds: Vec<String> = log
+            .entries(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.kind)
+            .collect();
+        assert_eq!(kinds, ["user.created"]);
+    }
+
+    /// The drop cascade holds for an asserted binding exactly as it does for a
+    /// login-made one: the row goes with the user, so the external account is
+    /// free to vouch for whoever holds the slug next.
+    #[tokio::test]
+    async fn dropping_a_bound_user_takes_the_binding_with_them() {
+        let (_, users, _, identities, _) = repositories();
+        let alice = users.create(&slug("alice"), None, None).await.unwrap();
+        identities
+            .bind(
+                &alice.id,
+                &asserted("spaceport-acme", "583231", "octo-alice"),
+            )
+            .await
+            .unwrap();
+
+        users
+            .drop_user(&UserRef::Slug(slug("alice")))
+            .await
+            .unwrap();
+
+        assert!(identities.for_user(&alice.id).await.unwrap().is_empty());
+        // And the account is free again: a fresh user may hold it.
+        let carol = users.create(&slug("carol"), None, None).await.unwrap();
+        identities
+            .bind(
+                &carol.id,
+                &asserted("spaceport-acme", "583231", "octo-alice"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(identities.for_user(&carol.id).await.unwrap().len(), 1);
     }
 }

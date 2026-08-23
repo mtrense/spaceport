@@ -1101,7 +1101,10 @@ mod tests {
             crate::auth::SessionRepository::with_jwt_cache(db.clone(), jwt_cache.clone());
         let entitlements = crate::auth::EntitlementRepository::new(db.clone());
         let alice: crate::auth::UserRef = "alice".parse().unwrap();
-        users.create(&"alice".parse().unwrap(), None).await.unwrap();
+        users
+            .create(&"alice".parse().unwrap(), None, None)
+            .await
+            .unwrap();
         entitlements
             .grant(&alice, &"reader@blog".parse().unwrap())
             .await
@@ -1183,7 +1186,10 @@ mod tests {
         let users = crate::auth::UserRepository::new(db.clone());
         let sessions = crate::auth::SessionRepository::new(db.clone());
         let alice: crate::auth::UserRef = "alice".parse().unwrap();
-        users.create(&"alice".parse().unwrap(), None).await.unwrap();
+        users
+            .create(&"alice".parse().unwrap(), None, None)
+            .await
+            .unwrap();
         let minted = sessions
             .mint_code(&alice, crate::auth::DEFAULT_SESSION_LIFETIME)
             .await
@@ -1226,7 +1232,10 @@ mod tests {
             let users = crate::auth::UserRepository::new(db.clone());
             let sessions = crate::auth::SessionRepository::new(db.clone());
             let alice: crate::auth::UserRef = "alice".parse().unwrap();
-            users.create(&"alice".parse().unwrap(), None).await.unwrap();
+            users
+                .create(&"alice".parse().unwrap(), None, None)
+                .await
+                .unwrap();
             let minted = sessions
                 .mint_code(&alice, crate::auth::DEFAULT_SESSION_LIFETIME)
                 .await
@@ -1268,7 +1277,10 @@ mod tests {
         let sessions = crate::auth::SessionRepository::new(db.clone());
         let entitlements = crate::auth::EntitlementRepository::new(db.clone());
         let alice: crate::auth::UserRef = "alice".parse().unwrap();
-        users.create(&"alice".parse().unwrap(), None).await.unwrap();
+        users
+            .create(&"alice".parse().unwrap(), None, None)
+            .await
+            .unwrap();
         entitlements
             .grant(&alice, &"reader@blog".parse().unwrap())
             .await
@@ -1526,7 +1538,10 @@ mod tests {
         let sessions = crate::auth::SessionRepository::new(db.clone());
         let entitlements = crate::auth::EntitlementRepository::new(db.clone());
         let named: crate::auth::UserRef = user.parse().unwrap();
-        let created = users.create(&user.parse().unwrap(), None).await.unwrap();
+        let created = users
+            .create(&user.parse().unwrap(), None, None)
+            .await
+            .unwrap();
         for grant in grants {
             entitlements
                 .grant(&named, &grant.parse().unwrap())
@@ -1841,7 +1856,10 @@ mod tests {
     ) -> (String, crate::auth::UserId, crate::auth::MintedApiKey) {
         let users = crate::auth::UserRepository::new(db.clone());
         let sessions = crate::auth::SessionRepository::new(db.clone());
-        let created = users.create(&user.parse().unwrap(), None).await.unwrap();
+        let created = users
+            .create(&user.parse().unwrap(), None, None)
+            .await
+            .unwrap();
         let minted = sessions
             .mint_api_key(
                 &user.parse().unwrap(),

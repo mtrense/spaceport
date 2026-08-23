@@ -520,7 +520,7 @@ mod tests {
     #[tokio::test]
     async fn a_minted_key_is_spk_prefixed_and_listed_only_as_its_tail() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("ci-bot"), None).await.unwrap();
+        users.create(&slug("ci-bot"), None, None).await.unwrap();
 
         let minted = mint(&sessions, "ci-bot").await;
 
@@ -542,7 +542,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_mints_for_one_role_at_one_app_coexist() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("ci-bot"), None).await.unwrap();
+        users.create(&slug("ci-bot"), None, None).await.unwrap();
 
         let first = mint(&sessions, "ci-bot").await;
         let second = mint(&sessions, "ci-bot").await;
@@ -567,7 +567,7 @@ mod tests {
     #[tokio::test]
     async fn a_key_answers_with_its_user_and_role_at_its_app_only() {
         let (users, sessions, _) = repositories();
-        let created = users.create(&slug("ci-bot"), None).await.unwrap();
+        let created = users.create(&slug("ci-bot"), None, None).await.unwrap();
         let minted = mint(&sessions, "ci-bot").await;
 
         let (user, role) = sessions
@@ -599,7 +599,7 @@ mod tests {
     #[tokio::test]
     async fn an_expired_key_stops_answering_and_is_swept() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("ci-bot"), None).await.unwrap();
+        users.create(&slug("ci-bot"), None, None).await.unwrap();
         let minted = mint(&sessions, "ci-bot").await;
         expire_keys(&sessions).await;
 
@@ -627,7 +627,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_a_key_by_id_revokes_it_and_spares_the_rest() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("ci-bot"), None).await.unwrap();
+        users.create(&slug("ci-bot"), None, None).await.unwrap();
         let first = mint(&sessions, "ci-bot").await;
         let second = mint(&sessions, "ci-bot").await;
 
@@ -663,7 +663,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_without_an_id_takes_sessions_and_keys_alike() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("ci-bot"), None).await.unwrap();
+        users.create(&slug("ci-bot"), None, None).await.unwrap();
         let minted = sessions
             .mint_code(&by_slug("ci-bot"), crate::auth::DEFAULT_SESSION_LIFETIME)
             .await
@@ -687,7 +687,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_an_id_that_names_nothing_says_so() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("ci-bot"), None).await.unwrap();
+        users.create(&slug("ci-bot"), None, None).await.unwrap();
         mint(&sessions, "ci-bot").await;
 
         let ghost = "00000000000000aa".parse().unwrap();
@@ -704,7 +704,7 @@ mod tests {
     #[tokio::test]
     async fn suspending_or_dropping_the_owner_kills_their_keys() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("ci-bot"), None).await.unwrap();
+        users.create(&slug("ci-bot"), None, None).await.unwrap();
         let minted = mint(&sessions, "ci-bot").await;
 
         users.suspend(&by_slug("ci-bot")).await.unwrap();
@@ -743,7 +743,7 @@ mod tests {
     #[tokio::test]
     async fn minting_for_a_suspended_or_unknown_user_is_refused() {
         let (users, sessions, _) = repositories();
-        users.create(&slug("ci-bot"), None).await.unwrap();
+        users.create(&slug("ci-bot"), None, None).await.unwrap();
         users.suspend(&by_slug("ci-bot")).await.unwrap();
 
         let suspended = sessions
@@ -776,7 +776,7 @@ mod tests {
     #[tokio::test]
     async fn mint_and_revoke_land_in_the_log_without_the_credential() {
         let (users, sessions, log) = repositories();
-        let created = users.create(&slug("ci-bot"), None).await.unwrap();
+        let created = users.create(&slug("ci-bot"), None, None).await.unwrap();
         let minted = mint(&sessions, "ci-bot").await;
         sessions
             .drop_sessions(

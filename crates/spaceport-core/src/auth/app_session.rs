@@ -452,7 +452,10 @@ mod tests {
 
     /// A signed-in alice, the way the login page produces one.
     async fn signed_in(users: &UserRepository, sessions: &SessionRepository) -> FreshSession {
-        users.create(&"alice".parse().unwrap(), None).await.unwrap();
+        users
+            .create(&"alice".parse().unwrap(), None, None)
+            .await
+            .unwrap();
         let minted = sessions
             .mint_code(&alice(), DEFAULT_SESSION_LIFETIME)
             .await

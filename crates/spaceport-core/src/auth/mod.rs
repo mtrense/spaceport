@@ -37,8 +37,8 @@ pub use entitlement::{
 pub use jwt::{JwtCache, JwtSigner, Rotation, SigningKeyRecord};
 pub use log::{AuthEvent, AuthLogRepository, OPERATOR_ORIGIN, SYSTEM_ORIGIN, WEB_ORIGIN};
 pub use mapping::{
-    Attributes, Condition, DroppedRule, IdentityRecord, IdentityRepository, MappingError,
-    MappingRecord, MappingRepository, RolesAtApp, evaluate,
+    AccountAtConnection, AssertedIdentity, Attributes, Condition, DroppedRule, IdentityRecord,
+    IdentityRepository, MappingError, MappingRecord, MappingRepository, RolesAtApp, evaluate,
 };
 pub use repository::UserRepository;
 pub use session::{
@@ -392,6 +392,19 @@ pub enum UserError {
     /// A live user already holds the slug, so creating another would be
     /// creating an ambiguity rather than a user.
     SlugTaken(anyhow::Error),
+    /// The identity `--connect` asserted could not be bound, so the user was
+    /// not created either — the two share a commit.
+    ///
+    /// The identity refusal is carried whole rather than flattened into an
+    /// `anyhow::Error`: a binding conflict is not a slug collision, and the
+    /// operator interface answers the two differently, so the caller that
+    /// creates a user with a binding attached gets exactly the refusal a
+    /// standalone `auth user connect` would have given it — including which
+    /// of [`IdentityError`]'s two conflicts it was. A second creation error
+    /// channel returning both types lost to this: every existing caller
+    /// already matches on [`UserError`], and a pair would make them all say
+    /// so twice.
+    Binding(IdentityError),
     /// The store would not do it.
     Failed(anyhow::Error),
 }
@@ -402,11 +415,46 @@ impl fmt::Display for UserError {
             Self::Unknown(error) | Self::SlugTaken(error) | Self::Failed(error) => {
                 write!(f, "{error:#}")
             }
+            Self::Binding(error) => error.fmt(f),
         }
     }
 }
 
 impl std::error::Error for UserError {}
+
+/// Why an operator-asserted identity binding did not happen. Told apart for
+/// [`UserError`]'s reason: each of these is a different thing for the operator
+/// to do next — go and disconnect somebody else's user, disconnect this one
+/// first, check who they actually are, or come back when the host is well.
+#[derive(Debug)]
+pub enum IdentityError {
+    /// That external account already vouches for a different user. One
+    /// account, one user: binding it here as well would leave two users a
+    /// single login could resolve to.
+    AccountBoundElsewhere(anyhow::Error),
+    /// The user already holds a different identity at that connection. The
+    /// spec forbids re-pointing one implicitly, so the remedy is `disconnect`
+    /// and then bind again — deliberately two commands, because moving a
+    /// person's account from under them is not something to do by typo.
+    AlreadyBound(anyhow::Error),
+    /// There was no binding to take away, so nothing was taken away.
+    NotBound(anyhow::Error),
+    /// The store would not do it.
+    Failed(anyhow::Error),
+}
+
+impl fmt::Display for IdentityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AccountBoundElsewhere(error)
+            | Self::AlreadyBound(error)
+            | Self::NotBound(error)
+            | Self::Failed(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
+impl std::error::Error for IdentityError {}
 
 #[cfg(test)]
 mod tests {

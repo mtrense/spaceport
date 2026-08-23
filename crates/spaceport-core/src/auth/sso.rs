@@ -661,8 +661,8 @@ fn resync_in(
 mod tests {
     use super::*;
     use crate::auth::{
-        AuthEvent, AuthLogRepository, EntitlementRepository, IdentityRepository, MappingRepository,
-        UserRepository,
+        AssertedIdentity, AuthEvent, AuthLogRepository, EntitlementRepository, IdentityRepository,
+        MappingRepository, UserRepository,
     };
 
     fn repositories() -> (
@@ -768,7 +768,11 @@ mod tests {
         plant_connection(&db, "spaceport-acme").await;
         plant_octocat_rule(&db).await;
 
-        let fresh = signed_in(sso.login(octocat(&[("login", &["octocat"])])).await.unwrap());
+        let fresh = signed_in(
+            sso.login(octocat(&[("login", &["octocat"])]))
+                .await
+                .unwrap(),
+        );
 
         let listed = users.list(None).await.unwrap();
         assert_eq!(listed.len(), 1);
@@ -799,7 +803,11 @@ mod tests {
         let (db, users, sso, _, _) = repositories();
         plant_connection(&db, "spaceport-acme").await;
         let alice = users
-            .create(&"alice".parse().unwrap(), Some("octocat@acme.example"))
+            .create(
+                &"alice".parse().unwrap(),
+                Some("octocat@acme.example"),
+                None,
+            )
             .await
             .unwrap();
 
@@ -824,11 +832,19 @@ mod tests {
         plant_connection(&db, "spaceport-acme").await;
         plant_octocat_rule(&db).await;
         let alice = users
-            .create(&"alice".parse().unwrap(), Some("octocat@acme.example"))
+            .create(
+                &"alice".parse().unwrap(),
+                Some("octocat@acme.example"),
+                None,
+            )
             .await
             .unwrap();
 
-        let fresh = signed_in(sso.login(octocat(&[("login", &["octocat"])])).await.unwrap());
+        let fresh = signed_in(
+            sso.login(octocat(&[("login", &["octocat"])]))
+                .await
+                .unwrap(),
+        );
 
         assert_ne!(fresh.user, alice.id);
         assert_eq!(users.list(None).await.unwrap().len(), 2);
@@ -844,18 +860,73 @@ mod tests {
         let (db, users, sso, _, _) = repositories();
         plant_connection(&db, "spaceport-acme").await;
         let carol = users
-            .create(&"carol".parse().unwrap(), Some("carol@acme.example"))
+            .create(&"carol".parse().unwrap(), Some("carol@acme.example"), None)
             .await
             .unwrap();
         link_octocat(&db, &carol.id).await;
         users
-            .create(&"eve".parse().unwrap(), Some("octocat@acme.example"))
+            .create(&"eve".parse().unwrap(), Some("octocat@acme.example"), None)
             .await
             .unwrap();
 
         let fresh = signed_in(sso.login(octocat(&[])).await.unwrap());
 
         assert_eq!(fresh.user, carol.id);
+    }
+
+    /// What an operator-asserted binding is *for*: alice signs in through a
+    /// connection whose every mapping rule ignores her, because the create-gate
+    /// is a gate on creation and she was not created here. Without this, letting
+    /// one named person in would mean writing a rule that admits everyone their
+    /// org contains — so the assertion at the socket is the narrow lever, and
+    /// this test is what keeps it working.
+    ///
+    /// The binding is planted through `bind`, the verb the operator command
+    /// calls, rather than through the login-shaped `record`: the placeholder row
+    /// it writes carries no attributes and no last login, and the point is that
+    /// a login lands on it all the same and fills it in.
+    #[tokio::test]
+    async fn an_asserted_binding_lets_a_login_in_that_no_rule_would_have() {
+        let (db, users, sso, _, _) = repositories();
+        plant_connection(&db, "spaceport-acme").await;
+        let identities = IdentityRepository::new(db.clone());
+        let alice = users
+            .create(&"alice".parse().unwrap(), None, None)
+            .await
+            .unwrap();
+        identities
+            .bind(
+                &alice.id,
+                &AssertedIdentity {
+                    connection: "spaceport-acme".to_owned(),
+                    external_id: "1001".to_owned(),
+                    external_login: "octocat".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        // Deliberately no `plant_octocat_rule` here: nothing about this login
+        // matches anything, and it must get in regardless.
+        let planted = identities.for_user(&alice.id).await.unwrap();
+        assert_eq!(planted[0].last_login_at, None);
+
+        let fresh = signed_in(
+            sso.login(octocat(&[("login", &["octocat"])]))
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(fresh.user, alice.id);
+        // No stranger minted beside her, which is the whole failure this
+        // feature exists to prevent.
+        let listed = users.list(None).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].slug.as_str(), "alice");
+        // And the placeholder has become a real snapshot.
+        let held = identities.for_user(&alice.id).await.unwrap();
+        assert_eq!(held[0].external_id, "1001");
+        assert!(held[0].last_login_at.is_some());
+        assert_eq!(held[0].attributes["login"], ["octocat"]);
     }
 
     /// A slug already held by somebody else's account gets stepped around with
@@ -867,11 +938,15 @@ mod tests {
         plant_connection(&db, "spaceport-acme").await;
         plant_octocat_rule(&db).await;
         let squatter = users
-            .create(&"github:octocat".parse().unwrap(), None)
+            .create(&"github:octocat".parse().unwrap(), None, None)
             .await
             .unwrap();
 
-        let fresh = signed_in(sso.login(octocat(&[("login", &["octocat"])])).await.unwrap());
+        let fresh = signed_in(
+            sso.login(octocat(&[("login", &["octocat"])]))
+                .await
+                .unwrap(),
+        );
 
         assert_ne!(fresh.user, squatter.id);
         let listed = users.list(None).await.unwrap();
@@ -908,7 +983,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let alice = users.create(&"alice".parse().unwrap(), None).await.unwrap();
+        let alice = users
+            .create(&"alice".parse().unwrap(), None, None)
+            .await
+            .unwrap();
         link_octocat(&db, &alice.id).await;
         entitlements
             .grant(
@@ -935,12 +1013,9 @@ mod tests {
         .unwrap();
 
         signed_in(
-            sso.login(octocat(&[
-                ("org", &["acme-corp"]),
-                ("team", &["review"]),
-            ]))
-            .await
-            .unwrap(),
+            sso.login(octocat(&[("org", &["acme-corp"]), ("team", &["review"])]))
+                .await
+                .unwrap(),
         );
 
         let (_, held) = entitlements
@@ -999,8 +1074,16 @@ mod tests {
             .await
             .unwrap();
 
-        signed_in(sso.login(octocat(&[("org", &["acme-corp"])])).await.unwrap());
-        signed_in(sso.login(octocat(&[("org", &["acme-corp"])])).await.unwrap());
+        signed_in(
+            sso.login(octocat(&[("org", &["acme-corp"])]))
+                .await
+                .unwrap(),
+        );
+        signed_in(
+            sso.login(octocat(&[("org", &["acme-corp"])]))
+                .await
+                .unwrap(),
+        );
 
         assert_eq!(users.list(None).await.unwrap().len(), 1);
         let synced = log
@@ -1019,7 +1102,10 @@ mod tests {
     async fn a_suspended_users_login_is_refused_and_logged() {
         let (db, users, sso, _, log) = repositories();
         plant_connection(&db, "spaceport-acme").await;
-        let alice = users.create(&"alice".parse().unwrap(), None).await.unwrap();
+        let alice = users
+            .create(&"alice".parse().unwrap(), None, None)
+            .await
+            .unwrap();
         link_octocat(&db, &alice.id).await;
         users
             .suspend(&UserRef::Slug("alice".parse().unwrap()))
@@ -1107,7 +1193,10 @@ mod tests {
     async fn a_linked_user_who_matches_no_rule_still_signs_in() {
         let (db, users, sso, _, _) = repositories();
         plant_connection(&db, "spaceport-acme").await;
-        let alice = users.create(&"alice".parse().unwrap(), None).await.unwrap();
+        let alice = users
+            .create(&"alice".parse().unwrap(), None, None)
+            .await
+            .unwrap();
         link_octocat(&db, &alice.id).await;
 
         let fresh = signed_in(sso.login(octocat(&[])).await.unwrap());
@@ -1125,7 +1214,10 @@ mod tests {
     async fn recording_an_identity_refuses_to_rebind_a_user_who_holds_another() {
         let (db, users, _, _, _) = repositories();
         plant_connection(&db, "spaceport-acme").await;
-        let alice = users.create(&"alice".parse().unwrap(), None).await.unwrap();
+        let alice = users
+            .create(&"alice".parse().unwrap(), None, None)
+            .await
+            .unwrap();
         link_octocat(&db, &alice.id).await;
 
         let alice_id = alice.id.clone();
@@ -1136,13 +1228,10 @@ mod tests {
                 let mut login = octocat(&[]);
                 login.external_id = "2002".to_owned();
 
-                Ok(record_identity_in(
-                    &transaction,
-                    &alice_id,
-                    &login,
-                    "2026-01-01T00:00:00Z",
+                Ok(
+                    record_identity_in(&transaction, &alice_id, &login, "2026-01-01T00:00:00Z")
+                        .is_err(),
                 )
-                .is_err())
             })
             .await
             .unwrap();

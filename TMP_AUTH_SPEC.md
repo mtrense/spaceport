@@ -8,10 +8,16 @@ Every login method authenticates by its own credential and never another's. A lo
 
 It follows that an IdP login resolves to an existing user only through a stored identity for (connection, external ID). A new user is created only when the login's attributes satisfy at least one of that connection's mapping rules, and a login matching no rule is refused without a user, session or entitlement being written for it. An IdP login never binds an identity onto a user that already holds a different one on that connection: joining two connections to one user is done by binding the second identity from a session already authenticated by the first, never by inferring the join from anything a login happens to carry.
 
+A binding may also be *asserted* by an operator at the socket, which is a different act from a login inferring one and is allowed for the same reason `--email` is: the admin is deliberately stating who this account belongs to, under their own authority, and the auth event log records that they did. `spaceport auth user connect <slug|user-id> <connection>:<login>` — and `--connect` on `user create`, which is the same act folded into the creation — resolves the handle to the IdP's stable external ID *at that moment* and stores the identity against it, refusing if the IdP does not know the handle rather than storing a binding that would silently never match. The handle is recorded beside the external ID for the human reading an audit and is never what resolution keys on: handles are renameable and reusable, so a binding stored by handle would follow the name to whoever holds it next. An operator-asserted binding carries no attributes and no last login until the person actually signs in, and it grants nothing by itself — entitlements still come from a `grant` or from the mapping rules. The two refusals a login is held to hold here too: the connection's external ID may belong to only one user, and a user may hold only one identity per connection, so re-pointing one means `disconnect` first.
+
+Because resolution keys on the stored identity and the mapping-rule gate applies only to *creation*, a user an operator has bound and granted signs in through that connection without any mapping rule matching them — which is how a single named person is let in without opening a rule that admits everyone their org contains.
+
 All `spaceport auth` commands run over the operator interface (unix socket); whoever can reach the socket is the admin — there is no separate in-band admin role. Every mutating command is recorded in the auth event log.
 
 - `spaceport auth user list [<pattern>]`
-- `spaceport auth user create <slug> [--email <addr>]`
+- `spaceport auth user create <slug> [--email <addr>] [--connect <connection>:<login>]`
+- `spaceport auth user connect <slug|user-id> <connection>:<login>`
+- `spaceport auth user disconnect <slug|user-id> <connection>`
 - `spaceport auth user suspend <slug|user-id>`
 - `spaceport auth user resume <slug|user-id>`
 - `spaceport auth user drop <slug|user-id>`
