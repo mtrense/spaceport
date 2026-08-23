@@ -1,3 +1,5 @@
+# A reference manifest, with every block spelled out. `spaceport info manifest`
+# is the same thing in prose, out of the binary that enforces it.
 schema_version: 1
 
 source:        # one of build | image
@@ -69,14 +71,24 @@ container:
                                 # as a name cannot be resolved from outside the
                                 # image, so the volume stays owned by root and
                                 # spaceport says so at launch.
-  secrets:                      # Not supported yet: this parses and is checked
-                                # against `env` below, but applying an app that
-                                # declares one is refused — there is nowhere to
-                                # put the value. Sanitation is the job of the
-                                # user.
+  secrets:                      # names only — the value is not in this
+                                # document, because this document is committed.
+                                # An operator sets it with
+                                # `spaceport apps secret set <app-id> <name> -`,
+                                # and there is no way to read one back out.
+                                # Applying an app whose declared secrets are not
+                                # all set leaves it suspended and not serving —
+                                # including one that was running before the
+                                # apply — and names what is missing; setting the
+                                # last one starts it.
     - DB_PASSWORD               # every declared secret must be interpolated by
                                 # some `env` value, and every `{{...}}` must
                                 # name a declared secret
-  env:
+  env:                          # names are C identifiers, and none of them —
+                                # nor any secret above — may start with
+                                # `SPACEPORT` (case-insensitively): those are
+                                # spaceport's own channel to the app, and an app
+                                # that could shadow one could point its token
+                                # verification at somebody else's keys.
     DATABASE_URL: postgres://user:{{DB_PASSWORD}}@db:5432/my-app
     ENVIRONMENT: production
