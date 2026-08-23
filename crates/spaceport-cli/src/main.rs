@@ -1,3 +1,4 @@
+mod info;
 mod render;
 
 use std::io::Read as _;
@@ -123,6 +124,16 @@ enum Command {
     Connect {
         #[command(subcommand)]
         command: ConnectCommand,
+    },
+    /// Explain what a hosted app has to do to run here, for whoever is
+    /// writing one.
+    ///
+    /// Answered out of this binary: no running spaceport, no socket, no
+    /// host — an app developer holding a copy of the CLI gets the same answer
+    /// as the operator who will deploy their app.
+    Info {
+        #[command(subcommand)]
+        command: InfoCommand,
     },
     /// Watch what a running spaceport is doing, as it does it.
     Stream(StreamArgs),
@@ -272,6 +283,18 @@ struct SecretDeleteArgs {
 
     #[command(flatten)]
     server: ServerArgs,
+}
+
+#[derive(Debug, Subcommand)]
+enum InfoCommand {
+    /// The app manifest: every block it holds, what each is checked against,
+    /// and the questions to settle with the app's developer before writing
+    /// one.
+    Manifest,
+    /// The contract an edge-gated app is held to: the JWT it is handed, how to
+    /// verify it, what it must never trust instead, and what it must not turn
+    /// the token into.
+    Auth,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1063,9 +1086,26 @@ async fn main() -> Result<()> {
             ConnectCommand::Show(args) => connection(args, colour).await,
             ConnectCommand::Forget(args) => forget_connection(args, colour).await,
         },
+        Command::Info { command } => print_info(command, colour),
         Command::Stream(args) => stream(args, colour).await,
         Command::Status(args) => status(args, colour).await,
     }
+}
+
+/// Print one of the documents an app's developer needs, whole.
+///
+/// Whole and unsummarised on purpose: what reads this is as often an agent
+/// writing the manifest as a person, and an agent handed half a contract
+/// invents the other half.
+fn print_info(command: InfoCommand, colour: Colour) -> Result<()> {
+    let document = match command {
+        InfoCommand::Manifest => info::MANIFEST,
+        InfoCommand::Auth => info::AUTH,
+    };
+
+    print!("{}", info::document(document, colour));
+
+    Ok(())
 }
 
 /// Ask a running spaceport what it is, and lay the answer out.
