@@ -178,6 +178,47 @@ fn signed_in(last_login_at: Option<&str>) -> String {
     }
 }
 
+/// What an IdP says about this person, or `None` when it has said nothing.
+///
+/// `None` rather than a line of blanks, for [`signed_in`]'s reason pointed the
+/// other way: a profile is written by a login and by nothing else, so an
+/// identity without one is either a binding waiting for its person or an IdP
+/// that holds no name and no verified address — neither of them a field this
+/// side failed to fill in.
+///
+/// Each value is labelled and quoted — `name: "Ada Lovelace"` — rather than run
+/// together into a sentence. Today there are two fields and prose would have
+/// read well enough; the next connection kind is not obliged to stop at two,
+/// and a line whose shape a reader has to know by heart is one they will
+/// eventually misread. A field added later changes this list and nothing else.
+/// The quotes are `Debug`'s, so a value containing a comma stays visibly one
+/// value.
+///
+/// The address in particular is never printed bare. Bare is how the `email`
+/// field above prints the *credential* — the address a one-time code goes to —
+/// and this one is a third party's claim about a mailbox that signs nobody in.
+/// Two addresses that look alike in one report are two an operator will
+/// eventually treat as one.
+///
+/// The same spelling is in the daemon's own renderer, for the reason
+/// [`signed_in`] is in both: this one answers `spaceport auth audit` and that
+/// one answers `curl`, and two spellings of one fact would leave an operator
+/// wondering which knows something.
+fn asserted_profile(identity: &wire::IdentityRow) -> Option<String> {
+    let said: Vec<String> = [
+        ("name", &identity.profile_name),
+        ("email", &identity.profile_email),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| value.as_ref().map(|value| format!("{key}: {value:?}")))
+    .collect();
+
+    match said.is_empty() {
+        true => None,
+        false => Some(said.join(", ")),
+    }
+}
+
 /// `spaceport auth audit`: the report, and then what the user actually holds.
 pub fn audit(audit: &wire::Audit, colour: Colour) -> String {
     let mut fields = vec![
@@ -219,6 +260,16 @@ pub fn audit(audit: &wire::Audit, colour: Colour) -> String {
                         signed_in(identity.last_login_at.as_deref()),
                     ),
                 ));
+                // Attributed to the connection, always: a display name and an
+                // address are what that IdP asserted at the last login, not
+                // things spaceport knows about the person. The `email` field
+                // above is the credential; this is somebody else's word.
+                if let Some(profile) = asserted_profile(identity) {
+                    fields.push((
+                        "profile",
+                        format!("`{}` says {profile}", identity.connection),
+                    ));
+                }
             }
         }
     }
@@ -324,14 +375,19 @@ mod tests {
                     external_id: "4242".to_owned(),
                     external_login: "ada-gh".to_owned(),
                     last_login_at: Some("2026-02-02T00:00:00Z".to_owned()),
+                    profile_name: Some("Ada Lovelace".to_owned()),
+                    profile_email: Some("ada@ci.example".to_owned()),
                 },
                 // The other state a row can be in, in the same fixture: an
-                // operator asserted this one and its owner has not arrived.
+                // operator asserted this one and its owner has not arrived —
+                // so no login has asserted a profile for it either.
                 wire::IdentityRow {
                     connection: "spaceport-acme".to_owned(),
                     external_id: "1701".to_owned(),
                     external_login: "ada-acme".to_owned(),
                     last_login_at: None,
+                    profile_name: None,
+                    profile_email: None,
                 },
             ],
             access: vec!["wiki".parse().unwrap()],
@@ -373,13 +429,14 @@ refreshed  2026-02-02T01:00:00Z
 
     /// The same, transcribed from `fn audit_user`.
     const AUDITED: &str = "\
-user    ada
-id      00000000-0000-4000-8000-000000000001
-status  active
-email   ada@example.com
-sso     `spaceport-ci` as `ada-gh` (id 4242), last login 2026-02-02T00:00:00Z
-sso     `spaceport-acme` as `ada-acme` (id 1701), bound by an operator — nobody has signed in through it yet
-access  wiki
+user     ada
+id       00000000-0000-4000-8000-000000000001
+status   active
+email    ada@example.com
+sso      `spaceport-ci` as `ada-gh` (id 4242), last login 2026-02-02T00:00:00Z
+profile  `spaceport-ci` says name: \"Ada Lovelace\", email: \"ada@ci.example\"
+sso      `spaceport-acme` as `ada-acme` (id 1701), bound by an operator — nobody has signed in through it yet
+access   wiki
 
 ENTITLEMENT  ORIGIN                 ACCESS                             GRANTED
 admin@wiki   manual                 yes                                2026-02-02T00:00:00Z
@@ -557,12 +614,23 @@ reader@blog  mapped by rule `a1b2`  no — role not declared by the app  2026-02
 
     /// A user with no address on file is an ordinary user, and says so with
     /// nothing rather than with an empty line.
+    ///
+    /// The address the *connection* claims is a different thing and stays: this
+    /// user has no credential the email connection would sign them in by, and
+    /// github says it holds an address for them anyway. Both facts are true at
+    /// once, which is why the field is checked by its label rather than by the
+    /// word appearing anywhere in the report.
     #[test]
     fn leaves_out_an_email_there_is_none_of() {
         let mut audited = audited();
         audited.email = None;
 
-        assert!(!audit(&audited, Colour::No).contains("email"));
+        let block = audit(&audited, Colour::No);
+        assert!(
+            !block.lines().any(|line| line.starts_with("email")),
+            "{block:?}"
+        );
+        assert!(block.contains(r#"email: "ada@ci.example""#), "{block:?}");
     }
 
     /// The two states an identity row can be in, told apart in words: a login

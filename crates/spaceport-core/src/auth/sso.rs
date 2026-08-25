@@ -30,6 +30,17 @@
 //! the one-time code and every limit around it. For the same reason a login
 //! never *writes* `users.email`: minting the email connection's credential out
 //! of a GitHub claim is the same confusion pointed the other way.
+//!
+//! A login does record what GitHub calls the person — a display name and, when
+//! GitHub has verified one, the address it says they read — and that is not the
+//! rule above being walked back. Those two land in the identity's own
+//! `profile_name` and `profile_email`, beside the attributes and under the
+//! connection that asserted them, where they are a claim with an author. What
+//! makes them harmless is everything they are not wired to: they resolve
+//! nobody, they are not `users.email`, and they are not attributes, so no
+//! `--when` clause can be written against them and no entitlement can follow
+//! from one. They exist to be handed to an app that wants to greet the person
+//! by name.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -40,7 +51,7 @@ use tracing::info;
 
 use super::jwt::JwtCache;
 use super::log::record_in;
-use super::mapping::{self, Attributes, MappingRecord, evaluate};
+use super::mapping::{self, Attributes, IdpProfile, MappingRecord, evaluate};
 use super::repository::{find, record};
 use super::session::{
     DEFAULT_SESSION_LIFETIME, FreshSession, SessionId, generate_token, hash, short_handle,
@@ -64,6 +75,14 @@ pub struct SsoLogin {
     pub external_login: String,
     /// The snapshot [`evaluate`] judges and `mapping test` later replays.
     pub attributes: Attributes,
+    /// What the IdP calls this person — display data, stored beside the
+    /// identity and judged by nothing.
+    ///
+    /// A field of its own rather than two more entries in `attributes`,
+    /// deliberately: everything in that map is something an operator can write
+    /// a `--when` clause against, and an address a third party asserted must
+    /// never be a thing entitlements are handed out on. See [`IdpProfile`].
+    pub profile: IdpProfile,
 }
 
 /// How a login ended.
@@ -418,7 +437,14 @@ fn create(
     })
 }
 
-/// Replace the identity snapshot, inside the login's transaction.
+/// Replace the identity snapshot — attributes and profile both — inside the
+/// login's transaction.
+///
+/// Wholesale, absences included: a person who cleared their display name at the
+/// IdP, or whose primary address is no longer verified, has none here either
+/// from this login on. The row says what the IdP last said, and a column that
+/// held on to an older answer would be spaceport asserting something nobody
+/// asserted to it.
 ///
 /// The same delete-then-insert [`super::mapping::IdentityRepository::record`]
 /// spells out, and for its reason: a re-login and a re-link are two different
@@ -476,15 +502,18 @@ fn record_identity_in(
     transaction
         .execute(
             "INSERT INTO idp_identities
-                 (user_id, connection, external_id, external_login, attributes, last_login_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (user_id, connection, external_id, external_login, attributes, last_login_at,
+                  profile_name, profile_email)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 user.as_str(),
                 login.connection,
                 login.external_id,
                 login.external_login,
                 attributes,
-                at
+                at,
+                login.profile.name,
+                login.profile.email
             ],
         )
         .context("recording an sso identity")?;
@@ -715,12 +744,21 @@ mod tests {
             .collect()
     }
 
+    /// The login every test here starts from: octocat, with whatever
+    /// attributes the test cares about and the profile GitHub reports for that
+    /// account. Carrying a profile by default is the honest shape — a real
+    /// login carries one — and the tests about a login that carries none say so
+    /// by clearing it.
     fn octocat(attrs: &[(&str, &[&str])]) -> SsoLogin {
         SsoLogin {
             connection: "spaceport-acme".to_owned(),
             external_id: "1001".to_owned(),
             external_login: "octocat".to_owned(),
             attributes: attributes(attrs),
+            profile: IdpProfile {
+                name: Some("Mona Lisa".to_owned()),
+                email: Some("mona@acme.example".to_owned()),
+            },
         }
     }
 
@@ -730,7 +768,14 @@ mod tests {
     /// *returning* login does start here.
     async fn link_octocat(db: &Db, user: &UserId) {
         IdentityRepository::new(db.clone())
-            .record(user, "spaceport-acme", "1001", "octocat", &attributes(&[]))
+            .record(
+                user,
+                "spaceport-acme",
+                "1001",
+                "octocat",
+                &attributes(&[]),
+                &IdpProfile::default(),
+            )
             .await
             .unwrap();
     }
@@ -788,6 +833,57 @@ mod tests {
             .unwrap();
         assert_eq!(created.origin, "spaceport-acme");
         assert!(created.detail.unwrap().contains("auto-created"), "");
+    }
+
+    /// The profile a login carries lands against the identity that asserted it
+    /// — and nowhere else. Not on the user, whose `email` is the credential the
+    /// email connection signs people in by, and not in the attributes, where a
+    /// `--when` clause could have been pointed at it.
+    #[tokio::test]
+    async fn a_login_records_what_github_calls_the_person_beside_the_identity() {
+        let (db, users, sso, _, _) = repositories();
+        plant_connection(&db, "spaceport-acme").await;
+        plant_octocat_rule(&db).await;
+
+        let fresh = signed_in(
+            sso.login(octocat(&[("login", &["octocat"])]))
+                .await
+                .unwrap(),
+        );
+
+        let held = IdentityRepository::new(db)
+            .for_user(&fresh.user)
+            .await
+            .unwrap();
+        assert_eq!(held[0].profile.name.as_deref(), Some("Mona Lisa"));
+        assert_eq!(held[0].profile.email.as_deref(), Some("mona@acme.example"));
+        assert!(!held[0].attributes.contains_key("email"), "");
+        assert_eq!(users.list(None).await.unwrap()[0].email, None);
+    }
+
+    /// And the profile is a snapshot like the attributes beside it: a login
+    /// that carries nothing leaves nothing, rather than this spaceport going on
+    /// asserting a name the IdP has stopped asserting.
+    #[tokio::test]
+    async fn a_login_that_carries_no_profile_clears_the_one_before_it() {
+        let (db, users, sso, _, _) = repositories();
+        plant_connection(&db, "spaceport-acme").await;
+        let alice = users
+            .create(&"alice".parse().unwrap(), None, None)
+            .await
+            .unwrap();
+        link_octocat(&db, &alice.id).await;
+        signed_in(sso.login(octocat(&[])).await.unwrap());
+
+        let mut cleared = octocat(&[]);
+        cleared.profile = IdpProfile::default();
+        signed_in(sso.login(cleared).await.unwrap());
+
+        let held = IdentityRepository::new(db)
+            .for_user(&alice.id)
+            .await
+            .unwrap();
+        assert!(held[0].profile.is_empty(), "{:?}", held[0].profile);
     }
 
     /// The credential boundary, from the side that used to be a hole: a GitHub
@@ -1134,6 +1230,9 @@ mod tests {
         let held = identities.for_user(&alice.id).await.unwrap();
         assert_eq!(held.len(), 1);
         assert!(held[0].attributes.is_empty(), "{:?}", held[0].attributes);
+        // Including the profile this login carried: suspend freezes the row,
+        // and a refused login is not the moment to learn somebody's new name.
+        assert!(held[0].profile.is_empty(), "{:?}", held[0].profile);
     }
 
     /// The create-gate: a stranger no rule of the connection matches is refused

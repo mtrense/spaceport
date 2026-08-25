@@ -4018,6 +4018,44 @@ fn signed_in(last_login_at: Option<&str>) -> String {
     }
 }
 
+/// What an IdP says about this person, in the one spelling both renderers use
+/// — or `None` when it has said nothing.
+///
+/// `None` rather than a line of blanks, for [`signed_in`]'s reason turned the
+/// other way: a profile is filled in by a login and by nothing else, so an
+/// identity without one is either an operator's binding waiting for its person
+/// or an IdP that holds no name and no verified address. Neither is a field
+/// somebody forgot, and printing an empty one would invite a hunt for the
+/// mistake.
+///
+/// Every value is *labelled and quoted* — `name: "Ada Lovelace"` — rather than
+/// run together into a sentence. Two fields could have been read as prose; the
+/// next connection kind will not be two, and a reader who has to know the shape
+/// by heart to tell which half is which is a reader who will eventually read
+/// one as the other. Labels also mean a field added later changes this list and
+/// nothing else. The quoting is `Debug`'s, which is the point: it escapes what
+/// it must, and it makes a name with a comma in it — or an empty one an IdP
+/// somehow asserted — visible as one value rather than as two.
+///
+/// The address is never printed bare for a reason worth keeping in mind: bare
+/// is how the `email` field one line up prints the *credential*, and two
+/// addresses that look alike in a report are two an operator will eventually
+/// treat as one.
+fn asserted_profile(identity: &wire::IdentityRow) -> Option<String> {
+    let said: Vec<String> = [
+        ("name", &identity.profile_name),
+        ("email", &identity.profile_email),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| value.as_ref().map(|value| format!("{key}: {value:?}")))
+    .collect();
+
+    match said.is_empty() {
+        true => None,
+        false => Some(said.join(", ")),
+    }
+}
+
 /// `PUT /auth/users/{ref}/identities/{connection}` with the github handle as
 /// the body: assert that this user is that account.
 ///
@@ -5010,6 +5048,8 @@ async fn audit_user(
                 external_id: identity.external_id.clone(),
                 external_login: identity.external_login.clone(),
                 last_login_at: identity.last_login_at.clone(),
+                profile_name: identity.profile.name.clone(),
+                profile_email: identity.profile.email.clone(),
             })
             .collect(),
         access: declared
@@ -5061,6 +5101,18 @@ async fn audit_user(
                         signed_in(identity.last_login_at.as_deref()),
                     ),
                 );
+                // Attributed, always: the connection is the subject of the
+                // sentence because a display name and an address are things
+                // that IdP said, not things spaceport knows. An operator
+                // reading `alice@acme.example` here must not take it for the
+                // address a one-time code would go to — that is the `email`
+                // field further up, and the two are allowed to differ.
+                if let Some(profile) = asserted_profile(identity) {
+                    out.field(
+                        "profile",
+                        format!("`{}` says {profile}", identity.connection),
+                    );
+                }
             }
         }
     }
@@ -10850,6 +10902,7 @@ container:
                 "583231",
                 "octo-alice",
                 &attributes,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -10880,7 +10933,9 @@ container:
     }
 
     /// The audit's promise, kept from the moment an identity exists: it shows
-    /// the SSO connection, the login and when it last happened.
+    /// the SSO connection, the login and when it last happened — and, beside
+    /// it, what that IdP calls the person, attributed to the IdP rather than
+    /// stated as fact, because that is exactly what it is.
     #[tokio::test]
     async fn the_audit_names_the_sso_connection_when_one_exists() {
         let (router, db) = router_with_alice_and_blog().await;
@@ -10892,6 +10947,10 @@ container:
                 "583231",
                 "octo-alice",
                 &crate::auth::Attributes::new(),
+                &crate::auth::IdpProfile {
+                    name: Some("Alice Liddell".to_owned()),
+                    email: Some("alice@acme.example".to_owned()),
+                },
             )
             .await
             .unwrap();
@@ -10904,6 +10963,70 @@ container:
             "{audit}"
         );
         assert!(!audit.contains("no IdP login recorded"), "{audit}");
+        assert!(
+            audit.contains(
+                r#"spaceport-acme` says name: "Alice Liddell", email: "alice@acme.example""#
+            ),
+            "{audit}"
+        );
+    }
+
+    /// A connection that asserts only half a profile prints only that half,
+    /// labelled — which is the property that lets a connection kind with three
+    /// fields, or with fields this build has never heard of, be added without
+    /// this line having to be re-read as prose.
+    #[tokio::test]
+    async fn the_audit_labels_each_half_of_a_profile_on_its_own() {
+        let (router, db) = router_with_alice_and_blog().await;
+        let alice: crate::auth::UserId = alice_id(&router).await.parse().unwrap();
+        crate::auth::IdentityRepository::new(db.clone())
+            .record(
+                &alice,
+                "spaceport-acme",
+                "583231",
+                "octo-alice",
+                &crate::auth::Attributes::new(),
+                &crate::auth::IdpProfile {
+                    name: None,
+                    email: Some("alice@acme.example".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (_, audit) = user_command(&router, "GET", "/auth/users/alice/audit").await;
+
+        assert!(
+            audit.contains(r#"says email: "alice@acme.example""#),
+            "{audit}"
+        );
+        assert!(!audit.contains("name:"), "{audit}");
+    }
+
+    /// A profile the IdP never asserted gets no line at all, rather than a line
+    /// of blanks: an operator reading an audit should see that github said
+    /// nothing about this person, and an identity an operator bound by hand has
+    /// exactly that until its first login.
+    #[tokio::test]
+    async fn the_audit_says_nothing_about_a_profile_no_idp_has_asserted() {
+        let (router, db) = router_with_alice_and_blog().await;
+        let alice: crate::auth::UserId = alice_id(&router).await.parse().unwrap();
+        crate::auth::IdentityRepository::new(db.clone())
+            .record(
+                &alice,
+                "spaceport-acme",
+                "583231",
+                "octo-alice",
+                &crate::auth::Attributes::new(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+
+        let (_, audit) = user_command(&router, "GET", "/auth/users/alice/audit").await;
+
+        assert!(audit.contains("as `octo-alice`"), "{audit}");
+        assert!(!audit.contains("says"), "{audit}");
     }
 
     /// Bind a github account to a user the way `spaceport auth user connect`

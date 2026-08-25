@@ -282,15 +282,27 @@ pub struct RepositoryRecord {
 
 /// Who GitHub says a signed-in person is.
 ///
-/// The id and the login and nothing else, because they answer different
-/// questions and both are asked: the id is what an identity is *keyed* by —
-/// logins are renameable and reassignable, and a link made on one would follow
-/// the name to whoever holds it next — and the login is what a person and the
-/// mapping rules recognise.
+/// One GitHub account, in the three registers spaceport reads it in.
+///
+/// The id and the login answer different questions and both are asked: the id
+/// is what an identity is *keyed* by — logins are renameable and reassignable,
+/// and a link made on one would follow the name to whoever holds it next — and
+/// the login is what a person and the mapping rules recognise.
+///
+/// `name` is a third kind of thing again, and the distinction is the whole
+/// reason it is a separate field rather than a better login: it is display
+/// text, free-form, absent on most accounts and never unique. Nothing resolves,
+/// keys or authorises on it. It is carried because the person behind the
+/// account is eventually shown to an app, and `octo-alice` is not what she is
+/// called.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserRecord {
     pub id: i64,
     pub login: String,
+    /// GitHub's free-text display name, when the account has bothered to set
+    /// one. `None` and the empty string mean the same thing here and both
+    /// arrive as `None` — an account with a blank name has no name.
+    pub name: Option<String>,
 }
 
 /// One email address GitHub holds for a signed-in person.
@@ -305,6 +317,43 @@ pub struct EmailRecord {
     pub email: String,
     pub verified: bool,
     pub primary: bool,
+}
+
+/// GitHub's display name, with the empty string folded into the absence it
+/// actually is.
+///
+/// A trimmed-to-nothing name is an account that set a name and then took it
+/// back, and storing `""` would make a profile that reads as having a name
+/// nobody can see. One place rather than at each of the two reads, so the two
+/// cannot come to differ about what a blank name means.
+fn display_name(name: Option<String>) -> Option<String> {
+    name.map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+}
+
+/// The one address of a signed-in person worth recording: the primary, and
+/// only if GitHub has verified it.
+///
+/// Primary because it is the address the person actually reads — the listing
+/// carries every address they ever added, and picking any other one would put a
+/// long-abandoned forwarding address in front of an app. Verified because an
+/// unverified address is a string somebody typed into their settings, and a
+/// profile that carried one would let an app that trusted it be told anything.
+///
+/// `None` when GitHub has no address that is both, which is an ordinary answer
+/// and not a failure: it means this identity's profile has no address, and the
+/// column stays NULL.
+///
+/// Note what this address is *not*, because the distinction is the one the
+/// whole login flow is built around: it is a claim GitHub makes about a mailbox,
+/// stored beside the identity that made it. It is never `users.email` — that is
+/// the email connection's credential, proven by a code that has to arrive
+/// today — and nothing resolves a user by it.
+pub fn primary_verified(emails: &[EmailRecord]) -> Option<&str> {
+    emails
+        .iter()
+        .find(|email| email.primary && email.verified)
+        .map(|email| email.email.as_str())
 }
 
 /// One team a signed-in person is on, with the organisation it belongs to
@@ -410,6 +459,12 @@ mod wire {
     pub(super) struct User {
         pub(super) id: i64,
         pub(super) login: String,
+        /// Explicitly nullable *and* defaulted: GitHub sends `"name": null`
+        /// for an account that never set one, and the public read of a hidden
+        /// account has been known to omit the field outright. Both mean the
+        /// same absence, and neither is a reason to fail a sign-in.
+        #[serde(default)]
+        pub(super) name: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -775,6 +830,7 @@ impl Client {
         Ok(UserRecord {
             id: user.id,
             login: user.login,
+            name: display_name(user.name),
         })
     }
 
@@ -974,6 +1030,12 @@ impl Client {
             // a handle case-insensitively, and the stored name should be the
             // one github.com shows.
             login: user.login,
+            // Read because the endpoint sends it, and deliberately dropped on
+            // the floor by this read's one caller: `auth user connect` asserts
+            // who an account *is*, and a profile it recorded would be one
+            // spaceport read over the person's shoulder rather than one they
+            // signed in and handed over.
+            name: display_name(user.name),
         }))
     }
 
@@ -1800,10 +1862,12 @@ mod tests {
     /// The id is what an identity is keyed by and the login is what a person
     /// recognises, and the call is made as the person — the fake refuses it
     /// under anything but their token, so the recorded credential is proof.
+    /// The display name rides along as the third thing, for the profile.
     #[tokio::test]
     async fn reads_who_the_signed_in_person_is() {
         let github = FakeGitHub::new();
         github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
+        github.user_is_called("Mona Lisa");
 
         let user = client(&github)
             .user(&Secret::new("ghu_a-user-token"))
@@ -1815,6 +1879,7 @@ mod tests {
             UserRecord {
                 id: 1001,
                 login: "octocat".to_owned(),
+                name: Some("Mona Lisa".to_owned()),
             }
         );
         let read = github
@@ -1902,6 +1967,55 @@ mod tests {
         );
     }
 
+    /// The one address a profile may carry: primary *and* verified. Either flag
+    /// alone picks a different address here, which is the point — an
+    /// abandoned-but-verified forwarding address is not what the person reads,
+    /// and an unverified primary is a string they typed into their settings.
+    #[test]
+    fn takes_the_primary_verified_address_and_no_other() {
+        let emails = [
+            ("old@example.com", true, false),
+            ("typo@example.com", false, true),
+            ("mona@acme.example", true, true),
+        ]
+        .map(|(email, verified, primary)| EmailRecord {
+            email: email.to_owned(),
+            verified,
+            primary,
+        });
+
+        assert_eq!(primary_verified(&emails), Some("mona@acme.example"));
+    }
+
+    /// An account whose primary address github has not verified has no profile
+    /// address at all — the column stays empty rather than taking the best
+    /// available string.
+    #[test]
+    fn takes_no_address_at_all_when_none_is_both() {
+        let emails = [EmailRecord {
+            email: "typo@example.com".to_owned(),
+            verified: false,
+            primary: true,
+        }];
+
+        assert_eq!(primary_verified(&emails), None);
+        assert_eq!(primary_verified(&[]), None);
+    }
+
+    /// A name github sends as null, as blank, or as spaces is the same absence
+    /// three ways, and a profile that stored `""` would read as a name nobody
+    /// can see.
+    #[test]
+    fn a_blank_display_name_is_no_display_name() {
+        assert_eq!(display_name(None), None);
+        assert_eq!(display_name(Some(String::new())), None);
+        assert_eq!(display_name(Some("   ".to_owned())), None);
+        assert_eq!(
+            display_name(Some("  Mona Lisa  ".to_owned())),
+            Some("Mona Lisa".to_owned())
+        );
+    }
+
     /// The user endpoints answer as the person the token is, so a token that is
     /// not theirs must be refused — a fake that waved any `Bearer` through
     /// would let the App's own JWT pass exactly where it must not.
@@ -1936,6 +2050,10 @@ mod tests {
             Some(UserRecord {
                 id: 1001,
                 login: "octocat".to_owned(),
+                // The public read carries a display name too; this account
+                // simply has none, and the binding would not have stored one
+                // either way.
+                name: None,
             })
         );
     }
@@ -1982,6 +2100,10 @@ mod tests {
             Some(UserRecord {
                 id: 1001,
                 login: "octocat".to_owned(),
+                // The public read carries a display name too; this account
+                // simply has none, and the binding would not have stored one
+                // either way.
+                name: None,
             })
         );
         // Both installations were asked, in order — the first is the one that
@@ -2055,6 +2177,10 @@ mod tests {
             Some(UserRecord {
                 id: 1001,
                 login: "octocat".to_owned(),
+                // The public read carries a display name too; this account
+                // simply has none, and the binding would not have stored one
+                // either way.
+                name: None,
             })
         );
         let read = github

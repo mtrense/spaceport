@@ -701,6 +701,43 @@ pub struct AssertedIdentity {
     pub external_login: String,
 }
 
+/// What the IdP calls the person behind an identity: display data, and nothing
+/// a decision is ever made on.
+///
+/// Kept apart from [`Attributes`] on purpose, though both are things the same
+/// login carried. Attributes are the input to the mapping rules — an operator
+/// writes `--when org=acme-corp` and entitlements follow — so anything that
+/// lands there becomes something access can be granted off. A profile must
+/// never be that: the address is a claim GitHub makes about a mailbox, made at
+/// some past moment and never revalidated, and the name is free text the
+/// account holder can change to anybody else's this afternoon. They travel to
+/// the app so it can greet the person by name; they decide nothing.
+///
+/// Both halves are optional and ordinarily absent. An identity an operator
+/// asserted with `auth user connect` has neither until the person signs in, for
+/// the reason [`IdentityRecord::last_login_at`] is absent there too.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdpProfile {
+    /// The IdP's display name for the account, when it has one.
+    pub name: Option<String>,
+    /// The address the IdP asserts the account holder reads, when the IdP has
+    /// one it has verified.
+    ///
+    /// Emphatically not [`super::UserRecord::email`], which is the *credential*
+    /// the email connection signs somebody in by — a mailbox proven today, with
+    /// a code. This is somebody else's word about the same kind of thing, and
+    /// nothing resolves a user by it.
+    pub email: Option<String>,
+}
+
+impl IdpProfile {
+    /// Whether the IdP said anything at all — what an audit checks before
+    /// printing a line about a profile that is two absences.
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none() && self.email.is_none()
+    }
+}
+
 /// One identity as the `idp_identities` table stores it, minus the user it
 /// belongs to — a read is always about one user, exactly as an entitlement
 /// read is.
@@ -723,6 +760,9 @@ pub struct IdentityRecord {
     /// there would claim a login that never happened, and `mapping test`
     /// would then replay an empty snapshot as though a login had carried it.
     pub last_login_at: Option<String>,
+    /// What the IdP calls this person, as of that last login — empty until one
+    /// has happened.
+    pub profile: IdpProfile,
 }
 
 /// The `idp_identities` table, in the vocabulary of recording a login and
@@ -751,6 +791,13 @@ impl IdentityRepository {
     /// user through the same connection is a re-login, and the same external
     /// account now vouching for this user is a re-link — both must land on
     /// one fresh row, and one `ON CONFLICT` clause can only catch one of them.
+    ///
+    /// `profile` is replaced wholesale along with the attributes, absences
+    /// included: a person who cleared their display name at the IdP has no
+    /// display name here either the moment they sign in again. The row is a
+    /// snapshot of what the IdP last said, and a field that kept its old value
+    /// because the new answer was "nothing" would be this table remembering
+    /// something the IdP no longer asserts.
     pub async fn record(
         &self,
         user: &UserId,
@@ -758,11 +805,13 @@ impl IdentityRepository {
         external_id: &str,
         external_login: &str,
         attributes: &Attributes,
+        profile: &IdpProfile,
     ) -> Result<()> {
         let user = user.clone();
         let connection_slug = connection.to_owned();
         let external_id = external_id.to_owned();
         let external_login = external_login.to_owned();
+        let profile = profile.clone();
         let attributes =
             serde_json::to_string(attributes).context("writing an identity's attributes")?;
 
@@ -784,15 +833,17 @@ impl IdentityRepository {
                     .execute(
                         "INSERT INTO idp_identities
                              (user_id, connection, external_id, external_login, attributes,
-                              last_login_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                              last_login_at, profile_name, profile_email)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                         rusqlite::params![
                             user.as_str(),
                             connection_slug,
                             external_id,
                             external_login,
                             attributes,
-                            now()
+                            now(),
+                            profile.name,
+                            profile.email
                         ],
                     )
                     .context("recording an idp identity")?;
@@ -808,12 +859,13 @@ impl IdentityRepository {
     pub async fn for_user(&self, user: &UserId) -> Result<Vec<IdentityRecord>> {
         let user = user.clone();
 
-        let rows: Vec<(String, String, String, String, Option<String>)> = self
+        let rows: Vec<IdentityRow> = self
             .db
             .call(move |connection| {
                 let mut statement = connection
                     .prepare(
-                        "SELECT connection, external_id, external_login, attributes, last_login_at
+                        "SELECT connection, external_id, external_login, attributes,
+                                last_login_at, profile_name, profile_email
                          FROM idp_identities WHERE user_id = ?1 ORDER BY connection",
                     )
                     .context("preparing the identity query")?;
@@ -826,6 +878,8 @@ impl IdentityRepository {
                             row.get(2)?,
                             row.get(3)?,
                             row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
                         ))
                     })
                     .context("reading the idp identities")?
@@ -839,7 +893,15 @@ impl IdentityRepository {
         Ok(rows
             .into_iter()
             .filter_map(
-                |(connection, external_id, external_login, attributes, last_login_at)| {
+                |(
+                    connection,
+                    external_id,
+                    external_login,
+                    attributes,
+                    last_login_at,
+                    profile_name,
+                    profile_email,
+                )| {
                     match serde_json::from_str(&attributes) {
                         Ok(attributes) => Some(IdentityRecord {
                             connection,
@@ -847,6 +909,10 @@ impl IdentityRepository {
                             external_login,
                             attributes,
                             last_login_at,
+                            profile: IdpProfile {
+                                name: profile_name,
+                                email: profile_email,
+                            },
                         }),
                         Err(error) => {
                             tracing::warn!(
@@ -1074,7 +1140,13 @@ pub(super) fn bind_in(
             .context("refreshing an asserted identity's handle"),
         // Never signed in through, and asserting nothing about them: no
         // attributes to replay, and a `last_login_at` of NULL that says as
-        // much rather than claiming a login that did not happen.
+        // much rather than claiming a login that did not happen. The profile
+        // columns are left off the insert for the same reason and take their
+        // NULLs: `/users/{login}` does carry a display name and this command
+        // has already read it, but an assertion says who an account *is*, and a
+        // profile filled in here would be one spaceport read over the person's
+        // shoulder rather than one they signed in and handed over. Their first
+        // login fills it.
         None => transaction
             .execute(
                 "INSERT INTO idp_identities
@@ -1144,6 +1216,22 @@ pub(super) fn remove_users_in(transaction: &Transaction<'_>, user: &UserId) -> R
 
     Ok(())
 }
+
+/// One identity row as SQL hands it over: connection, external id, handle,
+/// attributes as stored JSON, last login, and the two halves of the profile.
+///
+/// Named rather than spelled out at the call site because a seven-place tuple
+/// in a signature is a swap waiting to happen — the last three are all
+/// `Option<String>` and the compiler would not notice.
+type IdentityRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 /// The row as SQL hands it over, before the typed fields are parsed out.
 ///
@@ -1270,6 +1358,16 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// A profile with both halves said, for the tests about a login that
+    /// carried one. The absent cases are spelled `IdpProfile::default()` in
+    /// place, because "the IdP said nothing" is the thing being asserted.
+    fn profile(name: &str, email: &str) -> IdpProfile {
+        IdpProfile {
+            name: Some(name.to_owned()),
+            email: Some(email.to_owned()),
+        }
     }
 
     /// Plant the connection `--via` is verified against, exactly as `connect`
@@ -1685,6 +1783,7 @@ mod tests {
                 "583231",
                 "octo-alice",
                 &attributes(&[("login", &["octo-alice"]), ("org", &["acme-corp"])]),
+                &profile("Alice Liddell", "alice@acme.example"),
             )
             .await
             .unwrap();
@@ -1697,10 +1796,21 @@ mod tests {
         assert_eq!(held[0].attributes["org"], ["acme-corp"]);
         let stamped = held[0].last_login_at.as_deref().unwrap();
         assert!(stamped.ends_with('Z'), "{stamped}");
+        // The profile comes back as the IdP asserted it — and stays out of the
+        // attributes, where a `--when` clause could have been aimed at it.
+        assert_eq!(held[0].profile.name.as_deref(), Some("Alice Liddell"));
+        assert_eq!(held[0].profile.email.as_deref(), Some("alice@acme.example"));
+        assert!(!held[0].attributes.contains_key("email"), "");
+        assert!(!held[0].attributes.contains_key("name"), "");
     }
 
     /// A re-login replaces the snapshot rather than sitting beside it: one
     /// row per user per connection is the table's whole claim.
+    ///
+    /// The profile goes the same way, and the second login here carries none —
+    /// a name cleared at the IdP and an address that lost its verified flag are
+    /// gone from here too, rather than being remembered by a spaceport nobody
+    /// is asserting them to any more.
     #[tokio::test]
     async fn a_second_login_replaces_the_snapshot() {
         let (_, users, _, identities, _) = repositories();
@@ -1712,6 +1822,7 @@ mod tests {
                 "583231",
                 "octo-alice",
                 &attributes(&[("org", &["acme-corp"])]),
+                &profile("Alice Liddell", "alice@acme.example"),
             )
             .await
             .unwrap();
@@ -1723,6 +1834,7 @@ mod tests {
                 "583231",
                 "octo-renamed",
                 &attributes(&[("org", &["other-org"])]),
+                &IdpProfile::default(),
             )
             .await
             .unwrap();
@@ -1731,6 +1843,7 @@ mod tests {
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].external_login, "octo-renamed");
         assert_eq!(held[0].attributes["org"], ["other-org"]);
+        assert!(held[0].profile.is_empty(), "{:?}", held[0].profile);
     }
 
     /// The drop cascade, seen from this table: the identity dies with the
@@ -1747,6 +1860,7 @@ mod tests {
                 "583231",
                 "octo-alice",
                 &attributes(&[("org", &["acme-corp"])]),
+                &IdpProfile::default(),
             )
             .await
             .unwrap();
@@ -1876,6 +1990,7 @@ mod tests {
                 "583231",
                 "octo-alice",
                 &attributes(&[("org", &["acme-corp"])]),
+                &profile("Alice Liddell", "alice@acme.example"),
             )
             .await
             .unwrap();
@@ -1893,6 +2008,10 @@ mod tests {
         assert_eq!(held[0].external_login, "octo-renamed");
         assert!(held[0].last_login_at.is_some());
         assert_eq!(held[0].attributes["org"], ["acme-corp"]);
+        // Including the profile: an assertion is not a login, so what the IdP
+        // last said about this person is not an operator's to overwrite with
+        // silence.
+        assert_eq!(held[0].profile.name.as_deref(), Some("Alice Liddell"));
         // And the command that was given is recorded, as every command is.
         let entries = log.entries(None).await.unwrap();
         assert_eq!(entries.last().unwrap().kind, "identity.bound");

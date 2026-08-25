@@ -724,6 +724,42 @@ const MIGRATIONS: &[&str] = &[
     DROP TABLE idp_identities;
     ALTER TABLE idp_identities_rebuilt RENAME TO idp_identities;
     CREATE UNIQUE INDEX idp_identities_by_external ON idp_identities (connection, external_id);",
+    // 19 — what the IdP calls the person: the display profile their last login
+    // carried, beside the identity it belongs to.
+    //
+    // On `idp_identities` and emphatically not on `users`, because these two
+    // columns are claims and not credentials. `users.email` is what the email
+    // connection *signs somebody in by* — a mailbox proven today, with a code —
+    // and a GitHub login that wrote it would hand the account a second way in
+    // that this host never verified and cannot revoke by revoking anything of
+    // GitHub's. That is the takeover step 17's resolution rule was narrowed to
+    // close, and a column on the user row would be the same confusion wearing a
+    // different name. Here the profile sits where the rest of what an IdP
+    // asserted sits: against the identity that asserted it, one row per
+    // connection, so an audit reads "github says this person is Mona Lisa"
+    // rather than "this person is Mona Lisa".
+    //
+    // Both nullable, because both are ordinarily absent. GitHub's `name` is a
+    // free-text field most accounts leave empty; the address is stored only
+    // when GitHub reports one as primary *and* verified, which an account with
+    // no verified address does not have. And an identity an operator asserted
+    // with `auth user connect` has neither until the person actually signs in —
+    // the same reason step 18 let `last_login_at` be NULL. NULL is "the IdP
+    // said nothing", which is a different answer from the empty string.
+    //
+    // Deliberately not folded into the `attributes` JSON one column over,
+    // though it would have needed no migration at all: `attributes` is the
+    // input to the mapping rules, so an `email` living there would let an
+    // operator write `--when email=…` and hand out entitlements off a
+    // third-party claim that was never revalidated. A profile is display data
+    // travelling to the app in the next slice, and nothing about it should ever
+    // decide who gets in.
+    //
+    // `ALTER TABLE` rather than step 18's rebuild: adding a nullable column is
+    // the one shape SQLite does in place, and a rebuild that dropped the table
+    // would take `idp_identities_by_external` with it for no gain.
+    "ALTER TABLE idp_identities ADD COLUMN profile_name TEXT;
+    ALTER TABLE idp_identities ADD COLUMN profile_email TEXT;",
 ];
 
 /// The schema version this build writes.
@@ -1390,7 +1426,9 @@ mod tests {
                 "external_id",
                 "external_login",
                 "attributes",
-                "last_login_at"
+                "last_login_at",
+                "profile_name",
+                "profile_email"
             ]
         );
         // The same user arriving through the same connection again is the same
@@ -1462,7 +1500,11 @@ mod tests {
                 "external_id",
                 "external_login",
                 "attributes",
-                "last_login_at"
+                "last_login_at",
+                // Step 19's, and asserted here too so that a rebuild written
+                // later cannot quietly reorder what this step left behind.
+                "profile_name",
+                "profile_email"
             ]
         );
         assert!(
@@ -1579,6 +1621,53 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    /// The profile columns arrive nullable and beside the identity, and an
+    /// identity an earlier build recorded keeps everything it said while
+    /// answering "nothing" for the two new questions — which is the honest
+    /// answer for a login that happened before anybody asked them.
+    #[test]
+    fn the_nineteenth_migration_gives_an_identity_the_profile_its_idp_asserts() {
+        let connection = empty();
+        for migration in &MIGRATIONS[..18] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection.pragma_update(None, "user_version", 18).unwrap();
+        connection
+            .execute(
+                "INSERT INTO idp_identities
+                     (user_id, connection, external_id, external_login, attributes, last_login_at)
+                 VALUES ('3f29b1d4-8a6e-4c2b-9e77-1d5f6a2b9c40', 'spaceport-acme', '583231',
+                         'octo-alice', '{\"org\":[\"acme-corp\"]}', '2026-08-16T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        let carried: (String, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT external_login, profile_name, profile_email FROM idp_identities",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(carried, ("octo-alice".to_owned(), None, None));
+        assert!(!refuses_null(&connection, "idp_identities", "profile_name"));
+        assert!(!refuses_null(
+            &connection,
+            "idp_identities",
+            "profile_email"
+        ));
+        // And a login that carried both writes both.
+        connection
+            .execute(
+                "UPDATE idp_identities
+                    SET profile_name = 'Mona Lisa', profile_email = 'mona@acme.example'",
+                [],
+            )
+            .unwrap();
     }
 
     /// A database written by the previous build has only the apps table, and

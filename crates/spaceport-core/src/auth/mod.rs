@@ -38,7 +38,8 @@ pub use jwt::{JwtCache, JwtSigner, Rotation, SigningKeyRecord};
 pub use log::{AuthEvent, AuthLogRepository, OPERATOR_ORIGIN, SYSTEM_ORIGIN, WEB_ORIGIN};
 pub use mapping::{
     AccountAtConnection, AssertedIdentity, Attributes, Condition, DroppedRule, IdentityRecord,
-    IdentityRepository, MappingError, MappingRecord, MappingRepository, RolesAtApp, evaluate,
+    IdentityRepository, IdpProfile, MappingError, MappingRecord, MappingRepository, RolesAtApp,
+    evaluate,
 };
 pub use repository::UserRepository;
 pub use session::{

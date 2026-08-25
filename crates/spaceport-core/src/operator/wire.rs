@@ -307,6 +307,17 @@ pub struct IdentityRow {
     /// has — an operator asserted the binding and the person has not arrived
     /// yet.
     pub last_login_at: Option<String>,
+    /// What the IdP displays this account as, when it says anything.
+    ///
+    /// Carried as its own field rather than folded into a sentence, because a
+    /// caller reading this as JSON is the next slice's app-facing profile and
+    /// wants the name, not prose about it. Absent until a login has asserted
+    /// one — an operator's binding asserts no profile.
+    pub profile_name: Option<String>,
+    /// The address the IdP asserts, and it is a claim and not a credential:
+    /// [`Audit::email`] one level up is what the email connection signs
+    /// somebody in by, and these two being different strings is ordinary.
+    pub profile_email: Option<String>,
 }
 
 /// One entitlement the user holds, and whether it reaches anything.

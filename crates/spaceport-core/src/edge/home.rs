@@ -1261,10 +1261,10 @@ async fn github_callback(
         let orgs = client.user_orgs(&token).await?;
         let teams = client.user_teams(&token).await?;
 
-        anyhow::Ok((user, orgs, teams))
+        anyhow::Ok((token, user, orgs, teams))
     }
     .await;
-    let (user, orgs, teams) = match asked {
+    let (token, user, orgs, teams) = match asked {
         Ok(answers) => answers,
         Err(error) => {
             warn!(error = %format!("{error:#}"), "a github login could not be read back");
@@ -1300,13 +1300,41 @@ async fn github_callback(
         attributes.insert("team".to_owned(), values);
     }
 
-    // The addresses are deliberately not read: `/user/emails` is not asked for
-    // and its scope is not needed. What GitHub proved by finishing this
-    // exchange is that the person holds account `user.id`, and nothing about
-    // any mailbox — the email connection proves that itself, with a code, when
-    // somebody signs in that way. Sending the addresses on would only invite
-    // the far side to resolve by them again, which is the takeover this flow
-    // was carrying.
+    // What GitHub calls this person, which is a different question from who
+    // they are and is answered separately on purpose. The addresses are read
+    // here — `/user/emails`, under the App's `emails: read` — and what is taken
+    // from them is the primary *verified* one and nothing else. That is not the
+    // resolution-by-email this flow used to do: nothing below looks a user up
+    // by this address, `users.email` is not written from it, and no mapping
+    // rule can be aimed at it. It is stored against the identity as a claim
+    // GitHub made, so that the next slice can hand an app a name to greet
+    // somebody by.
+    //
+    // Outside the block above, and failing softly, because a profile is not
+    // worth a sign-in. GitHub having a bad minute on this one endpoint, or an
+    // installation whose email permission an operator narrowed after the fact,
+    // must leave the person signed in with no profile rather than staring at a
+    // bad-gateway page — the identity, the entitlements and the session do not
+    // depend on it. The warning is what an operator reads if the profiles
+    // stopped arriving.
+    let profile = crate::auth::IdpProfile {
+        name: user.name.clone(),
+        email: match client.user_emails(&token).await {
+            Ok(emails) => {
+                crate::connections::github::api::primary_verified(&emails).map(str::to_owned)
+            }
+            Err(error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    login = %user.login,
+                    "a github login's addresses would not read; signing in without a profile address"
+                );
+
+                None
+            }
+        },
+    };
+
     let outcome = home
         .sso
         .login(SsoLogin {
@@ -1314,6 +1342,7 @@ async fn github_callback(
             external_id: user.id.to_string(),
             external_login: user.login,
             attributes,
+            profile,
         })
         .await;
 
@@ -3379,6 +3408,15 @@ mod tests {
         github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
         github.user_belongs_to_orgs(&["acme-corp"]);
         github.user_belongs_to_teams(&[("acme-corp", "authors")]);
+        github.user_is_called("Mona Lisa");
+        // Three addresses, of which exactly one is both primary and verified —
+        // so a profile that picked by either flag alone would pick a different
+        // one and this test would say so.
+        github.user_emails_in_pages(&[&[
+            ("old@example.com", true, false),
+            ("mona@acme.example", true, true),
+            ("typo@example.com", false, false),
+        ]]);
         let users = crate::auth::UserRepository::new(db.clone());
         let alice = users
             .create(&"alice".parse().unwrap(), None, None)
@@ -3390,6 +3428,7 @@ mod tests {
                 "spaceport-for-acme",
                 "1001",
                 "octocat",
+                &Default::default(),
                 &Default::default(),
             )
             .await
@@ -3433,6 +3472,16 @@ mod tests {
         assert_eq!(held[0].attributes["login"], ["octocat"]);
         assert_eq!(held[0].attributes["org"], ["acme-corp"]);
         assert_eq!(held[0].attributes["team"], ["acme-corp/authors", "authors"]);
+        // And what github calls her, beside the identity that asserted it: the
+        // display name, and the one address that was primary *and* verified.
+        assert_eq!(held[0].profile.name.as_deref(), Some("Mona Lisa"));
+        assert_eq!(held[0].profile.email.as_deref(), Some("mona@acme.example"));
+        // Which is emphatically not her credential: `users.email` is what the
+        // email connection signs somebody in by, and a github login does not
+        // get to mint one.
+        assert_eq!(users.list(None).await.unwrap()[0].email, None);
+        // Nor is it something a mapping rule could ever be aimed at.
+        assert!(!held[0].attributes.contains_key("email"), "");
         // The mapped entitlement arrived, tagged with its rule.
         let (_, entitled) = home
             .entitlements
@@ -3511,16 +3560,26 @@ mod tests {
                 .email,
             Some("octocat@acme.example".to_owned())
         );
-        // And the callback never even asked: `/user/emails` is off the login
-        // path, so the scope it needs is not one this flow requires.
+        // The callback did read the addresses — a profile needs one — and what
+        // it did with the answer is the whole point: the same address that is
+        // alice's *credential* is, over here, a claim recorded against the new
+        // user's github identity and nothing more. It resolved nobody.
         let asked: Vec<String> = github
             .requests()
             .into_iter()
             .map(|request| request.path)
             .collect();
         assert!(
-            !asked.iter().any(|path| path.contains("/user/emails")),
+            asked.iter().any(|path| path.contains("/user/emails")),
             "{asked:?}"
+        );
+        let held = crate::auth::IdentityRepository::new(db)
+            .for_user(&minted.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            held[0].profile.email.as_deref(),
+            Some("octocat@acme.example")
         );
     }
 
@@ -3542,6 +3601,7 @@ mod tests {
                 "spaceport-for-acme",
                 "1001",
                 "octocat",
+                &Default::default(),
                 &Default::default(),
             )
             .await
@@ -3587,6 +3647,7 @@ mod tests {
                 "spaceport-for-acme",
                 "1001",
                 "octocat",
+                &Default::default(),
                 &Default::default(),
             )
             .await

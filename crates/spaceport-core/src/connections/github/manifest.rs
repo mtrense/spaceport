@@ -94,9 +94,12 @@ pub const LOGIN_CALLBACK_PATH: &str = "/auth/github/callback";
 /// and read the pull requests those checks belong to. Nothing writes to a
 /// repository's contents, and nothing reads an organisation's secrets.
 ///
-/// The last two rows are what SSO costs. An IdP login may only link to an
-/// existing user through an email GitHub asserts as verified — that is
-/// `emails: read` on the account — and the mapping rules an operator writes
+/// The last two rows are what SSO costs. A login records the profile GitHub
+/// holds for whoever signed in, and the address half of that is the one GitHub
+/// reports as primary and verified — which is `emails: read` on the account.
+/// Note what that permission does *not* buy any more: an address never resolves
+/// a user and is never written as one's credential, so this is read for display
+/// and nothing else. And the mapping rules an operator writes
 /// with `spaceport auth mapping add` match on `org=` and `team=` membership,
 /// which nothing can evaluate without `members: read` on the organisation. The
 /// older rationale here said nothing reads an organisation's members, and it
@@ -122,7 +125,8 @@ const PERMISSIONS: [(&str, &str); 8] = [
     // say so.
     ("members", "read"),
     // The account permission over a user's email addresses, verified flags
-    // included — which is the only thing an SSO login is allowed to link by.
+    // included — which is what a login stores as the profile's address, and
+    // never what it identifies anybody by.
     ("emails", "read"),
 ];
 

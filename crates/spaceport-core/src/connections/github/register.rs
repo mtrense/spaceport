@@ -171,13 +171,21 @@ pub async fn connect(
     // Said and not refused: an App made by hand likely predates the manifest's
     // SSO permissions or diverges from them, and everything except SSO login
     // works without these two. Refusing would hold today's registration
-    // hostage to a feature the operator may never turn on — but a login that
-    // cannot link by verified email, or a mapping rule that silently never
-    // matches, is exactly the invisible-in-three-weeks mistake this module
-    // exists to say out loud now.
+    // hostage to a feature the operator may never turn on — but a mapping rule
+    // that silently never matches, or a profile that arrives with no address in
+    // it, is exactly the invisible-in-three-weeks mistake this module exists to
+    // say out loud now.
+    //
+    // The two are not equally serious and the sentences say so: without
+    // `members` nobody is mapped anything, whereas without `emails` people
+    // still sign in and simply arrive without the address half of their
+    // profile.
     for (permission, why) in [
         ("members", "`org=`/`team=` mapping rules will never match"),
-        ("emails", "SSO logins cannot link users by verified email"),
+        (
+            "emails",
+            "the profile an sso login records will carry no email address",
+        ),
     ] {
         if confirmed.permissions.get(permission).map(String::as_str) != Some("read") {
             warn!(

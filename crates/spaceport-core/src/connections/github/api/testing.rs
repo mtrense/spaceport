@@ -201,6 +201,10 @@ struct ScriptedUser {
     token: String,
     id: i64,
     login: String,
+    /// GitHub's display name for them, or `None` for the account that never
+    /// set one — the ordinary case, which is why it is where a scripted person
+    /// starts.
+    name: Option<String>,
     /// Pages of `/user/emails`, each a JSON array — pages rather than a flat
     /// list so a test can make GitHub paginate the way it really does.
     email_pages: Vec<Value>,
@@ -489,10 +493,18 @@ impl FakeGitHub {
             token: token.to_owned(),
             id,
             login: login.to_owned(),
+            name: None,
             email_pages: Vec::new(),
             org_pages: Vec::new(),
             team_pages: Vec::new(),
         });
+    }
+
+    /// Say what GitHub displays this person as — the free-text `name` on their
+    /// account, which most accounts leave empty and which is why a scripted
+    /// person has none until a test says otherwise.
+    pub(crate) fn user_is_called(&self, name: &str) {
+        self.script(|user| user.name = Some(name.to_owned()));
     }
 
     /// Serve the signed-in person's emails over these pages, in this order —
@@ -765,8 +777,14 @@ impl FakeGitHub {
 
                 ok(answer, None)
             }
+            // `name` is always present and often null, which is what GitHub
+            // sends for an account that never set one — the absence a profile
+            // has to survive rather than a field the fake leaves out.
             ["", "user"] => match signed_in(&state, request) {
-                Some(user) => ok(json!({"id": user.id, "login": user.login}), None),
+                Some(user) => ok(
+                    json!({"id": user.id, "login": user.login, "name": user.name}),
+                    None,
+                ),
                 None => unauthorized(),
             },
             ["", "user", "emails"] => match signed_in(&state, request) {
