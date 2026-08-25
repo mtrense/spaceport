@@ -1,6 +1,6 @@
 # Global user pool. 
 This user pool provides stable user IDs to spaceport and the hosted applications. Human users come from SSO/IdPs (GitHub, Okta, Entra, ...) or via email/one-time code sign-in (same as the minted session below, which can be used for testing before SSO lands). SSO is implemented in a later iteration. Technical or internal users are created through the admin CLI.
-User IDs are UUIDs and are never reused. Dropping a user cascades: all sessions (including derived app sessions and open WebSocket connections), API keys, entitlements and cached JWTs die with the user. A slug can be re-created after a drop, but yields a fresh user ID. Suspending a user has the same immediate effect as dropping it (sessions, keys and cached JWTs are invalidated) but keeps the record and entitlements; resume restores access but does not resurrect sessions or keys.
+User IDs are UUIDs and are never reused. Dropping a user cascades: all sessions (including derived app sessions and open WebSocket connections), API keys, entitlements and cached JWTs die with the user. A slug can be re-created after a drop, but yields a fresh user ID. A slug is a name and not an identity: it may be changed in place (`spaceport auth user rename`), and doing so moves the name only — the user ID, entitlements, sessions, API keys, cached JWTs and identity bindings are all untouched, and the person stays signed in. The new slug must be free, exactly as at creation. Suspending a user has the same immediate effect as dropping it (sessions, keys and cached JWTs are invalidated) but keeps the record and entitlements; resume restores access but does not resurrect sessions or keys.
 
 Email/one-time-code sign-in: the login page on `edge.hostname` accepts an email address; if (and only if) it belongs to a known, non-suspended user, a single-use code is sent via the configured SMTP connection. Codes are 8 characters from an unambiguous alphabet, valid for 10 minutes, invalidated after 5 failed attempts; at most 5 codes per email per hour, and the response is identical whether or not the email is known.
 
@@ -18,6 +18,7 @@ All `spaceport auth` commands run over the operator interface (unix socket); who
 - `spaceport auth user create <slug> [--email <addr>] [--connect <connection>:<login>]`
 - `spaceport auth user connect <slug|user-id> <connection>:<login>`
 - `spaceport auth user disconnect <slug|user-id> <connection>`
+- `spaceport auth user rename <slug|user-id> <slug>`
 - `spaceport auth user suspend <slug|user-id>`
 - `spaceport auth user resume <slug|user-id>`
 - `spaceport auth user drop <slug|user-id>`

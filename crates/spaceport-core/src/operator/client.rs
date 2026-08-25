@@ -511,6 +511,22 @@ pub async fn auth_user_suspend(operator: &Operator, user: &UserRef) -> Result<St
     send_to(operator, Pace::Quick, request).await
 }
 
+/// Ask it to give the user `user` names the slug `slug` instead of the one
+/// they answer to now.
+///
+/// Both halves are safe in the path as they are: a slug's alphabet is the app
+/// id's and a UUID is hex and hyphens, so there is nothing here a url reserves.
+pub async fn auth_user_rename(
+    operator: &Operator,
+    user: &UserRef,
+    slug: &UserSlug,
+) -> Result<String> {
+    let request =
+        builder("POST", &format!("/auth/users/{user}/rename/{slug}")).body(Full::default())?;
+
+    send_to(operator, Pace::Quick, request).await
+}
+
 /// Ask it to let the user `user` names back in.
 pub async fn auth_user_resume(operator: &Operator, user: &UserRef) -> Result<String> {
     let request = builder("POST", &format!("/auth/users/{user}/resume")).body(Full::default())?;

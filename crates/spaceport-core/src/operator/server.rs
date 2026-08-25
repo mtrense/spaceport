@@ -211,6 +211,7 @@ fn router(instance: Arc<Instance>, events: Arc<EventBus>, shutdown: Cancellation
         )
         .route("/auth/users", get(list_users))
         .route("/auth/users/{user}", put(create_user).delete(drop_user))
+        .route("/auth/users/{user}/rename/{slug}", post(rename_user))
         .route("/auth/users/{user}/suspend", post(suspend_user))
         .route("/auth/users/{user}/resume", post(resume_user))
         .route("/auth/users/{user}/audit", get(audit_user))
@@ -4115,6 +4116,45 @@ async fn disconnect_user(
         )
             .into_response(),
         Err(error) => refuse_user(UserError::Binding(error)),
+    }
+}
+
+/// `POST /auth/users/{ref}/rename/{slug}`: the same user, under another name.
+///
+/// The new slug rides in the path rather than the body, unlike the email a
+/// create carries and the handle a connect does: those are strings from
+/// elsewhere that a query string or a path segment could quietly eat a
+/// character of, while a slug's alphabet is the app id's — lowercase letters,
+/// digits and hyphens — and a value that is not one is refused here by the
+/// same parser that refuses it at a create.
+///
+/// The answer says the id, because the id is what did *not* change and that is
+/// the point of renaming rather than dropping and creating: entitlements,
+/// sessions, API keys and the apps' own rows all key on it, so none of them
+/// need touching.
+async fn rename_user(
+    State(users): State<Arc<UserRepository>>,
+    UrlPath((user, slug)): UrlPath<(String, String)>,
+) -> Response {
+    let user: UserRef = match user.parse() {
+        Ok(user) => user,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+    let slug: crate::auth::UserSlug = match slug.parse() {
+        Ok(slug) => slug,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+
+    match users.rename(&user, &slug).await {
+        Ok(renamed) => {
+            let body = format!(
+                "user `{}` renamed\n  id     {} — unchanged, so their entitlements, sessions and keys are too\n  apps that stored the id as `sub` see the same person\n",
+                renamed.slug, renamed.id,
+            );
+
+            (StatusCode::OK, body).into_response()
+        }
+        Err(error) => refuse_user(error),
     }
 }
 
@@ -9498,6 +9538,52 @@ container:
         assert!(listed.contains("active"), "{listed}");
     }
 
+    /// The point of the route: the name in the listing changes and the id
+    /// does not, so the new name resolves to the user the old one did.
+    #[tokio::test]
+    async fn renames_a_user_and_keeps_their_id() {
+        let (_, router) = store_and_router();
+        let (_, created) = create_user_named(&router, "alice", "").await;
+        let id = id_in(&created);
+
+        let (status, body) =
+            user_command(&router, "POST", "/auth/users/alice/rename/alice-smith").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("user `alice-smith` renamed"), "{body}");
+        assert!(body.contains(&id), "{body}");
+        let (_, listed) = user_command(&router, "GET", "/auth/users").await;
+        assert!(listed.contains("alice-smith"), "{listed}");
+        assert!(listed.contains(&id), "{listed}");
+        // The old name is nobody's now, and the new one answers to the user
+        // that was created under the old one.
+        let (status, _) = user_command(&router, "POST", "/auth/users/alice/suspend").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, body) = user_command(&router, "POST", "/auth/users/alice-smith/suspend").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// A rename onto a name somebody holds is the create's conflict, and a
+    /// rename to something that is not a slug is the create's refusal.
+    #[tokio::test]
+    async fn refuses_a_rename_onto_a_taken_or_malformed_slug() {
+        let (_, router) = store_and_router();
+        create_user_named(&router, "alice", "").await;
+        create_user_named(&router, "bob", "").await;
+
+        let (status, body) = user_command(&router, "POST", "/auth/users/alice/rename/bob").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("already answers to `bob`"), "{body}");
+
+        let (status, body) = user_command(&router, "POST", "/auth/users/alice/rename/2Fast").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("lowercase"), "{body}");
+
+        // Neither refusal moved anything: alice is still alice.
+        let (_, listed) = user_command(&router, "GET", "/auth/users").await;
+        assert!(listed.contains("alice"), "{listed}");
+    }
+
     #[tokio::test]
     async fn a_command_aimed_at_no_user_is_not_found() {
         let (_, router) = store_and_router();
@@ -9505,6 +9591,7 @@ container:
         for (method, uri) in [
             ("POST", "/auth/users/ghost/suspend"),
             ("POST", "/auth/users/ghost/resume"),
+            ("POST", "/auth/users/ghost/rename/phantom"),
             ("DELETE", "/auth/users/ghost"),
         ] {
             let (status, body) = user_command(&router, method, uri).await;

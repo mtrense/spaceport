@@ -262,6 +262,74 @@ impl UserRepository {
         Ok(created)
     }
 
+    /// Change the name a user answers to, keeping the id they keep for life.
+    ///
+    /// One column moves and nothing follows it: entitlements, sessions, API
+    /// keys, identity bindings and every JWT already minted all key on the id,
+    /// so a rename costs the user nothing — they stay signed in, and an app
+    /// that stored their `sub` never notices. That is the whole difference
+    /// between this and dropping a user to create them again under the new
+    /// name, which mints a fresh id and is a different person to everything
+    /// downstream.
+    ///
+    /// The new slug being free is the same check a create makes, and it is
+    /// made the same way — by letting the table's constraint answer, so that
+    /// one question is asked about one moment. Renaming a user to the slug
+    /// they already hold is allowed and logged, for `suspend`'s reason: the
+    /// log records the commands that were given.
+    pub async fn rename(&self, user: &UserRef, slug: &UserSlug) -> Result<UserRecord, UserError> {
+        let asked = user.clone();
+        let wanted = slug.clone();
+
+        let found = self
+            .db
+            .call(move |connection| {
+                let transaction = connection
+                    .transaction()
+                    .context("beginning to rename a user")?;
+
+                let Some(row) = find(&transaction, &asked)? else {
+                    return Ok(None);
+                };
+                let mut record = record(row)?;
+                let was = record.slug.clone();
+
+                transaction
+                    .execute(
+                        "UPDATE users SET user_slug = ?2 WHERE user_id = ?1",
+                        rusqlite::params![record.id.as_str(), wanted.as_str()],
+                    )
+                    .context("renaming a user")?;
+                record.slug = wanted;
+
+                let at = now();
+                record_in(
+                    &transaction,
+                    &at,
+                    "user.renamed",
+                    Some(&record.id),
+                    OPERATOR_ORIGIN,
+                    Some(&format!("slug `{was}` is now `{}`", record.slug)),
+                )?;
+
+                transaction.commit().context("committing a user's rename")?;
+
+                Ok(Some((was, record)))
+            })
+            .await
+            .map_err(|error| match slug_collision(&error) {
+                true => UserError::SlugTaken(anyhow!(
+                    "a user already answers to `{slug}` — drop it first, or pick another slug"
+                )),
+                false => UserError::Failed(error),
+            })?;
+
+        let (was, record) = found.ok_or_else(|| UserError::Unknown(unknown(user)))?;
+        info!(user = %record.id, was = %was, slug = %record.slug, "user renamed");
+
+        Ok(record)
+    }
+
     /// Mark a user suspended, keeping everything about them.
     ///
     /// Recorded and logged even when the user was already suspended: the log
@@ -570,6 +638,75 @@ mod tests {
         assert!(suspended.suspended);
     }
 
+    /// What a rename is *for*: the name moves, the identity does not — so
+    /// everything keyed on the id keeps pointing at the same person.
+    #[tokio::test]
+    async fn renames_a_user_without_touching_their_id() {
+        let (users, _) = repositories();
+        let created = users.create(&slug("alice"), None, None).await.unwrap();
+
+        let renamed = users
+            .rename(&by_slug("alice"), &slug("alice-smith"))
+            .await
+            .unwrap();
+
+        assert_eq!(renamed.id, created.id);
+        assert_eq!(renamed.slug, slug("alice-smith"));
+        let listed = users.list(None).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].slug, slug("alice-smith"));
+        // And the old name answers to nobody, so it is free to create again.
+        assert!(
+            matches!(
+                users.rename(&by_slug("alice"), &slug("bob")).await,
+                Err(UserError::Unknown(_))
+            ),
+            "the old slug still resolves"
+        );
+    }
+
+    /// The slug's uniqueness holds against a rename too, and a refused rename
+    /// leaves both users exactly as they were.
+    #[tokio::test]
+    async fn refuses_renaming_onto_a_slug_a_live_user_holds() {
+        let (users, _) = repositories();
+        let alice = users.create(&slug("alice"), None, None).await.unwrap();
+        users.create(&slug("bob"), None, None).await.unwrap();
+
+        let error = users
+            .rename(&by_slug("alice"), &slug("bob"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, UserError::SlugTaken(_)), "{error}");
+        let listed = users.list(None).await.unwrap();
+        assert_eq!(listed[0].id, alice.id);
+        assert_eq!(listed[0].slug, slug("alice"));
+    }
+
+    /// The rename is logged under the id it happened to, naming both halves —
+    /// which is what lets somebody reading the log follow one user through
+    /// every name they have answered to.
+    #[tokio::test]
+    async fn a_rename_is_recorded_with_both_names() {
+        let (users, log) = repositories();
+        let created = users.create(&slug("alice"), None, None).await.unwrap();
+
+        users
+            .rename(&UserRef::Id(created.id.clone()), &slug("alice-smith"))
+            .await
+            .unwrap();
+
+        let entries = log.entries(Some(&created.id)).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].kind, "user.renamed");
+        assert_eq!(
+            entries[1].detail.as_deref(),
+            Some("slug `alice` is now `alice-smith`")
+        );
+        assert_eq!(entries[1].origin, OPERATOR_ORIGIN);
+    }
+
     #[tokio::test]
     async fn a_command_aimed_at_nobody_says_so() {
         let (users, _) = repositories();
@@ -577,6 +714,7 @@ mod tests {
         for result in [
             users.suspend(&by_slug("ghost")).await,
             users.resume(&by_slug("ghost")).await,
+            users.rename(&by_slug("ghost"), &slug("phantom")).await,
             users.drop_user(&by_slug("ghost")).await,
         ] {
             let error = result.unwrap_err();

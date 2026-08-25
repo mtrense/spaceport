@@ -47,7 +47,7 @@ An app manifest may not set any variable whose name starts with `SPACEPORT` (cas
 }
 ```
 
-- `sub` — the user's stable id, a UUID, never reused. This is the identity to key the app's own rows on. A user's slug can be re-created after a drop and yields a *fresh* id, which is the point: the new user is not the old one. An operator can also bind somebody's IdP account to a user that already exists, before they have ever signed in (`spaceport auth user connect`), which is how a person spaceport already knows arrives under the `sub` the app already has rather than as a second one beside it.
+- `sub` — the user's stable id, a UUID, never reused. This is the identity to key the app's own rows on. A user's slug can be re-created after a drop and yields a *fresh* id, which is the point: the new user is not the old one. It runs the other way too — a slug an operator renames (`spaceport auth user rename`) keeps the same `sub`, so an app that keyed its rows on the id never notices, while one that keyed them on a name it read somewhere would have just lost them. An operator can also bind somebody's IdP account to a user that already exists, before they have ever signed in (`spaceport auth user connect`), which is how a person spaceport already knows arrives under the `sub` the app already has rather than as a second one beside it.
 - `aud` — the app id, exactly `SPACEPORT_APP_ID`.
 - `roles` — the intersection of the user's entitlements with the roles the deployed manifest declares. Never empty: a user with no overlap gets a `403` from spaceport and the app hears nothing of the request.
 - `exp` — five minutes after `iat`. The token is a per-request assertion, not a session.

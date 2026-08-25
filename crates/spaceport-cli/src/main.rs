@@ -606,6 +606,19 @@ enum UserCommand {
     /// there: a user holds at most one identity per connection, so `connect`
     /// over an existing binding is refused rather than silently re-aimed.
     Disconnect(UserDisconnectArgs),
+    /// Change the name a user answers to, keeping who they are.
+    ///
+    /// Only the name moves. The id they were minted with stays theirs, and
+    /// everything hanging off it — entitlements, sessions, API keys, the IdP
+    /// account they are bound to, and the `sub` the apps stored their rows
+    /// under — carries on pointing at the same person, who does not even get
+    /// signed out. That is the difference from dropping them and creating the
+    /// new name: a fresh slug from a fresh create is a different user to
+    /// everything downstream, and the old one's access is gone.
+    ///
+    /// The new slug has to be free, exactly as at a create — while alice
+    /// exists there is one alice.
+    Rename(UserRenameArgs),
     /// Suspend a user, keeping the record but letting nothing in.
     Suspend(UserRefArgs),
     /// Let a suspended user back in.
@@ -674,6 +687,19 @@ struct UserDisconnectArgs {
     /// The connection to forget them at, as `spaceport connect list` prints
     /// it. `spaceport auth audit <user>` says which they hold.
     connection: String,
+
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Args)]
+struct UserRenameArgs {
+    /// The user, as a slug or a user id.
+    user: UserRef,
+
+    /// The name they answer to from now on: a lowercase letter, then lowercase
+    /// letters, digits and hyphens — the same alphabet a create takes.
+    slug: UserSlug,
 
     #[command(flatten)]
     server: ServerArgs,
@@ -1122,6 +1148,7 @@ async fn main() -> Result<()> {
                 UserCommand::Create(args) => user_create(args, colour).await,
                 UserCommand::Connect(args) => user_connect(args, colour).await,
                 UserCommand::Disconnect(args) => user_disconnect(args, colour).await,
+                UserCommand::Rename(args) => user_rename(args, colour).await,
                 UserCommand::Suspend(args) => user_suspend(args, colour).await,
                 UserCommand::Resume(args) => user_resume(args, colour).await,
                 UserCommand::Drop(args) => user_drop(args, colour).await,
@@ -1783,6 +1810,18 @@ async fn user_disconnect(args: UserDisconnectArgs, colour: Colour) -> Result<()>
         render::prose::block(
             &client::auth_user_disconnect(&args.server.operator()?, &args.user, &args.connection)
                 .await?,
+            colour
+        )
+    );
+
+    Ok(())
+}
+
+async fn user_rename(args: UserRenameArgs, colour: Colour) -> Result<()> {
+    print!(
+        "{}",
+        render::prose::block(
+            &client::auth_user_rename(&args.server.operator()?, &args.user, &args.slug).await?,
             colour
         )
     );

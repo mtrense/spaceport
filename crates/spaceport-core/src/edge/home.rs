@@ -3504,7 +3504,11 @@ mod tests {
         assert_eq!(minted.email, None);
         // Alice keeps hers, unlinked and untouched.
         assert_eq!(
-            listed.iter().find(|user| user.id == alice.id).unwrap().email,
+            listed
+                .iter()
+                .find(|user| user.id == alice.id)
+                .unwrap()
+                .email,
             Some("octocat@acme.example".to_owned())
         );
         // And the callback never even asked: `/user/emails` is off the login
