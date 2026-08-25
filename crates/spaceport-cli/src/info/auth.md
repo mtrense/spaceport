@@ -42,7 +42,9 @@ An app manifest may not set any variable whose name starts with `SPACEPORT` (cas
     "iat": 1785333600,
     "exp": 1785333900,
     "jti": "019fae2c-cf00-7c40-9e1a-6f2d4b7a9c81",
-    "roles": ["reader", "writer"]
+    "roles": ["reader", "writer"],
+    "name": "Mona Lisa",
+    "email": "mona@acme.example"
   }
 }
 ```
@@ -52,6 +54,14 @@ An app manifest may not set any variable whose name starts with `SPACEPORT` (cas
 - `roles` — the intersection of the user's entitlements with the roles the deployed manifest declares. Never empty: a user with no overlap gets a `403` from spaceport and the app hears nothing of the request.
 - `exp` — five minutes after `iat`. The token is a per-request assertion, not a session.
 - `jti` — fresh per token, for an app that wants replay detection.
+- `name`, `email` — who to greet, and where to write to them. Both are **optional**: a claim spaceport has no answer for is absent from the payload entirely, never `null` and never an empty string, so an app must handle a token that carries neither and fall back to something of its own. Neither is an identifier — see below.
+
+`name` and `email` exist so an app does not have to keep a user table just to put a name in a corner of the page. They are display data and nothing else:
+
+- **Never key rows on them, and never authorize on them.** `sub` is the only identifier in the token. A display name is free text the person can change at their IdP this afternoon, and an address can move to somebody else; an app that resolved a user by either would be resolving them by something spaceport itself refuses to resolve them by.
+- **`email` is not proof of anything.** It is either an address spaceport verified with a one-time code, or one the IdP claims about the account — the app cannot tell which, and should treat both as contact details, not as a credential or a second identity.
+- **They can change between two requests**, because they are re-read at every mint: the person signs in through a different connection, or renames themselves at the IdP, and the next token says something else. Do not treat a change as a different user.
+- Where they come from, if it matters: `email` is the address spaceport proved by code when the user has one, otherwise the address claimed by the identity they most recently signed in through; `name` is that identity's display name. The two are resolved independently, so they can come from different connections of the same person.
 
 Signature: Ed25519 (`alg: EdDSA`). Nothing else is ever issued and nothing else must ever be accepted.
 
@@ -157,7 +167,7 @@ spaceport auth session api-key ci-bot writer@<app-id> --expires 90d
 
 The key grants exactly that role at exactly that app, whatever the user otherwise holds — no separate `grant` is needed for it.
 
-The caller sends it as `Authorization: Bearer spk_…`. Spaceport validates it, strips it, and hands the app the same JWT shape it always gets — `sub` the owning user, `roles` the key's single role. The app cannot tell an API key from a browser session, and does not need to.
+The caller sends it as `Authorization: Bearer spk_…`. Spaceport validates it, strips it, and hands the app the same JWT shape it always gets — `sub` the owning user, `roles` the key's single role, and whatever `name` and `email` that user has, since a key belongs to a person or a technical user and not to a caller with an identity of its own. The app cannot tell an API key from a browser session, and does not need to.
 
 The full key is shown once, at mint. Only its prefix and last four characters can be listed afterwards. Dropping or suspending the owning user revokes it.
 
@@ -180,7 +190,7 @@ What the caller has to get right, and what it gets back when it does not. None o
 
 1. Which role names does the app understand, and what does each permit? (They go in the manifest and never change casually.)
 2. Where does the app currently get its user identity from, and can that be replaced by `sub` outright? What happens to existing rows keyed on the old identity?
-3. Does the app need anything about the user beyond the id and the roles — an email, a display name? The token carries neither, deliberately, and spaceport has no endpoint the app can ask.
+3. Does the app need anything about the user beyond the id and the roles? A display name and an address ride along as `name` and `email`, but both are optional and neither is an identifier — so what does the app show when a token carries neither, and is anything in it currently keyed on an address? Beyond those two there is nothing: spaceport has no endpoint the app can ask.
 4. Does the app have a login, a signup or a password reset of its own? All three have to go behind edge gating, or the app is running two auth systems that disagree.
 5. Which requests come from machines rather than browsers, and who owns the technical user each key is minted for?
 6. Are there endpoints that must stay reachable signed out (health checks, webhook receivers, static assets on error pages)? Each one is a public prefix, and a public prefix gets no token at all.

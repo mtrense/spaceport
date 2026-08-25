@@ -1514,6 +1514,10 @@ async fn run(args: RunArgs) -> Result<()> {
         logins: Arc::new(edge::LoginAttempts::new()),
         throttle: Arc::new(edge::LoginThrottle::new()),
         sso,
+        // The very repository the operator socket audits through, so that what
+        // a minted JWT says about a person and what `auth audit` prints are
+        // one answer about one table.
+        identities: identities.clone(),
     });
 
     let operator = args.operator.map(|endpoint| {

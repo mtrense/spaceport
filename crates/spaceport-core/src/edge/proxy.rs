@@ -656,6 +656,7 @@ mod tests {
             db.clone(),
             jwt_cache.clone(),
         ));
+        let identities = Arc::new(crate::auth::IdentityRepository::new(db.clone()));
         let signer = Arc::new(crate::auth::JwtSigner::new(db.clone()));
         let hostname = Some("spaceport.test".to_owned());
         let state = Arc::new(EdgeState {
@@ -690,12 +691,14 @@ mod tests {
                 https_port: 443,
                 logins: Arc::new(crate::edge::home::LoginAttempts::new()),
                 throttle: Arc::new(crate::edge::home::LoginThrottle::new()),
-                sso: Arc::new(crate::auth::SsoRepository::new(db)),
+                sso: Arc::new(crate::auth::SsoRepository::new(db.clone())),
+                identities: identities.clone(),
             })),
             apps,
             upstreams: Upstreams::new(),
             sessions,
             entitlements,
+            identities,
             signer,
             jwt_cache,
             hostname,
@@ -1660,6 +1663,11 @@ mod tests {
             payload["exp"].as_i64().unwrap() - payload["iat"].as_i64().unwrap(),
             300
         );
+        // This alice was created by an operator and has never signed in
+        // anywhere, so nobody has ever said what she is called — and the
+        // claims that would say it are absent rather than empty.
+        assert!(payload.get("name").is_none(), "{payload}");
+        assert!(payload.get("email").is_none(), "{payload}");
 
         // The verification an app's middleware performs, against the JWKS the
         // edge itself serves on spaceport's own hostname.
@@ -1685,6 +1693,45 @@ mod tests {
                     .unwrap(),
             )
             .expect("the edge's jwks should verify the edge's token");
+    }
+
+    /// The other half of what a gated app is told: who the person behind the
+    /// `sub` is, gathered from the identity their last login recorded — so an
+    /// app can greet somebody by name without keeping a user table of its own.
+    ///
+    /// The address here is the *most recent connection's*, and the name comes
+    /// with it, which is [`crate::auth::VouchedProfile::resolve`]'s ordering
+    /// reaching the wire.
+    #[tokio::test]
+    async fn a_gated_request_tells_the_app_what_to_call_the_person() {
+        let db = crate::state::Db::in_memory().unwrap();
+        let (cookie, user) = planted_cookie(&db, "alice", &["reader@blog"], "blog").await;
+        let identities = crate::auth::IdentityRepository::new(db.clone());
+        identities
+            .record(
+                &user,
+                "spaceport-acme",
+                "583231",
+                "octo-alice",
+                &crate::auth::Attributes::default(),
+                &crate::auth::IdpProfile {
+                    name: Some("Alice Liddell".to_owned()),
+                    email: Some("alice@acme.example".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated("blog", "alpha.test", credential_echo().await, ""))
+            .unwrap();
+        let edge = edge_over(apps, db).await;
+
+        let (status, _, body) = get_headed(edge, "alpha.test", "/", &[("cookie", &cookie)]).await;
+        assert_eq!(status, StatusCode::OK);
+        let payload = jwt_payload(&echoed_jwt(&body));
+        assert_eq!(payload["sub"], user.as_str());
+        assert_eq!(payload["name"], "Alice Liddell");
+        assert_eq!(payload["email"], "alice@acme.example");
     }
 
     /// The four-minute cache at work: the second request rides the first's

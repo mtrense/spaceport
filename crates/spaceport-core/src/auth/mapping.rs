@@ -738,6 +738,110 @@ impl IdpProfile {
     }
 }
 
+/// What spaceport is willing to tell an app about the person behind a `sub`:
+/// one name and one address, drawn from however many identities the user
+/// holds, or nothing when nobody ever said.
+///
+/// A type of its own rather than another [`IdpProfile`], because it is no
+/// longer one IdP's word: the address here may be the one the *email*
+/// connection proved with a code, and the name may come from a different
+/// connection than the address did. It is the answer to "who shall the JWT
+/// say this is", and the only thing that ever builds one is
+/// [`IdentityRepository::vouched`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VouchedProfile {
+    /// The display name to greet the person by, absent when no connection has
+    /// ever asserted one.
+    pub name: Option<String>,
+    /// The address to reach them at, absent when neither spaceport nor any
+    /// connection has one.
+    pub email: Option<String>,
+}
+
+impl VouchedProfile {
+    /// Resolve what a JWT says from `credential` — the address the *email*
+    /// connection signs this user in by, when they have one — and every
+    /// identity they hold.
+    ///
+    /// Three rules, and each is a choice with a discarded alternative behind
+    /// it.
+    ///
+    /// *The credential outranks the claims.* A mailbox proven today with a
+    /// one-time code is a better answer than GitHub's undated word about the
+    /// same kind of thing, so `users.email` wins whenever it is there — which
+    /// for an SSO-only user is never, which is why the fallthrough exists at
+    /// all. The name has no such counterpart: [`super::UserRecord::slug`] is a
+    /// handle an operator chose for their own listings, not what the person is
+    /// called, and shipping it as `name` would have every app greeting people
+    /// by a slug.
+    ///
+    /// *The most recent login wins among identities.* The ordering is by
+    /// [`IdentityRecord::last_login_at`], latest first, and an identity nobody
+    /// has ever used sorts last — which costs nothing, since a binding an
+    /// operator asserted carries no profile to lose. It needs no schema and no
+    /// configuration, and it tracks the account the person actually signs in
+    /// with. The alternative — recording which connection minted the session
+    /// and preferring that one — is truer where it applies and has no answer
+    /// at all for a one-time-code session or an API key, which mint JWTs too.
+    ///
+    /// *The two halves are resolved apart.* A connection that asserts a name
+    /// and no address cannot blank an address another one gave us. The halves
+    /// may therefore come from different connections, which reads like mixing
+    /// two people — except that every identity here is bound to one user, by
+    /// an operator or by a login that proved it, so by construction they are
+    /// all the same person.
+    pub fn resolve(credential: Option<&str>, identities: &[IdentityRecord]) -> Self {
+        // Cloned and sorted rather than indexed in place: `for_user` hands
+        // these back in connection order, which is the order an audit reads,
+        // and re-ordering the caller's slice to answer a question about it
+        // would be this function changing what it was lent.
+        let mut recent: Vec<&IdentityRecord> = identities.iter().collect();
+        recent.sort_by(|left, right| {
+            signed_in_at(right)
+                .cmp(&signed_in_at(left))
+                // Two identities of the same age — both never used, most
+                // often — fall back to connection name, so the answer is one
+                // answer and not whatever order SQLite happened to hand over.
+                .then_with(|| left.connection.cmp(&right.connection))
+        });
+
+        Self {
+            name: recent
+                .iter()
+                .find_map(|identity| identity.profile.name.clone()),
+            email: credential.map(str::to_owned).or_else(|| {
+                recent
+                    .iter()
+                    .find_map(|identity| identity.profile.email.clone())
+            }),
+        }
+    }
+
+    /// Whether there is anything to say — what a mint checks before adding
+    /// claims nobody can fill.
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none() && self.email.is_none()
+    }
+}
+
+/// When an identity was last signed in through, as an instant that sorts.
+///
+/// The stored text is parsed rather than compared as text, because RFC 3339
+/// does not sort lexicographically once fractional seconds are in play — a
+/// stamp with them reads as *earlier* than one without, since `.` precedes
+/// `Z`. A stamp this build cannot parse, and an identity nobody has used,
+/// both answer with the beginning of time: last place, where an unused
+/// binding belongs anyway.
+fn signed_in_at(identity: &IdentityRecord) -> time::OffsetDateTime {
+    identity
+        .last_login_at
+        .as_deref()
+        .and_then(|at| {
+            time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok()
+        })
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH)
+}
+
 /// One identity as the `idp_identities` table stores it, minus the user it
 /// belongs to — a read is always about one user, exactly as an entitlement
 /// read is.
@@ -925,6 +1029,72 @@ impl IdentityRepository {
                 },
             )
             .collect())
+    }
+
+    /// Who a JWT minted for `user` should say they are: the credential and
+    /// every identity, read in one transaction and resolved by
+    /// [`VouchedProfile::resolve`].
+    ///
+    /// One transaction so the two tables are about one moment — the same
+    /// reason [`super::EntitlementRepository::audit`] reads a user beside
+    /// their grants — and one method rather than two reads at the gate, so
+    /// that the cookie path and the API-key path cannot come to different
+    /// answers about the same person.
+    ///
+    /// A user the pool no longer knows answers with an empty profile rather
+    /// than an error. The gate meets the same race one line earlier and calls
+    /// it "no access"; a mint that is already going to be refused has no use
+    /// for a louder failure here, and an unknown user genuinely has nothing to
+    /// vouch for.
+    pub async fn vouched(&self, user: &UserId) -> Result<VouchedProfile> {
+        let user = user.clone();
+
+        self.db
+            .call(move |connection| {
+                let transaction = connection
+                    .transaction()
+                    .context("beginning to read a profile to vouch for")?;
+
+                let credential =
+                    match super::repository::find(&transaction, &super::UserRef::Id(user.clone()))?
+                    {
+                        Some(row) => super::repository::record(row)?.email,
+                        None => return Ok(VouchedProfile::default()),
+                    };
+
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT connection, last_login_at, profile_name, profile_email
+                         FROM idp_identities WHERE user_id = ?1",
+                    )
+                    .context("preparing the profile query")?;
+                let identities = statement
+                    .query_map(rusqlite::params![user.as_str()], |row| {
+                        // Built as whole records so the resolution runs over
+                        // exactly the type the audit path hands it, with the
+                        // two columns it never reads left at their empties:
+                        // an id and a snapshot decide nothing here, and
+                        // parsing the snapshot's JSON to throw it away would
+                        // make a mint fail over a row a login could still fix.
+                        Ok(IdentityRecord {
+                            connection: row.get(0)?,
+                            external_id: String::new(),
+                            external_login: String::new(),
+                            attributes: Attributes::default(),
+                            last_login_at: row.get(1)?,
+                            profile: IdpProfile {
+                                name: row.get(2)?,
+                                email: row.get(3)?,
+                            },
+                        })
+                    })
+                    .context("reading the identities to vouch from")?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .context("reading the identities to vouch from")?;
+
+                Ok(VouchedProfile::resolve(credential.as_deref(), &identities))
+            })
+            .await
     }
 
     /// Assert that `user` is `identity`, on its own commit — the write
@@ -1367,6 +1537,25 @@ mod tests {
         IdpProfile {
             name: Some(name.to_owned()),
             email: Some(email.to_owned()),
+        }
+    }
+
+    /// One identity as [`VouchedProfile::resolve`] looks at it: which
+    /// connection, when it was last signed in through, and what it calls the
+    /// person. The id, handle and snapshot decide nothing there, so they are
+    /// left empty rather than invented.
+    fn identity(
+        connection: &str,
+        last_login_at: Option<&str>,
+        profile: IdpProfile,
+    ) -> IdentityRecord {
+        IdentityRecord {
+            connection: connection.to_owned(),
+            external_id: String::new(),
+            external_login: String::new(),
+            attributes: Attributes::default(),
+            last_login_at: last_login_at.map(str::to_owned),
+            profile,
         }
     }
 
@@ -1844,6 +2033,156 @@ mod tests {
         assert_eq!(held[0].external_login, "octo-renamed");
         assert_eq!(held[0].attributes["org"], ["other-org"]);
         assert!(held[0].profile.is_empty(), "{:?}", held[0].profile);
+    }
+
+    /// The resolution's first rule: an address proven with a one-time code
+    /// beats any number of connections asserting one, and the fallthrough
+    /// exists for the ordinary SSO user, who has no credential at all.
+    #[test]
+    fn a_proven_address_outranks_every_claimed_one() {
+        let claimed = [identity(
+            "spaceport-acme",
+            Some("2026-08-20T00:00:00Z"),
+            profile("Alice Liddell", "alice@acme.example"),
+        )];
+
+        let credentialed = VouchedProfile::resolve(Some("alice@proven.example"), &claimed);
+        assert_eq!(credentialed.email.as_deref(), Some("alice@proven.example"));
+        // Only the address is outranked. The name has no credential to lose
+        // to — a user slug is an operator's handle, not what somebody is
+        // called — so the connection's word stands.
+        assert_eq!(credentialed.name.as_deref(), Some("Alice Liddell"));
+
+        let sso_only = VouchedProfile::resolve(None, &claimed);
+        assert_eq!(sso_only.email.as_deref(), Some("alice@acme.example"));
+
+        // And a user nobody has said anything about is vouched for by their
+        // subject alone.
+        assert!(VouchedProfile::resolve(None, &[]).is_empty());
+    }
+
+    /// The second rule: among identities, the one they signed in through most
+    /// recently wins — and a binding an operator asserted, which has no login
+    /// behind it, sorts last where it can never take a live answer's place.
+    #[test]
+    fn the_most_recent_login_says_who_the_person_is() {
+        let identities = [
+            identity(
+                "spaceport-acme",
+                Some("2026-08-20T00:00:00Z"),
+                profile("Alice at Acme", "alice@acme.example"),
+            ),
+            identity(
+                "spaceport-zeta",
+                Some("2026-08-24T00:00:00Z"),
+                profile("Alice at Zeta", "alice@zeta.example"),
+            ),
+            identity(
+                "spaceport-old",
+                None,
+                profile("Stale Alice", "stale@example"),
+            ),
+        ];
+
+        let vouched = VouchedProfile::resolve(None, &identities);
+        assert_eq!(vouched.name.as_deref(), Some("Alice at Zeta"));
+        assert_eq!(vouched.email.as_deref(), Some("alice@zeta.example"));
+
+        // Ordered by the stamp and not by the order the rows arrive in: the
+        // same three identities read back the other way round answer the same.
+        let mut backwards = identities.clone();
+        backwards.reverse();
+        assert_eq!(VouchedProfile::resolve(None, &backwards), vouched);
+    }
+
+    /// Stamps are compared as moments, never as text: RFC 3339 with
+    /// fractional seconds sorts *before* the same second without them, because
+    /// `.` precedes `Z` — so a lexicographic winner would be the older login.
+    #[test]
+    fn a_fractional_second_does_not_reorder_two_logins() {
+        let identities = [
+            identity(
+                "spaceport-acme",
+                Some("2026-08-24T09:00:00Z"),
+                profile("Earlier", "earlier@example"),
+            ),
+            identity(
+                "spaceport-zeta",
+                Some("2026-08-24T09:00:00.500Z"),
+                profile("Later", "later@example"),
+            ),
+        ];
+
+        assert_eq!(
+            VouchedProfile::resolve(None, &identities).name.as_deref(),
+            Some("Later")
+        );
+    }
+
+    /// The third rule: the halves are resolved apart, so a connection that
+    /// says a name and no address cannot blank an address another one gave
+    /// us — the two may therefore come from different connections, which is
+    /// one person's two accounts and not two people.
+    #[test]
+    fn each_half_of_a_profile_is_resolved_on_its_own() {
+        let vouched = VouchedProfile::resolve(
+            None,
+            &[
+                identity(
+                    "spaceport-acme",
+                    Some("2026-08-20T00:00:00Z"),
+                    IdpProfile {
+                        name: None,
+                        email: Some("alice@acme.example".to_owned()),
+                    },
+                ),
+                identity(
+                    "spaceport-zeta",
+                    Some("2026-08-24T00:00:00Z"),
+                    IdpProfile {
+                        name: Some("Alice Liddell".to_owned()),
+                        email: None,
+                    },
+                ),
+            ],
+        );
+
+        assert_eq!(vouched.name.as_deref(), Some("Alice Liddell"));
+        assert_eq!(vouched.email.as_deref(), Some("alice@acme.example"));
+    }
+
+    /// What the gate actually calls: the credential and the identities read
+    /// together, resolved into the two claims a JWT carries.
+    #[tokio::test]
+    async fn vouching_reads_the_credential_and_the_claims_as_one() {
+        let (_, users, _, identities, _) = repositories();
+        let alice = users
+            .create(&slug("alice"), Some("alice@proven.example"), None)
+            .await
+            .unwrap();
+        identities
+            .record(
+                &alice.id,
+                "spaceport-acme",
+                "583231",
+                "octo-alice",
+                &attributes(&[("org", &["acme-corp"])]),
+                &profile("Alice Liddell", "alice@acme.example"),
+            )
+            .await
+            .unwrap();
+
+        let vouched = identities.vouched(&alice.id).await.unwrap();
+        assert_eq!(vouched.name.as_deref(), Some("Alice Liddell"));
+        assert_eq!(vouched.email.as_deref(), Some("alice@proven.example"));
+
+        // A user the pool no longer knows is nobody to vouch for — the race
+        // the gate meets one line before it refuses for want of access.
+        users
+            .drop_user(&UserRef::Id(alice.id.clone()))
+            .await
+            .unwrap();
+        assert!(identities.vouched(&alice.id).await.unwrap().is_empty());
     }
 
     /// The drop cascade, seen from this table: the identity dies with the

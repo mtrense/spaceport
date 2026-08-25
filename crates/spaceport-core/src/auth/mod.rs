@@ -39,7 +39,7 @@ pub use log::{AuthEvent, AuthLogRepository, OPERATOR_ORIGIN, SYSTEM_ORIGIN, WEB_
 pub use mapping::{
     AccountAtConnection, AssertedIdentity, Attributes, Condition, DroppedRule, IdentityRecord,
     IdentityRepository, IdpProfile, MappingError, MappingRecord, MappingRepository, RolesAtApp,
-    evaluate,
+    VouchedProfile, evaluate,
 };
 pub use repository::UserRepository;
 pub use session::{

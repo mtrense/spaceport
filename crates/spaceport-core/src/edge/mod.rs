@@ -248,6 +248,12 @@ pub struct EdgeState {
     /// carries. The same repository the exchange checks entitlements through,
     /// because both are reading the same access question at different moments.
     pub entitlements: Arc<crate::auth::EntitlementRepository>,
+    /// Who each user is at their connections, for the `name` and `email` a
+    /// minted JWT carries. Read per mint beside the entitlements, and by the
+    /// same argument: what an IdP last said about a person can have changed
+    /// since the session began, and the token is the thing that has to be
+    /// current.
+    pub identities: Arc<crate::auth::IdentityRepository>,
     /// The key the gate signs JWTs with — the same signer whose JWKS the home
     /// router serves, or a token minted here would fail against the document
     /// apps verify with.
@@ -291,6 +297,7 @@ pub async fn serve(
     // page minted — and this is where that sameness is wired.
     let sessions = home.sessions.clone();
     let entitlements = home.entitlements.clone();
+    let identities = home.identities.clone();
     let signer = home.signer.clone();
     let jwt_cache = home.jwt_cache.clone();
     let hostname = home.hostname.clone();
@@ -308,6 +315,7 @@ pub async fn serve(
         upstreams: proxy::Upstreams::new(),
         sessions,
         entitlements,
+        identities,
         signer,
         jwt_cache,
         hostname,
@@ -689,6 +697,7 @@ mod tests {
             upstreams: proxy::Upstreams::new(),
             sessions,
             entitlements,
+            identities: Arc::new(crate::auth::IdentityRepository::new(db.clone())),
             signer: Arc::new(crate::auth::JwtSigner::new(db)),
             jwt_cache,
             hostname: None,

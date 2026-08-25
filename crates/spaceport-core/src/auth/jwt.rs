@@ -613,12 +613,21 @@ fn retired_beyond_grace(at: &str) -> bool {
 /// again here: the spec says an empty intersection is a `403` and never an
 /// empty-`roles` JWT, and this refusal is the last line of defence against
 /// the gate's check and this signature drifting apart.
+///
+/// `profile` is the opposite kind of claim and is allowed to be empty. `sub`
+/// says who may act; `name` and `email` only say what to call them, so that
+/// an app need not run its own user table to greet a person by name. Neither
+/// is a key an app should ever look a user up by — spaceport resolves nobody
+/// by an address, and the name is free text the account holder can change
+/// this afternoon — and both are simply absent when nothing has been
+/// asserted, an absence deliberately distinguishable from a blank string.
 pub fn mint(
     key: &SigningKey,
     iss: &str,
     sub: &UserId,
     aud: &AppId,
     roles: &[Role],
+    profile: &crate::auth::VouchedProfile,
     now: time::OffsetDateTime,
 ) -> Result<Secret> {
     if roles.is_empty() {
@@ -633,7 +642,7 @@ pub fn mint(
         "kid": key.kid,
     });
     let iat = now.unix_timestamp();
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "iss": iss,
         "sub": sub,
         "aud": aud.as_str(),
@@ -642,6 +651,19 @@ pub fn mint(
         "jti": uuid_v4()?,
         "roles": roles,
     });
+
+    // Added rather than declared in the literal above, because a claim
+    // spaceport cannot fill must not appear at all: `serde_json` would write
+    // `"name": null`, and a verifier reading that has to decide whether null
+    // means unknown or means the person has no name. An absent key asks
+    // nobody that.
+    if let Some(claims) = payload.as_object_mut() {
+        for (claim, said) in [("name", &profile.name), ("email", &profile.email)] {
+            if let Some(said) = said {
+                claims.insert(claim.to_owned(), serde_json::Value::String(said.clone()));
+            }
+        }
+    }
 
     let message = format!(
         "{}.{}",
@@ -865,6 +887,7 @@ impl Default for JwtCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::VouchedProfile;
 
     fn db() -> Db {
         Db::in_memory().unwrap()
@@ -952,6 +975,7 @@ mod tests {
             &user("aaaaaaaa"),
             &app("blog"),
             &roles(&["reader", "writer"]),
+            &VouchedProfile::default(),
             moment(),
         )
         .unwrap();
@@ -980,6 +1004,57 @@ mod tests {
             payload["jti"].as_str().unwrap().parse::<UserId>().is_ok(),
             "{payload}"
         );
+
+        // Seven and no more: nobody has said what this person is called, so
+        // the claims that would say it are absent rather than null.
+        assert_eq!(payload.as_object().unwrap().len(), 7, "{payload}");
+        assert!(payload.get("name").is_none(), "{payload}");
+        assert!(payload.get("email").is_none(), "{payload}");
+    }
+
+    /// What spaceport knows about the person rides along beside the subject —
+    /// and only the halves it actually knows, so an app can tell "nobody ever
+    /// told us" from "their name is the empty string".
+    #[tokio::test]
+    async fn a_minted_jwt_says_what_to_call_the_subject() {
+        let signer = JwtSigner::new(db());
+        let key = key(&signer).await;
+        let claims = |profile: &VouchedProfile| {
+            let jwt = mint(
+                &key,
+                "https://spaceport.test",
+                &user("aaaaaaaa"),
+                &app("blog"),
+                &roles(&["reader"]),
+                profile,
+                moment(),
+            )
+            .unwrap();
+
+            decode(jwt.expose().split('.').nth(1).unwrap())
+        };
+
+        let both = claims(&VouchedProfile {
+            name: Some("Alice Liddell".to_owned()),
+            email: Some("alice@acme.example".to_owned()),
+        });
+        assert_eq!(both["name"], "Alice Liddell");
+        assert_eq!(both["email"], "alice@acme.example");
+
+        // Half a profile is half the claims, not one claim and one null.
+        let named = claims(&VouchedProfile {
+            name: Some("Alice Liddell".to_owned()),
+            email: None,
+        });
+        assert_eq!(named["name"], "Alice Liddell");
+        assert!(named.get("email").is_none(), "{named}");
+
+        // And nothing said about the person changes nothing about the token
+        // that vouches for them: the roles are still the whole of what it
+        // authorises.
+        let anonymous = claims(&VouchedProfile::default());
+        assert_eq!(anonymous["roles"], serde_json::json!(["reader"]));
+        assert_eq!(anonymous.as_object().unwrap().len(), 7, "{anonymous}");
     }
 
     /// Two mints are two tokens: the `jti` is fresh every time, which is what
@@ -1001,6 +1076,7 @@ mod tests {
             &user("aaaaaaaa"),
             &app("blog"),
             &roles(&["reader"]),
+            &VouchedProfile::default(),
             moment(),
         )
         .unwrap();
@@ -1010,6 +1086,7 @@ mod tests {
             &user("aaaaaaaa"),
             &app("blog"),
             &roles(&["reader"]),
+            &VouchedProfile::default(),
             moment(),
         )
         .unwrap();
@@ -1031,6 +1108,7 @@ mod tests {
             &user("aaaaaaaa"),
             &app("blog"),
             &[],
+            &VouchedProfile::default(),
             moment(),
         )
         .unwrap_err();
@@ -1051,6 +1129,7 @@ mod tests {
             &user("aaaaaaaa"),
             &app("blog"),
             &roles(&["reader"]),
+            &VouchedProfile::default(),
             moment(),
         )
         .unwrap();
@@ -1097,6 +1176,7 @@ mod tests {
             &user("aaaaaaaa"),
             &app("blog"),
             &roles(&["reader"]),
+            &VouchedProfile::default(),
             moment(),
         )
         .unwrap();
@@ -1200,6 +1280,7 @@ mod tests {
             &user("aaaaaaaa"),
             &app("blog"),
             &roles(&["reader"]),
+            &VouchedProfile::default(),
             moment(),
         )
         .unwrap();
@@ -1211,6 +1292,7 @@ mod tests {
             &user("aaaaaaaa"),
             &app("blog"),
             &roles(&["reader"]),
+            &VouchedProfile::default(),
             moment(),
         )
         .unwrap();

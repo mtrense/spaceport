@@ -319,6 +319,7 @@ async fn vouch(
         user,
         &app.id,
         &intersection,
+        &vouched(state, user).await,
         time::OffsetDateTime::now_utc(),
     ) {
         Ok(jwt) => jwt,
@@ -335,6 +336,29 @@ async fn vouch(
     state.jwt_cache.insert(token, &app.id, user, jwt.clone());
 
     Admission::Pass { bearer: Some(jwt) }
+}
+
+/// Who the JWT about to be minted should say `user` is — or nobody, when the
+/// read fails.
+///
+/// A failed read warns and mints anyway, deliberately. `name` and `email`
+/// decide nothing, so turning a database hiccup over a display name into a
+/// `500` would refuse a request that access has already been granted for, and
+/// make a greeting into an outage. It is the same rule the GitHub login
+/// follows when the address read fails: a profile must never cost somebody
+/// their way in.
+async fn vouched(state: &EdgeState, user: &crate::auth::UserId) -> crate::auth::VouchedProfile {
+    match state.identities.vouched(user).await {
+        Ok(profile) => profile,
+        Err(error) => {
+            warn!(
+                error = %format!("{error:#}"),
+                "could not read who to vouch for; minting a jwt that says only the subject"
+            );
+
+            crate::auth::VouchedProfile::default()
+        }
+    }
 }
 
 /// The API key a request presents, if it presents one: the first
@@ -404,6 +428,11 @@ async fn vouch_key(
         user,
         &app.id,
         &[role],
+        // The same person the cookie path would have vouched for: a key
+        // belongs to a user, not to a robot with a name of its own, so an app
+        // behind one is told who is calling in exactly the words a browser
+        // session would have used.
+        &vouched(state, user).await,
         time::OffsetDateTime::now_utc(),
     ) {
         Ok(jwt) => jwt,

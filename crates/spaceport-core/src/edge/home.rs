@@ -92,6 +92,11 @@ pub struct Home {
     /// before it mints anything: a nonce is a promise the callback will keep,
     /// so the entitlement question has to be answered before one exists.
     pub entitlements: Arc<EntitlementRepository>,
+    /// Who each user is at their connections. On the `Home` for the wiring's
+    /// sake, exactly as `jwt_cache` is: nothing on this host reads it, but
+    /// `edge::serve` copies it out for [`super::EdgeState`], where every mint
+    /// asks it what to call the person it is vouching for.
+    pub identities: Arc<crate::auth::IdentityRepository>,
     /// Where the exchange records an access denial. The one auth event a page
     /// here writes outside a mutation's transaction, because a denial *is* no
     /// mutation — see [`AuthLogRepository::record`].
@@ -1850,7 +1855,8 @@ mod tests {
             https_port: 443,
             logins: Arc::new(LoginAttempts::new()),
             throttle: Arc::new(LoginThrottle::new()),
-            sso: Arc::new(SsoRepository::new(db)),
+            sso: Arc::new(SsoRepository::new(db.clone())),
+            identities: Arc::new(crate::auth::IdentityRepository::new(db)),
         });
 
         (home, github)
@@ -2595,6 +2601,7 @@ mod tests {
             logins: Arc::new(LoginAttempts::new()),
             throttle: Arc::new(LoginThrottle::new()),
             sso: Arc::new(SsoRepository::new(db.clone())),
+            identities: Arc::new(crate::auth::IdentityRepository::new(db.clone())),
         });
 
         (home, crate::auth::UserRepository::new(db), entitlements)
@@ -3255,6 +3262,7 @@ mod tests {
             logins: Arc::new(LoginAttempts::new()),
             throttle: Arc::new(LoginThrottle::new()),
             sso: Arc::new(SsoRepository::new(db.clone())),
+            identities: Arc::new(crate::auth::IdentityRepository::new(db.clone())),
         });
 
         (home, github, db)
