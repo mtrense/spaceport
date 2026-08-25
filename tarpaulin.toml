@@ -1,0 +1,38 @@
+# Line coverage for the workspace, measured by cargo-tarpaulin.
+#
+# `cargo tarpaulin` reads this file on its own, so the flags live here rather
+# than in the CI workflow and in whatever a person types: one place to change,
+# and a laptop measures the same thing the pipeline does.
+#
+#   cargo install cargo-tarpaulin --locked
+#   cargo tarpaulin
+#
+# Reports land in `target/coverage`: `tarpaulin-report.html` to read through,
+# `lcov.info` to feed an editor or a diff overlay.
+[default]
+workspace = true
+all-features = true
+# The lockfile CI vetted, for the same reason `cargo test --locked` uses it: a
+# semver-compatible point release must not slip into a measurement run.
+locked = true
+
+# Whatever the host supports: ptrace on Linux, the instrumentation-based llvm
+# engine everywhere else. Worth knowing if a number ever looks wrong: ptrace
+# single-steps breakpoints across every thread, and this workspace's tokio
+# tests have a lot of them, so hits can go missing when a task moves between
+# worker threads. `engine = "Llvm"` counts in-process instead, and is the
+# thing to try before believing a suspicious Linux result.
+engine = "Auto"
+
+# Stdout for whoever is watching, Lcov for any tool that wants to consume it
+# (editor gutters, a reviewer's diff overlay), Html to open and click through.
+out = ["Stdout", "Lcov", "Html"]
+# Under `target/`, which is already git-ignored.
+output-dir = "target/coverage"
+
+# Coverage of a test harness by itself is not a number worth reading.
+exclude-files = ["target/*", "examples/*"]
+
+# Instrumented builds run slower than the 60s default allows for anything that
+# waits on a timer.
+timeout = "300s"

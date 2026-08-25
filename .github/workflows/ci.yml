@@ -60,6 +60,41 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-features --locked
 
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Built from source and pinned, rather than pulled as a release binary
+      # from a third party: it is one more thing running over this checkout,
+      # and the cache above keeps the compile off all but the first run.
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin --locked --version 0.37.2
+
+      # Flags live in `tarpaulin.toml`, so this measures what a laptop running
+      # `cargo tarpaulin` measures. Informational for now — nothing here
+      # fails on a percentage; add `--fail-under N` once the number has a floor
+      # worth defending.
+      - name: Coverage
+        run: cargo tarpaulin
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        # Also when the tests fail: the partial report is how you find out how
+        # far the run got.
+        if: always()
+        with:
+          name: coverage
+          path: target/coverage
+          # A run that died before tarpaulin wrote anything has already failed
+          # for a better reason than a missing artifact.
+          if-no-files-found: warn
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
