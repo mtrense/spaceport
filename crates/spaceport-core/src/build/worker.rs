@@ -1388,7 +1388,7 @@ auth:
             Nudge::new(),
             shutdown.clone(),
         ));
-        until_built(&fixture, "site", REVISION).await;
+        until_built(&fixture, Policy::default().settle, "site", REVISION).await;
         shutdown.cancel();
         running.await.unwrap();
 
@@ -1425,17 +1425,34 @@ auth:
     /// Give the loop enough turns to have acted on what it has been told,
     /// without moving the clock: a nudge wakes a task, and a task that has not
     /// been polled yet has not started settling on it.
+    ///
+    /// Turns on their own are not enough, because a pass queries the database
+    /// on a blocking thread: two hundred of them go by in microseconds while
+    /// that thread is still waiting for a core. So the turns are split around a
+    /// pause on the real clock, which the paused one does not see.
     async fn let_the_loop_run() {
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
         for _ in 0..200 {
             tokio::task::yield_now().await;
         }
     }
 
-    /// Let the loop run until it has built `revision`, without moving the
-    /// clock: a test that slept would be a test that let the interval elapse
-    /// behind its own back.
-    async fn until_built(fixture: &Fixture, id: &str, revision: &str) {
-        for _ in 0..10_000 {
+    /// Let the loop run until it has built `revision`, without letting the
+    /// interval move.
+    ///
+    /// The settle is nudged along a step at a time rather than all at once,
+    /// because the sleep it belongs to is only registered after the pass before
+    /// it has finished, and an advance that lands before that is an advance the
+    /// loop never sees. A hundred steps is minutes against an interval of five
+    /// of them, so nothing here is the interval elapsing behind the test's back.
+    async fn until_built(fixture: &Fixture, settle: Duration, id: &str, revision: &str) {
+        for _ in 0..100 {
+            let_the_loop_run().await;
             if fixture
                 .worker
                 .builds
@@ -1447,7 +1464,7 @@ auth:
                 return;
             }
 
-            tokio::task::yield_now().await;
+            tokio::time::advance(settle.unsigned_abs()).await;
         }
 
         panic!("`{id}` was never built at `{revision}`");
@@ -1503,9 +1520,7 @@ auth:
 
         let woken = tokio::time::Instant::now();
         nudge.nudge();
-        let_the_loop_run().await;
-        tokio::time::advance(policy.settle.unsigned_abs()).await;
-        until_built(&fixture, "site", REVISION).await;
+        until_built(&fixture, policy.settle, "site", REVISION).await;
 
         assert!(
             woken.elapsed() < policy.interval.unsigned_abs(),
@@ -1530,7 +1545,7 @@ auth:
             Nudge::new(),
             shutdown.clone(),
         ));
-        until_built(&fixture, "site", REVISION).await;
+        until_built(&fixture, Policy::default().settle, "site", REVISION).await;
         // Cancelled while the loop is sleeping off an interval that is minutes
         // away: without the select arm this would never return.
         shutdown.cancel();

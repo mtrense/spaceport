@@ -691,19 +691,22 @@ mod tests {
             .count()
     }
 
-    /// Wait until `expected` passes have run, without letting the clock move.
+    /// Wait until `expected` passes have run, without letting the interval move.
     ///
-    /// Yields rather than sleeps on purpose: the clock in these tests is paused
-    /// and only advances when nothing is ready to run, so a test that slept
-    /// would be a test that let the hourly interval elapse behind its own back —
-    /// which is the very thing the nudge is supposed to make unnecessary.
-    async fn until_passes(github: &Arc<FakeGitHub>, expected: usize) {
-        for _ in 0..10_000 {
+    /// The paused clock never advances on its own here, so the settle is nudged
+    /// along a step at a time — once round is not enough, because the sleep the
+    /// settle belongs to is only registered after the pass before it has
+    /// finished, and an advance that lands before that is an advance the loop
+    /// never sees. A hundred steps is minutes against an interval of an hour,
+    /// so nothing here is the interval elapsing behind the test's back.
+    async fn until_passes(github: &Arc<FakeGitHub>, settle: Duration, expected: usize) {
+        for _ in 0..100 {
+            let_the_loop_run().await;
             if passes(github) >= expected {
                 return;
             }
 
-            tokio::task::yield_now().await;
+            tokio::time::advance(settle.unsigned_abs()).await;
         }
 
         panic!("{} passes ran, and {expected} were wanted", passes(github));
@@ -712,7 +715,18 @@ mod tests {
     /// Give the loop enough turns to have acted on what it has been told,
     /// without moving the clock: a nudge wakes a task, and a task that has not
     /// been polled yet has not started settling on it.
+    ///
+    /// Turns on their own are not enough, because a pass queries the database
+    /// on a blocking thread: a hundred of them pass in microseconds while that
+    /// thread is still waiting for a core. So the turns are split around a
+    /// pause on the real clock, which the paused one does not see.
     async fn let_the_loop_run() {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
         for _ in 0..100 {
             tokio::task::yield_now().await;
         }
@@ -733,13 +747,11 @@ mod tests {
             nudge.clone(),
             shutdown.clone(),
         ));
-        until_passes(&github, 1).await;
+        until_passes(&github, policy.settle, 1).await;
 
         let woken = tokio::time::Instant::now();
         nudge.nudge();
-        let_the_loop_run().await;
-        tokio::time::advance(policy.settle.unsigned_abs()).await;
-        until_passes(&github, 2).await;
+        until_passes(&github, policy.settle, 2).await;
 
         assert!(
             woken.elapsed() < policy.interval.unsigned_abs(),
@@ -765,7 +777,7 @@ mod tests {
             nudge.clone(),
             shutdown.clone(),
         ));
-        until_passes(&github, 1).await;
+        until_passes(&github, policy.settle, 1).await;
 
         nudge.nudge();
         let_the_loop_run().await;
@@ -774,8 +786,7 @@ mod tests {
         tokio::time::advance(Duration::milliseconds(500).unsigned_abs()).await;
         nudge.nudge();
         nudge.nudge();
-        tokio::time::advance(policy.settle.unsigned_abs()).await;
-        until_passes(&github, 2).await;
+        until_passes(&github, policy.settle, 2).await;
         // And nothing follows it: the loop is back on its interval rather than
         // working through a queue of shoves.
         let_the_loop_run().await;
@@ -800,7 +811,7 @@ mod tests {
             nudge.clone(),
             shutdown.clone(),
         ));
-        until_passes(&github, 1).await;
+        until_passes(&github, policy.settle, 1).await;
 
         nudge.nudge();
         // The loop has taken the nudge and started settling on it, and the
