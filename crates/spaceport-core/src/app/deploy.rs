@@ -1106,9 +1106,42 @@ container:
 
     /// Give the loop enough turns to have acted on what it was told, without
     /// moving the clock: a task that has not been polled has not started.
+    ///
+    /// Turns on their own are not enough, because every repository call is a
+    /// query on a blocking thread: two hundred of them pass in microseconds
+    /// while that thread is still waiting for a core. So the turns are split
+    /// around a pause on the real clock, which the paused one does not see.
     async fn let_the_loop_run() {
         for _ in 0..200 {
             tokio::task::yield_now().await;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Let the loop run until `done`, moving only the settle along.
+    ///
+    /// A busy machine — a coverage run instruments every line of this — can
+    /// leave the pass's queries queued for longer than any single wait wants to
+    /// budget for, so the wait is on what the loop did rather than on a number
+    /// of turns, and gives up only after seconds of them.
+    ///
+    /// The settle is advanced each time round rather than once, because the
+    /// sleep it belongs to is only registered once the pass before it has
+    /// finished. Nothing here advances the interval, so what a test asserts
+    /// afterwards is still about the nudge.
+    async fn let_the_loop_reach(settle: Duration, done: impl Fn() -> bool) {
+        for _ in 0..100 {
+            let_the_loop_run().await;
+            if done() {
+                return;
+            }
+
+            tokio::time::advance(settle.unsigned_abs()).await;
         }
     }
 
@@ -1134,9 +1167,7 @@ container:
 
         let woken = tokio::time::Instant::now();
         nudge.nudge();
-        let_the_loop_run().await;
-        tokio::time::advance(policy.settle.unsigned_abs()).await;
-        let_the_loop_run().await;
+        let_the_loop_reach(policy.settle, || !fixture.runtime.launches().is_empty()).await;
 
         assert_eq!(fixture.runtime.launches(), [image(PUSHED)]);
         assert!(
@@ -1160,7 +1191,10 @@ container:
             Nudge::new(),
             shutdown.clone(),
         ));
-        let_the_loop_run().await;
+        let_the_loop_reach(Policy::default().settle, || {
+            !fixture.runtime.launches().is_empty()
+        })
+        .await;
         // Cancelled while the loop is sleeping off an interval that is minutes
         // away: without the select arm this would never return.
         shutdown.cancel();

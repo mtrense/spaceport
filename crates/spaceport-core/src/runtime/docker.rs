@@ -1987,6 +1987,11 @@ volumes:
         let name = container_name(&app);
         let _ = runtime.remove_container(&name).await;
 
+        // Pulled by hand, because this test creates the container by hand: the
+        // pull is `launch`'s, and a machine that has never run this image has
+        // nothing for `create_container` to find.
+        runtime.pull("traefik/whoami:latest").await.unwrap();
+
         // What an older spaceport would have created: managed and named, with
         // nothing said about its configuration.
         let body = ContainerCreateBody {
