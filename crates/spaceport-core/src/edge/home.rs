@@ -597,9 +597,9 @@ async fn login_page(State(home): State<Arc<Home>>, Query(query): Query<LoginQuer
     login_form(StatusCode::OK, None, query.next.as_deref(), &buttons)
 }
 
-/// The "Sign in with GitHub" buttons, one per connection, already escaped —
-/// or an empty string when there are none, which leaves the page exactly the
-/// page it was before SSO existed.
+/// The GitHub buttons, one per connection, already escaped — or an empty
+/// string when there are none, which leaves the page exactly the page it was
+/// before SSO existed.
 ///
 /// Each is a `GET` form to the start route with `next` in a hidden field: a
 /// form so the buttons match the code form beside them, `GET` because starting
@@ -608,6 +608,13 @@ async fn login_page(State(home): State<Arc<Home>>, Query(query): Query<LoginQuer
 /// A connections read that fails costs the buttons and not the page: the code
 /// form is a working way in, and refusing it because SSO is having trouble
 /// would be the wrong door to close.
+///
+/// The label is the connection's *owner* and not its name. The name is the
+/// App's, which for an app spaceport registered from a manifest is a machine's
+/// idea of a name — `app01-mxtr-dev-mtrense` — while the owner is the
+/// organisation whose account the person clicking is about to prove they are
+/// in. The App's name earns a second, quieter label only where it is the thing
+/// that tells two rows apart: two Apps under one owner.
 async fn sso_buttons(home: &Home, next: Option<&str>) -> String {
     let connections = match home.connections.all().await {
         Ok(connections) => connections,
@@ -625,27 +632,47 @@ async fn sso_buttons(home: &Home, next: Option<&str>) -> String {
             escape(next)
         ),
     };
-    // The connection's display name only when there is a choice to make: one
-    // App is "GitHub" to the person clicking, two are two doors that need
-    // labels.
-    let named = connections.len() > 1;
+    // How many connections each owner holds. One is a row that needs no second
+    // label — the octicon beside it already says which forge this is, and the
+    // owner says the rest. Two are two doors that would otherwise read the
+    // same.
+    let mut held: HashMap<&str, usize> = HashMap::new();
+    for connection in &connections {
+        *held.entry(connection.owner.as_str()).or_default() += 1;
+    }
 
-    connections
+    let buttons: String = connections
         .iter()
         .map(|connection| {
-            let label = match named {
-                true => format!("Sign in with GitHub ({})", escape(&connection.name)),
-                false => "Sign in with GitHub".to_owned(),
+            let app = match held[connection.owner.as_str()] > 1 {
+                true => format!(
+                    "\n    <span class=\"via\">{}</span>",
+                    escape(&connection.name)
+                ),
+                false => String::new(),
             };
 
             format!(
                 "<form method=\"get\" action=\"/auth/github/{slug}\">\n{next}  \
-                 <button type=\"submit\">{label}</button>\n</form>\n",
+                 <button type=\"submit\">\n    {OCTICON}\n    \
+                 <span class=\"org\">{owner}</span>{app}\n  </button>\n</form>\n",
                 slug = escape(&connection.slug),
+                owner = escape(&connection.owner),
             )
         })
-        .collect()
+        .collect();
+
+    match buttons.is_empty() {
+        true => String::new(),
+        false => format!("<div class=\"sso\">\n{buttons}</div>\n"),
+    }
 }
+
+/// GitHub's mark, inline because the login page fetches nothing: a button whose
+/// icon arrives on a second request is a button that is briefly wrong, and a
+/// page that reaches off-host for an image is a page that leaks who is looking
+/// at it.
+const OCTICON: &str = r#"<svg width="18" height="18" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>"#;
 
 /// `POST /login`: redeem the code, set the cookie, go where `next` says.
 ///
@@ -1395,11 +1422,19 @@ struct LoginQuery {
     next: Option<String>,
 }
 
-/// The login form, with `error` above it when the last attempt failed, `next`
-/// carried through a hidden field, and `buttons` — the pre-rendered, already
-/// escaped SSO forms from [`sso_buttons`], or nothing — below it. The code
-/// input turns autocomplete and its relatives off because a one-time code is
-/// the one value a browser must not helpfully remember.
+/// The login form: `buttons` — the pre-rendered, already escaped SSO forms
+/// from [`sso_buttons`], or nothing — first, the code form under them, `error`
+/// above both when the last attempt failed, and `next` carried through a hidden
+/// field in every form on the page.
+///
+/// SSO leads because for anybody whose spaceport has a connection it is the way
+/// in; the code is the fallback that works when it is not. A spaceport with no
+/// connection is the page it always was, down to the sentence: the lede and the
+/// divider both appear only alongside buttons, so a host with no GitHub in it
+/// says nothing about GitHub.
+///
+/// The code input turns autocomplete and its relatives off because a one-time
+/// code is the one value a browser must not helpfully remember.
 fn login_form(
     status: StatusCode,
     error: Option<&str>,
@@ -1407,7 +1442,7 @@ fn login_form(
     buttons: &str,
 ) -> Response {
     let error = match error {
-        Some(error) => format!("<p class=\"error\">{}</p>\n", escape(error)),
+        Some(error) => format!("<p class=\"error\">{WARNING}\n  {}</p>\n", escape(error)),
         None => String::new(),
     };
     let next = match safe_next(next) {
@@ -1417,21 +1452,31 @@ fn login_form(
             escape(next)
         ),
     };
+    let (lede, divider) = match buttons.is_empty() {
+        true => ("Enter the one-time code you were given.", ""),
+        false => (
+            "Continue with a GitHub organisation, or login using a one-time code.",
+            "<div class=\"or\">or</div>\n",
+        ),
+    };
 
     page(
         status,
         "Sign in",
         &format!(
             r#"<h1>Sign in</h1>
-<p>Enter the one-time code you were given.</p>
-{error}<form method="post" action="/login">
-{next}  <input name="code" autofocus autocomplete="off" autocapitalize="off" spellcheck="false">
+<p class="lede">{lede}</p>
+{error}{buttons}{divider}<form class="code" method="post" action="/login">
+{next}  <label for="code">One-time code</label>
+  <input name="code" id="code" autofocus autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste the code you were given">
   <button type="submit">Sign in</button>
-</form>
-{buttons}"#
+</form>"#
         ),
     )
 }
+
+/// The mark on the error banner, inline for the same reason [`OCTICON`] is.
+const WARNING: &str = r#"<svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM7.25 4.5h1.5v5h-1.5v-5Zm0 6.25h1.5v1.5h-1.5v-1.5Z"/></svg>"#;
 
 /// The longest `next` worth carrying.
 ///
@@ -1767,6 +1812,12 @@ fn problem(status: StatusCode, title: &str, detail: &str) -> Response {
 
 /// One whole HTML document. `body` is trusted; everything interpolated into it
 /// has already been through [`escape`].
+///
+/// Every page this host serves is one card on a tinted ground, whether it is
+/// the login form or a sentence about what went wrong — same shell, same
+/// palette, same footer. There is no second stylesheet and no asset: a page
+/// that fetches nothing is a page that renders whole on the first response,
+/// which is what a login form and an error page both need most.
 fn page(status: StatusCode, title: &str, body: &str) -> Response {
     let document = format!(
         r#"<!doctype html>
@@ -1776,21 +1827,220 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title} — spaceport</title>
 <style>
-body {{ font-family: system-ui, sans-serif; margin: 4rem auto; max-width: 34rem; line-height: 1.5; }}
-button {{ font: inherit; padding: 0.5rem 1rem; }}
-.quiet {{ color: #666; font-size: 0.9rem; }}
-</style>
+{STYLE}</style>
 </head>
 <body>
+<main class="card">
 {body}
+<p class="footer">spaceport <span>{version}</span></p>
+</main>
 </body>
 </html>
 "#,
         title = escape(title),
+        version = env!("CARGO_PKG_VERSION"),
     );
 
     (status, Html(document)).into_response()
 }
+
+/// The whole of this host's styling.
+///
+/// A `const` rather than an interpolated literal because CSS is mostly braces,
+/// and every one of them would have to be doubled to survive a `format!`.
+///
+/// The colours are named twice — once light, once dark — and nowhere else, so
+/// the two schemes cannot drift apart. Dark is chosen by the browser rather
+/// than offered as a switch: a page with no session yet has nowhere to remember
+/// a preference, and the operating system already knows the answer.
+const STYLE: &str = r#"
+:root {
+  --bg: #f6f5f4;
+  --glow: #e9e2df;
+  --card: #ffffff;
+  --ink: #1b1917;
+  --muted: #6d6763;
+  --line: #e2ddd9;
+  --brand: #a82b1c;
+  --brand-ink: #ffffff;
+  --field: #ffffff;
+  --danger: #a82b1c;
+  --danger-bg: #fdf2f0;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14110f;
+    --glow: #241b18;
+    --card: #1d1a18;
+    --ink: #f2eeeb;
+    --muted: #a09892;
+    --line: #322c29;
+    --brand: #c9432f;
+    --brand-ink: #ffffff;
+    --field: #14110f;
+    --danger: #ef8674;
+    --danger-bg: #2a1512;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 2rem 1rem;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  line-height: 1.5;
+  color: var(--ink);
+  background:
+    radial-gradient(60rem 40rem at 50% -20%, var(--glow), transparent 70%),
+    var(--bg);
+}
+
+.card {
+  width: 100%;
+  max-width: 30rem;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 2rem 1.75rem 1.5rem;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.04), 0 12px 32px -12px rgb(0 0 0 / 0.12);
+}
+
+h1 {
+  font-size: 1.35rem;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+  margin: 0 0 0.35rem;
+}
+a { color: var(--brand); }
+code {
+  font-size: 0.9em;
+  padding: 0.1em 0.35em;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+}
+.lede, .quiet {
+  color: var(--muted);
+  font-size: 0.925rem;
+}
+.lede { margin: 0 0 1.5rem; }
+
+button {
+  font: inherit;
+  font-weight: 500;
+  padding: 0.7rem 1rem;
+  color: var(--brand-ink);
+  background: var(--brand);
+  border: 1px solid transparent;
+  border-radius: 9px;
+  cursor: pointer;
+  transition: filter 120ms, transform 120ms;
+}
+button:hover { filter: brightness(1.08); }
+button:active { transform: translateY(1px); }
+button:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+
+/* One form per connection, each a row: mark, owner, and the App's name only
+   where two rows share an owner. Outlined rather than filled — the code form's
+   button below is the one filled thing on the page, and two competing primaries
+   would say nothing about which way in is which. */
+
+.sso { display: grid; gap: 0.5rem; }
+.sso form { margin: 0; }
+.sso button {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  text-align: left;
+  padding: 0.7rem 0.9rem;
+  color: var(--ink);
+  background: var(--field);
+  border-color: var(--line);
+  transition: border-color 120ms, transform 120ms;
+}
+.sso button:hover { filter: none; border-color: var(--muted); }
+.sso svg { flex: none; fill: currentColor; opacity: 0.85; }
+.sso .org { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sso .via {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.75rem;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.or {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 1.5rem 0 1.25rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+.or::before, .or::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
+.code { margin: 0; }
+.code label {
+  display: block;
+  font-size: 0.825rem;
+  font-weight: 500;
+  color: var(--muted);
+  margin-bottom: 0.375rem;
+}
+.code input {
+  width: 100%;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.08em;
+  padding: 0.7rem 0.9rem;
+  color: var(--ink);
+  background: var(--field);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+.code input::placeholder { letter-spacing: normal; color: var(--muted); opacity: 0.7; }
+.code input:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 1px;
+  border-color: transparent;
+}
+.code button { width: 100%; margin-top: 0.6rem; }
+
+.error {
+  display: flex;
+  gap: 0.5rem;
+  margin: 0 0 1.25rem;
+  padding: 0.65rem 0.8rem;
+  font-size: 0.875rem;
+  color: var(--danger);
+  background: var(--danger-bg);
+  border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
+  border-radius: 9px;
+}
+.error svg { flex: none; margin-top: 1px; }
+
+.footer {
+  margin: 1.5rem 0 0;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+.footer span { font-variant-numeric: tabular-nums; opacity: 0.75; }
+"#;
 
 /// `value`, safe to put anywhere in a document or an attribute.
 ///
@@ -3273,21 +3523,25 @@ mod tests {
     /// key that will not parse would fail the flow before GitHub was asked
     /// anything.
     async fn connect_for_login(home: &Home) {
-        home.connections
-            .record(&Connection {
-                slug: "spaceport-for-acme".to_owned(),
-                app_id: 42,
-                name: "Spaceport for Acme".to_owned(),
-                owner: "an-organisation".to_owned(),
-                // The OAuth client the fake's code exchange verifies against.
-                client_id: "Iv1.0123456789abcdef".to_owned(),
-                client_secret: Secret::new("a-client-secret"),
-                webhook_secret: Secret::new("a-webhook-secret"),
-                private_key: Secret::new(crate::connections::github::key::testing::PKCS1),
-                connected_at: String::new(),
-            })
-            .await
-            .unwrap();
+        home.connections.record(&acme()).await.unwrap();
+    }
+
+    /// The connection `connect_for_login` records, as a value — so a test that
+    /// wants a second one can change the field it cares about and leave the
+    /// credentials alone.
+    fn acme() -> Connection {
+        Connection {
+            slug: "spaceport-for-acme".to_owned(),
+            app_id: 42,
+            name: "Spaceport for Acme".to_owned(),
+            owner: "an-organisation".to_owned(),
+            // The OAuth client the fake's code exchange verifies against.
+            client_id: "Iv1.0123456789abcdef".to_owned(),
+            client_secret: Secret::new("a-client-secret"),
+            webhook_secret: Secret::new("a-webhook-secret"),
+            private_key: Secret::new(crate::connections::github::key::testing::PKCS1),
+            connected_at: String::new(),
+        }
     }
 
     /// Walk the start route and hand back the state GitHub would echo, read
@@ -3347,7 +3601,13 @@ mod tests {
             body.contains(r#"action="/auth/github/spaceport-for-acme""#),
             "{body}"
         );
-        assert!(body.contains("Sign in with GitHub"), "{body}");
+        // Labelled by the owner, which is the account the click is about —
+        // never by the App's name, which is a slug nobody chose to read.
+        assert!(
+            body.contains(r#"<span class="org">an-organisation</span>"#),
+            "{body}"
+        );
+        assert!(!body.contains("Spaceport for Acme"), "{body}");
         // The `next` rides along in the button's form too.
         assert!(
             body.contains(r#"<input type="hidden" name="next" value="/wiki">"#),
@@ -3355,6 +3615,46 @@ mod tests {
         );
         // And the code form is exactly as it was.
         assert!(body.contains(r#"<input name="code""#), "{body}");
+    }
+
+    /// Two Apps under one owner would be two rows reading the same word, so
+    /// those rows — and only those — carry the App's name underneath it.
+    #[tokio::test]
+    async fn two_connections_sharing_an_owner_are_told_apart_by_the_app() {
+        let (home, _, _) = sso_home();
+        connect_for_login(&home).await;
+        home.connections
+            .record(&Connection {
+                slug: "spaceport-for-acme-staging".to_owned(),
+                app_id: 43,
+                name: "Spaceport for Acme (staging)".to_owned(),
+                ..acme()
+            })
+            .await
+            .unwrap();
+        home.connections
+            .record(&Connection {
+                slug: "spaceport-for-others".to_owned(),
+                app_id: 44,
+                name: "Spaceport for Others".to_owned(),
+                owner: "another-organisation".to_owned(),
+                ..acme()
+            })
+            .await
+            .unwrap();
+
+        let (_, body) = get_path(home, "/login").await;
+
+        assert!(
+            body.contains(r#"<span class="via">Spaceport for Acme</span>"#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"<span class="via">Spaceport for Acme (staging)</span>"#),
+            "{body}"
+        );
+        // The owner nobody else shares says its own name and nothing more.
+        assert!(!body.contains("Spaceport for Others"), "{body}");
     }
 
     /// The start route's whole job: remember, then hand the browser to the
