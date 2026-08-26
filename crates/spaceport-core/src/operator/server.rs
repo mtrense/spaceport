@@ -1946,6 +1946,11 @@ async fn deploy(
 /// on, which is the whole of what this is for: "not found" is true of an app
 /// nobody tracks, of a commit still in the queue and of a build that failed an
 /// hour ago, and those are three different mornings.
+// The `Err` is a whole response because that is what the caller does with it:
+// returns it, unchanged, on the next line. Boxing it to get the `Result` small
+// would buy an allocation on the refusal path and an unbox at every call site,
+// for a value that is built once and never carried anywhere.
+#[allow(clippy::result_large_err)]
 async fn chosen(
     builds: &BuildRepository,
     instance: &Instance,
@@ -1959,6 +1964,8 @@ async fn chosen(
 }
 
 /// The newest image there is for the app.
+// A ready-made response as the error, for the reason [`chosen`] gives.
+#[allow(clippy::result_large_err)]
 async fn newest(
     builds: &BuildRepository,
     instance: &Instance,
@@ -2027,6 +2034,8 @@ async fn nothing_built(builds: &BuildRepository, instance: &Instance, id: &AppId
 ///
 /// The exact spelling wins over any prefix it is also a prefix of, so a
 /// revision typed in full is never called ambiguous by a longer one.
+// A ready-made response as the error, for the reason [`chosen`] gives.
+#[allow(clippy::result_large_err)]
 async fn named(
     builds: &BuildRepository,
     instance: &Instance,
@@ -3930,6 +3939,9 @@ fn connect_pair(connect: &str) -> Result<(&str, &str), String> {
 /// them, and does not when it is not. Pointing at the wrong connection can
 /// therefore make a handle that plainly exists look unknown — which is the
 /// operator's to get right, the same way the half after the colon is.
+// A ready-made response as the error, for the reason [`chosen`] gives: both
+// callers return it as it stands.
+#[allow(clippy::result_large_err)]
 async fn asserted_identity(
     connections: &ConnectionRepository,
     github: Arc<dyn Transport>,
