@@ -199,13 +199,17 @@ pub(super) async fn gate<B>(
         }
     }
 
-    let login = state
-        .hostname
-        .as_deref()
-        .map(|hostname| exchange_url(hostname, state.https_port, app.id.as_str(), host, req.uri()));
+    let login = |next: Option<&Uri>| {
+        state
+            .hostname
+            .as_deref()
+            .map(|hostname| exchange_url(hostname, state.https_port, app.id.as_str(), host, next))
+    };
 
     if is_navigation(req.method(), req.headers()) {
-        return Admission::Refused(match login {
+        // A navigation is the page the browser is on, so the request URL is
+        // exactly where signing in should land.
+        return Admission::Refused(match login(Some(req.uri())) {
             Some(login) => see_other(&login),
             // A gated app on a spaceport with no hostname has no exchange to
             // send anyone through. 503 rather than 401: the request is fine,
@@ -221,11 +225,17 @@ pub(super) async fn gate<B>(
     // redirect would be swallowed invisibly by whatever scripted this, so the
     // answer is machine-readable instead — the spec's contract for SPAs, which
     // read `X-Spaceport-Login` and drive the exchange themselves.
+    //
+    // The URL names no destination. This request is `/api/…`, not the page the
+    // user is looking at, and sending the browser back to an endpoint would
+    // finish the login by rendering JSON at it. A frontend that wants its page
+    // back appends its own `next`; forgetting to costs the app's home page,
+    // which is a place a person can be.
     let mut response = plain(StatusCode::UNAUTHORIZED, "signed out\n");
     response
         .headers_mut()
         .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-    if let Some(login) = login
+    if let Some(login) = login(None)
         && let Ok(value) = HeaderValue::from_str(&login)
     {
         response.headers_mut().insert(X_SPACEPORT_LOGIN, value);
@@ -553,7 +563,7 @@ fn is_navigation(method: &Method, headers: &HeaderMap) -> bool {
     }
 }
 
-/// The exchange URL for `app` as requested at `host`, carrying `uri`'s path
+/// The exchange URL for `app` as requested at `host`, carrying `next`'s path
 /// and query and nothing else of the request.
 ///
 /// The scheme and edge authority come from configuration, and the `host`
@@ -562,24 +572,37 @@ fn is_navigation(method: &Method, headers: &HeaderMap) -> bool {
 /// manifest before ever redirecting to it. What the client controls is the
 /// path and query, which travel as one encoded value and come back out only
 /// through the same open-redirect gate the login form uses.
+///
+/// `next` is `None` when the caller has no destination worth naming — the
+/// URL then says nothing about where to land and the exchange defaults it to
+/// `/`. That is the honest answer for a refusal that is not a navigation: the
+/// request URL is an endpoint the browser was never meant to render, and the
+/// document the frontend actually sits on is something only the frontend
+/// knows.
 pub(super) fn exchange_url(
     hostname: &str,
     https_port: u16,
     app: &str,
     host: &str,
-    uri: &Uri,
+    next: Option<&Uri>,
 ) -> String {
-    let next = uri
-        .path_and_query()
-        .map_or_else(|| uri.path(), http::uri::PathAndQuery::as_str);
-
-    format!(
-        "https://{}/auth/exchange?app={}&host={}&next={}",
+    let url = format!(
+        "https://{}/auth/exchange?app={}&host={}",
         authority(hostname, https_port),
         query_encode(app),
         query_encode(host),
-        query_encode(next),
-    )
+    );
+
+    match next {
+        Some(next) => {
+            let next = next
+                .path_and_query()
+                .map_or_else(|| next.path(), http::uri::PathAndQuery::as_str);
+
+            format!("{url}&next={}", query_encode(next))
+        }
+        None => url,
+    }
 }
 
 /// `hostname`, with the https port beside it when it is not the default —
@@ -686,7 +709,7 @@ pub(super) async fn callback(
             state.https_port,
             app.id.as_str(),
             &name,
-            &next.parse().unwrap_or_else(|_| Uri::from_static("/")),
+            Some(&next.parse().unwrap_or_else(|_| Uri::from_static("/"))),
         )
     });
     let restarted = || match &restart {
@@ -952,7 +975,7 @@ mod tests {
             443,
             "blog",
             "alpha.test",
-            &"/a/b?c=d&e=f".parse().unwrap(),
+            Some(&"/a/b?c=d&e=f".parse().unwrap()),
         );
 
         assert_eq!(
@@ -970,9 +993,22 @@ mod tests {
             8443,
             "blog",
             "a.test",
-            &"/".parse().unwrap(),
+            Some(&"/".parse().unwrap()),
         );
 
         assert!(url.starts_with("https://spaceport.test:8443/"), "{url}");
+    }
+
+    /// A refusal that is not a navigation has no page to name, so the URL it
+    /// hands the frontend carries no `next` at all — the exchange defaults it
+    /// to `/`, and a frontend that knows better sets its own.
+    #[test]
+    fn the_exchange_url_omits_next_when_there_is_no_destination() {
+        let url = exchange_url("spaceport.test", 443, "blog", "alpha.test", None);
+
+        assert_eq!(
+            url,
+            "https://spaceport.test/auth/exchange?app=blog&host=alpha.test"
+        );
     }
 }

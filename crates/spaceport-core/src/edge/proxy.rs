@@ -1020,6 +1020,10 @@ mod tests {
 
     /// A fetch, an XHR or a WebSocket handshake would swallow a redirect
     /// invisibly, so they are told in headers instead — and never forwarded.
+    ///
+    /// The login URL names no `next`: `/api/posts` is not a page, and putting
+    /// it there would end the sign-in with a browser rendering JSON. A
+    /// frontend that wants its page back appends the document's own path.
     #[tokio::test]
     async fn a_non_navigation_to_a_gated_app_gets_a_401_with_directions() {
         let apps = Arc::new(AppStore::new());
@@ -1037,10 +1041,9 @@ mod tests {
 
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(header(&headers, "www-authenticate"), "Bearer");
-        assert!(
-            header(&headers, "x-spaceport-login")
-                .starts_with("https://spaceport.test/auth/exchange?app=blog"),
-            "{headers:?}"
+        assert_eq!(
+            header(&headers, "x-spaceport-login"),
+            "https://spaceport.test/auth/exchange?app=blog&host=alpha.test"
         );
     }
 

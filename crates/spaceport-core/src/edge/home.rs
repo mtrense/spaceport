@@ -3440,6 +3440,42 @@ mod tests {
         assert!(location.ends_with("&next=%2F"), "{location}");
     }
 
+    /// The other side of that gate. A `401`'s login URL names no destination,
+    /// so an SPA that wants its page back appends the document's own path —
+    /// and a plain one survives the round trip intact, which is what makes
+    /// the client-supplied `next` a usable contract rather than a hole.
+    #[tokio::test]
+    async fn a_client_supplied_next_survives_the_exchange() {
+        let apps = Arc::new(AppStore::new());
+        apps.insert(gated_app("blog", "alpha.test", "reader"))
+            .unwrap();
+        let (home, users, entitlements) = exchange_home(apps);
+        let cookie = session_cookie_for(&home, &users).await;
+        entitlements
+            .grant(
+                &crate::auth::UserRef::Slug("alice".parse().unwrap()),
+                &"reader@blog".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // What a frontend appends: the document it was on, not the `/api/…`
+        // call that was refused.
+        let response = get_exchange(
+            home,
+            "/auth/exchange?app=blog&host=alpha.test&next=%2Ftracks%3Fsort%3Dnew",
+            Some(&cookie),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers()[http::header::LOCATION].to_str().unwrap();
+        assert!(
+            location.ends_with("&next=%2Ftracks%3Fsort%3Dnew"),
+            "{location}"
+        );
+    }
+
     /// An open app has no session to mint, whoever asks: the exchange simply
     /// hands the browser back to the app's own domain.
     #[tokio::test]

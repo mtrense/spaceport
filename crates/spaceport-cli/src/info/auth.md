@@ -141,6 +141,15 @@ The app rarely sees these — spaceport answers them itself — but the app's *f
 
 - A top-level navigation (`GET`, `Sec-Fetch-Mode: navigate`, `Accept: text/html`) without a session is redirected into the sign-in exchange and comes back to the path it asked for.
 - Anything else — a `fetch`, an XHR, a POST, a WebSocket upgrade — gets `401` with `WWW-Authenticate: Bearer` and an `X-Spaceport-Login` response header carrying the login URL. A redirect would be swallowed invisibly by whatever scripted the call, so this is the contract: on a `401` the app's frontend reads that header and drives a full-page navigation to it.
+- **That login URL names no destination**, and signing in through it as-is lands the user on the app's `/`. It cannot name one: spaceport saw `/api/tracks/rust`, not the page the user is looking at, and sending a browser back to an API endpoint would end the sign-in by rendering JSON at it. A frontend that wants the user back on the page they were on sets `next` itself, from the document:
+
+  ```js
+  const url = new URL(res.headers.get('X-Spaceport-Login'));
+  url.searchParams.set('next', location.pathname + location.search);
+  location.assign(url);
+  ```
+
+  Setting `next` is safe from the client: spaceport re-checks it through the same open-redirect gate the login form uses — a plain absolute path on this host, or `/`. A bad one costs the home page, never a redirect off-site.
 - A signed-in user with no role at this app gets `403` from spaceport, not a redirect. Signing in again will not help them; an operator has to grant something.
 - Sign-out is `POST https://<SPACEPORT_ISSUER>/logout`, which drops the global session and every app session derived from it. `GET` on that URL renders a confirmation form and logs nobody out. A per-app "log out" link is a link there.
 
