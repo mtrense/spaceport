@@ -63,8 +63,9 @@ axum = "0.8"
 # The three segments of a JSON Web Token, joined by dots. Base64url without
 # padding, which is a spelling of base64 rather than a different encoding, and
 # not one worth hand-rolling next to a signature. Already in the tree under
-# rustls-pemfile, so this costs nothing but the direct dependency.
-base64 = "0.22"
+# `pem`, which `rcgen` reads its keys with, so this costs nothing but the
+# direct dependency.
+base64 = "0.23"
 bytes = "1"
 http = "1"
 http-body-util = "0.1"
