@@ -109,6 +109,7 @@ pub async fn reconcile(applier: &Arc<Applier>) -> Result<Report> {
                 let downed = Downed {
                     id: record.id.clone(),
                     manifest,
+                    revision: record.revision.clone(),
                     reason: reason.clone(),
                 };
                 // Only a conflict can refuse it, which means another app has

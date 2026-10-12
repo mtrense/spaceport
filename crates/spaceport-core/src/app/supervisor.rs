@@ -535,10 +535,12 @@ fn missing(app: &App, containers: &[crate::runtime::Managed]) -> Option<&'static
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::manifest::Source;
+    use crate::app::reconcile::reconcile;
     use crate::app::repository::AppRepository;
     use crate::app::secrets::SecretRepository;
     use crate::app::{AppManifest, AppStore};
-    use crate::build::repository::BuildRepository;
+    use crate::build::repository::{Build, BuildRepository, BuildState};
     use crate::runtime::{Container, ContainerId, ContainerRuntime, Managed};
     use crate::state::Db;
     use anyhow::{Result, bail};
@@ -555,6 +557,8 @@ mod tests {
     #[derive(Default)]
     struct FakeRuntime {
         launched: Mutex<Vec<AppId>>,
+        /// The image each launch ran, in order.
+        images: Mutex<Vec<String>>,
         containers: Mutex<Vec<Managed>>,
         /// Refuse to start anything, so that every attempt fails.
         refuse: Mutex<bool>,
@@ -596,10 +600,16 @@ mod tests {
 
     #[async_trait]
     impl ContainerRuntime for FakeRuntime {
-        async fn launch(&self, app: &AppId, _manifest: &AppManifest) -> Result<Container> {
+        async fn launch(&self, app: &AppId, manifest: &AppManifest) -> Result<Container> {
             if *self.refuse.lock().unwrap() {
                 bail!("no image for you");
             }
+            // Refused the way the real engine refuses it, so a manifest that
+            // reaches here unresolved fails a test rather than passing it.
+            let Source::Image { image } = &manifest.source else {
+                bail!("app `{app}` builds its own image, which spaceport cannot do yet");
+            };
+            self.images.lock().unwrap().push(image.clone());
             let mut launched = self.launched.lock().unwrap();
             launched.push(app.clone());
 
@@ -941,6 +951,7 @@ container:
             .insert_down(Downed {
                 id: id("hello"),
                 manifest: manifest(""),
+                revision: None,
                 reason: "no image `x:1`".to_owned(),
             })
             .unwrap();
@@ -950,6 +961,111 @@ container:
 
         assert!(store.routes().serving("alpha.test").is_some());
         assert_eq!(runtime.launched.lock().unwrap().len(), 2);
+    }
+
+    /// A built app that could not be started at boot — the engine was not up
+    /// yet, which is what an upgrade that restarts it looks like — is down with
+    /// the manifest as recorded, `type: build` and all. Taking it over has to
+    /// run the image its deployed revision was built into, exactly as the boot
+    /// would have.
+    #[tokio::test]
+    async fn takes_over_a_built_app_that_was_down_at_boot() {
+        let db = Db::in_memory().unwrap();
+        let builds = BuildRepository::new(db.clone());
+        record_build(&builds, "hello", "abc1234", "spaceport/hello:abc1234").await;
+        let deployed = Arc::new(Applier::new(
+            Arc::new(AppStore::new()),
+            Arc::new(FakeRuntime::default()),
+            AppRepository::new(db.clone()),
+            builds.clone(),
+            SecretRepository::new(db.clone()),
+        ));
+        deployed
+            .deploy(id("hello"), built_manifest(), Some("abc1234"), false)
+            .await
+            .unwrap();
+
+        // The next spaceport, starting before the engine is back.
+        let runtime = Arc::new(FakeRuntime::default());
+        runtime.refuse_to_launch();
+        let store = Arc::new(AppStore::new());
+        let applier = Arc::new(Applier::new(
+            store.clone(),
+            runtime.clone(),
+            AppRepository::new(db.clone()),
+            builds,
+            SecretRepository::new(db),
+        ));
+        reconcile(&applier).await.unwrap();
+        assert!(store.downed(&id("hello")).is_some());
+
+        *runtime.refuse.lock().unwrap() = false;
+        let mut supervisor = Supervisor::new(applier, impatient());
+        supervisor.sweep().await;
+        supervisor.retry_what_is_due().await;
+
+        assert_eq!(
+            *runtime.images.lock().unwrap(),
+            ["spaceport/hello:abc1234".to_owned()]
+        );
+        assert!(store.routes().serving("alpha.test").is_some());
+    }
+
+    /// A manifest spaceport builds rather than pulls.
+    fn built_manifest() -> AppManifest {
+        AppManifest::parse(
+            "schema_version: 1
+source:
+  type: build
+  dockerfile: Dockerfile
+  context: .
+routing:
+  hosts: [alpha.test]
+auth:
+  gating: open
+container:
+  health:
+    readiness:
+      type: none
+",
+        )
+        .unwrap()
+    }
+
+    /// A finished build of `revision` that produced `image`.
+    async fn record_build(builds: &BuildRepository, app: &str, revision: &str, image: &str) {
+        builds
+            .request(&Build {
+                app: id(app),
+                revision: revision.to_owned(),
+                connection: "spaceport".to_owned(),
+                repository: "an-organisation/site".to_owned(),
+                branch: "main".to_owned(),
+                manifest_path: "spaceport.yaml".to_owned(),
+                state: BuildState::Pending,
+                image_tag: None,
+                image_id: None,
+                reason: None,
+                log: None,
+                started_at: String::new(),
+                finished_at: None,
+                manifest: None,
+                deployed_at: None,
+                deploy_reason: None,
+            })
+            .await
+            .unwrap();
+        builds
+            .succeeded(
+                &id(app),
+                revision,
+                image,
+                "sha256:0123",
+                built_manifest().source_text(),
+                "",
+            )
+            .await
+            .unwrap();
     }
 
     /// The engine went away and came back, so anything that happened in between

@@ -104,6 +104,14 @@ impl Suspended {
 pub struct Downed {
     pub id: AppId,
     pub manifest: AppManifest,
+    /// The revision a built manifest is resolved at before it is started.
+    ///
+    /// Only an app that was never running has a manifest that still needs
+    /// resolving: one restored at boot is down with the document as recorded,
+    /// `type: build` and all, and this is the revision the record carried. One
+    /// whose container died was running a manifest already resolved, so it has
+    /// none, and needs none.
+    pub revision: Option<String>,
     /// What the supervisor last saw go wrong, in the words an operator will
     /// read in a status report.
     pub reason: String,
@@ -452,6 +460,7 @@ impl AppStore {
             Downed {
                 id: id.clone(),
                 manifest: app.manifest.clone(),
+                revision: None,
                 reason: reason.clone(),
             },
         );
@@ -785,6 +794,7 @@ auth:
         Downed {
             id: app.id,
             manifest: app.manifest,
+            revision: None,
             reason: reason.to_owned(),
         }
     }

@@ -516,11 +516,13 @@ impl Applier {
         let _working = self.working(id).await;
 
         // Whichever of the two it is, the manifest is the same one: what the
-        // store is holding for this app, which is what the record said.
-        let manifest = match self.store.take_down(id, reason) {
-            Some(app) => app.manifest.clone(),
+        // store is holding for this app, which is what the record said. A
+        // running app's is already resolved to an image; a down one's may be
+        // the document as recorded, with the revision to resolve it at.
+        let (manifest, revision) = match self.store.take_down(id, reason) {
+            Some(app) => (app.manifest.clone(), None),
             None => match self.store.downed(id) {
-                Some(down) => down.manifest,
+                Some(down) => (down.manifest, down.revision),
                 None => {
                     return Err(ApplyError::Failed(anyhow!(
                         "no app named `{id}` is running or down"
@@ -533,9 +535,14 @@ impl Applier {
         // holding: a restart is a container being built afresh, and it must be
         // built from the secrets as they are now — including one an operator
         // set in the minute since the app broke, which is a fair description of
-        // why it broke.
-        let started = match self.runnable(id, manifest).await {
-            Ok(manifest) => self.start(id.clone(), manifest).await,
+        // why it broke. The build goes through `resolved` for the same reason
+        // `restore` sends it there: an app that never started at boot is down
+        // with `type: build`, and the runtime cannot run that.
+        let started = match self.resolved(id, manifest, revision.as_deref()).await {
+            Ok(manifest) => match self.runnable(id, manifest).await {
+                Ok(manifest) => self.start(id.clone(), manifest).await,
+                Err(error) => Err(error),
+            },
             Err(error) => Err(error),
         };
 
@@ -2512,6 +2519,7 @@ container:
             .insert_down(Downed {
                 id: "hello".parse().unwrap(),
                 manifest: manifest("alpha.test"),
+                revision: None,
                 reason: "no image `x:1`".to_owned(),
             })
             .unwrap();
