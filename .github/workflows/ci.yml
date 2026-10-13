@@ -25,6 +25,10 @@ env:
   # CI never benefits from incremental artifacts, and they cost cache space.
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: -D warnings
+  # Ubuntu runners have a docker daemon, so the daemon-backed runtime tests
+  # fail here rather than skip: a skip would pass and drop their lines from
+  # the coverage number without a word.
+  SPACEPORT_REQUIRE_DOCKER: 1
 
 permissions:
   contents: read

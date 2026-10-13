@@ -1764,11 +1764,22 @@ env:
     /// there is no daemon: they are the only way to check the parts that are
     /// nothing but daemon, so they should run wherever one exists, but a
     /// checkout with no docker installed is not a broken checkout.
+    ///
+    /// CI sets `SPACEPORT_REQUIRE_DOCKER`, because there a missing daemon is
+    /// a broken runner: skipping would pass the run and quietly take every
+    /// line only these tests reach out of the coverage number.
     async fn daemon() -> Option<DockerRuntime> {
-        let runtime = DockerRuntime::connect(DataDir::new(temp_dir()), None).ok()?;
-        runtime.ping().await.ok()?;
-
-        Some(runtime)
+        let required = std::env::var_os("SPACEPORT_REQUIRE_DOCKER").is_some();
+        let runtime = match DockerRuntime::connect(DataDir::new(temp_dir()), None) {
+            Ok(runtime) => runtime,
+            Err(error) if required => panic!("no docker to connect to: {error:#}"),
+            Err(_) => return None,
+        };
+        match runtime.ping().await {
+            Ok(_) => Some(runtime),
+            Err(error) if required => panic!("docker does not answer: {error:#}"),
+            Err(_) => None,
+        }
     }
 
     /// A data directory of this test's own, so a test that makes volumes can
