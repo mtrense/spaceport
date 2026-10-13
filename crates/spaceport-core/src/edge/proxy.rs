@@ -1183,6 +1183,32 @@ mod tests {
         assert_eq!(status, StatusCode::SEE_OTHER);
     }
 
+    /// The callback only means something on a domain a gated app serves, so
+    /// everywhere else it is refused before a nonce is looked at: a host no
+    /// app claims is a 404 like any unclaimed path, an open app has no session
+    /// to mint and is a 404 that says so, and a request naming no host at all
+    /// cannot be bound to any app and is a 400.
+    #[tokio::test]
+    async fn the_callback_refuses_hosts_it_cannot_mint_a_session_for() {
+        let apps = Arc::new(AppStore::new());
+        apps.insert(app("hello", "open.test", upstream().await))
+            .unwrap();
+        let edge = edge(apps).await;
+        let path = "/.spaceport/callback?nonce=whatever&next=%2F";
+
+        let (status, _, body) = get_headed(edge, "nobody.test", path, NAVIGATE).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("no app is being served"), "{body}");
+
+        let (status, _, body) = get_headed(edge, "open.test", path, NAVIGATE).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("not gated"), "{body}");
+
+        let (status, _, body) = get_headed(edge, "", path, NAVIGATE).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("names no host"), "{body}");
+    }
+
     /// A nonce is one redemption: replaying the callback URL — a reload, a
     /// bookmark — restarts the exchange rather than erroring, so the second
     /// visit heals into a fresh sign-in instead of stranding the browser.

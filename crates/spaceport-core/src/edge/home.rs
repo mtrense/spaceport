@@ -4516,4 +4516,167 @@ mod tests {
 
         assert_eq!(status, StatusCode::SEE_OTHER);
     }
+
+    /// The SSO home with its hostname taken away — what a daemon started
+    /// without `edge.hostname` serves.
+    fn hostless_home() -> Arc<Home> {
+        let (home, _, _) = sso_home();
+        let mut home = Arc::into_inner(home).expect("nobody else holds the home yet");
+        home.hostname = None;
+
+        Arc::new(home)
+    }
+
+    /// Without a hostname there is no callback url to give GitHub, so the
+    /// start route says which setting is missing instead of sending the
+    /// browser somewhere it could never come back from.
+    #[tokio::test]
+    async fn starting_a_login_without_a_hostname_names_the_missing_setting() {
+        let home = hostless_home();
+        connect_for_login(&home).await;
+
+        let (status, body) = get_path(home, "/auth/github/spaceport-for-acme").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("This spaceport has no hostname"), "{body}");
+        assert!(body.contains("edge.hostname"), "{body}");
+    }
+
+    /// The setup page writes the hostname into the manifest's urls, so a
+    /// spaceport without one cannot describe an app and says so.
+    #[tokio::test]
+    async fn the_setup_page_without_a_hostname_names_the_missing_setting() {
+        let home = hostless_home();
+        let state = begin(&home, None);
+
+        let (status, body) = get_path(home, &format!("/connections/github/setup/{state}")).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("This spaceport has no hostname"), "{body}");
+        assert!(body.contains("spaceport connect github --auto"), "{body}");
+    }
+
+    /// GitHub always sends a code with a live state; a bounce that carries
+    /// only the state is somebody else's doing, and is refused before GitHub
+    /// is asked anything.
+    #[tokio::test]
+    async fn a_login_callback_without_a_code_is_refused() {
+        let (home, github, _) = sso_home();
+        connect_for_login(&home).await;
+
+        let state = started(home.clone(), "/auth/github/spaceport-for-acme").await;
+        let response = callback_with(home, &format!("state={state}")).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("GitHub sent no code"), "{body}");
+        assert!(github.requests().is_empty(), "{:?}", github.requests());
+    }
+
+    /// A connection disconnected while its sign-in was out at GitHub cannot
+    /// finish it: the callback reads the connection afresh and says it is
+    /// gone rather than trusting what the attempt remembered.
+    #[tokio::test]
+    async fn a_login_callback_for_a_removed_connection_is_refused() {
+        let (home, github, _) = sso_home();
+        connect_for_login(&home).await;
+        github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
+
+        let state = started(home.clone(), "/auth/github/spaceport-for-acme").await;
+        assert!(home.connections.forget("spaceport-for-acme").await.unwrap());
+        let response =
+            callback_with(home.clone(), &format!("code=a-login-code&state={state}")).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response.headers().get(http::header::SET_COOKIE).is_none());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("This connection is gone"), "{body}");
+    }
+
+    /// GitHub refusing to turn the code into a token is the one failure
+    /// sentence for the whole conversation: a bad gateway, no session, and
+    /// advice to start again.
+    #[tokio::test]
+    async fn a_refused_token_exchange_fails_the_login_without_a_session() {
+        let (home, github, _) = sso_home();
+        connect_for_login(&home).await;
+        github.signs_in("a-login-code", "ghu_a-user-token", 1001, "octocat");
+        github.refuse_path_with(
+            "/login/oauth/access_token",
+            StatusCode::UNAUTHORIZED,
+            "Bad credentials",
+        );
+
+        let state = started(home.clone(), "/auth/github/spaceport-for-acme").await;
+        let response = callback_with(home, &format!("code=a-login-code&state={state}")).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(response.headers().get(http::header::SET_COOKIE).is_none());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("GitHub would not finish the sign-in"),
+            "{body}"
+        );
+    }
+
+    /// A manifest conversion GitHub refuses records nothing, and the page
+    /// passes GitHub's reason on — the operator is the one watching, and the
+    /// reason is what they can act on.
+    #[tokio::test]
+    async fn a_refused_manifest_conversion_records_nothing() {
+        let (home, github) = home();
+        github.refuse_with(StatusCode::NOT_FOUND, "Not Found");
+        let state = begin(&home, None);
+
+        let (status, body) = get_path(
+            home.clone(),
+            &format!("/connections/github/setup/{state}/callback?code=a-one-time-code"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            body.contains("GitHub would not hand over the app"),
+            "{body}"
+        );
+        assert!(
+            home.connections
+                .by_slug("spaceport-for-acme")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// An exchange link that names no app has nothing to exchange for, and is
+    /// answered as an incomplete link before any session is looked at.
+    #[tokio::test]
+    async fn an_exchange_naming_no_app_is_refused() {
+        let response = get_exchange(plain_home(), "/auth/exchange?host=alpha.test", None).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("This sign-in link names no app"), "{body}");
+    }
+
+    /// A login form submitted without a code is the form again, asking for
+    /// one, with the `next` it came with still carried.
+    #[tokio::test]
+    async fn a_login_without_a_code_asks_for_one() {
+        let response = post_form(plain_home(), "/login", "next=%2Fwiki").await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.headers().get(http::header::SET_COOKIE).is_none());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Enter the code."), "{body}");
+        assert!(
+            body.contains(r#"<input type="hidden" name="next" value="/wiki">"#),
+            "{body}"
+        );
+    }
 }

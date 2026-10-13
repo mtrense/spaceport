@@ -1593,4 +1593,551 @@ mod tests {
             panic!("a command with no deadline should not have given up on a silent spaceport");
         };
     }
+
+    /// What a far end heard of one request: enough to say which route it was
+    /// aimed at and how it asked to be answered.
+    #[derive(Debug)]
+    struct Heard {
+        /// `PUT /apps/site?suspended=true`, without the protocol version.
+        line: String,
+        accept: Option<String>,
+        content_type: Option<String>,
+        body: String,
+    }
+
+    impl Heard {
+        /// Read back out of the raw bytes of one request.
+        fn from_raw(raw: &str) -> Self {
+            let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw, ""));
+            let mut lines = head.split("\r\n");
+            let request_line = lines.next().unwrap_or_default();
+            let line = request_line
+                .rsplit_once(' ')
+                .map_or(request_line, |(line, _version)| line)
+                .to_owned();
+            let mut accept = None;
+            let mut content_type = None;
+            for header in lines {
+                let Some((name, value)) = header.split_once(':') else {
+                    continue;
+                };
+                match name.to_ascii_lowercase().as_str() {
+                    "accept" => accept = Some(value.trim().to_owned()),
+                    "content-type" => content_type = Some(value.trim().to_owned()),
+                    _ => {}
+                }
+            }
+
+            Self {
+                line,
+                accept,
+                content_type,
+                body: body.to_owned(),
+            }
+        }
+    }
+
+    /// A far end that hears one request out and answers it with `status` and
+    /// `body`, handing back what it heard.
+    ///
+    /// Reads until the head is over and the body it announced has arrived,
+    /// rather than once: a registration or a manifest is more than one read is
+    /// promised to deliver.
+    async fn a_spaceport_that_answers(
+        name: &str,
+        status: &'static str,
+        body: &'static str,
+    ) -> (PathBuf, tokio::sync::oneshot::Receiver<Heard>) {
+        let (listener, path) = bound(name);
+        let (tell, heard) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut raw = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&raw);
+                let Some((head, sent)) = text.split_once("\r\n\r\n") else {
+                    continue;
+                };
+                let announced = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                if sent.len() >= announced {
+                    break;
+                }
+            }
+            let _ = tell.send(Heard::from_raw(&String::from_utf8_lossy(&raw)));
+            let _ = stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len(),
+                    )
+                    .as_bytes(),
+                )
+                .await;
+            let _ = stream.shutdown().await;
+        });
+
+        (path, heard)
+    }
+
+    /// Run `call` against a spaceport answering `200 OK` with `body`, and hand
+    /// back what it returned beside what the far end heard.
+    async fn ask<T, F, Fut>(body: &'static str, call: F) -> (T, Heard)
+    where
+        F: FnOnce(Operator) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let (path, heard) = a_spaceport_that_answers("ask", "200 OK", body).await;
+        let answer = call(operator_on(path, Duration::from_secs(5)))
+            .await
+            .unwrap();
+
+        (answer, heard.await.unwrap())
+    }
+
+    fn a_user() -> UserRef {
+        "alice".parse().unwrap()
+    }
+
+    /// Every call that answers in prose aims at its own route, and the route is
+    /// the whole of what the far end goes on: a wrapper that drifted onto a
+    /// neighbour's path, or dropped a flag from its query, would do the wrong
+    /// thing to a real app without a word of complaint. So each one is held to
+    /// the request line it sends, and to not asking for JSON it would not read.
+    #[tokio::test]
+    async fn every_prose_call_sends_its_own_request_line() {
+        let app = &an_app();
+        let user = &a_user();
+        let entitlement = &"reader@site".parse::<RoleAtApp>().unwrap();
+        let scope = &"site".parse::<RevokeScope>().unwrap();
+        let session = &"0123456789abcdef".parse::<SessionId>().unwrap();
+        let slug = &"bob".parse::<UserSlug>().unwrap();
+
+        macro_rules! expect {
+            ($line:expr, |$op:ident| $call:expr) => {{
+                let (answer, heard) = ask("done", |$op| async move { $call.await }).await;
+                assert_eq!(heard.line, $line);
+                assert_eq!(heard.accept, None, "{}", $line);
+                assert_eq!(answer, "done", "{}", $line);
+            }};
+        }
+
+        expect!("PUT /apps/site", |op| apply(&op, app, "x".into(), false));
+        expect!("PUT /apps/site?suspended=true", |op| apply(
+            &op,
+            app,
+            "x".into(),
+            true
+        ));
+        expect!("POST /apps/site/deployment", |op| deploy(&op, app, None));
+        expect!("POST /apps/site/deployment?revision=abc%26x", |op| deploy(
+            &op,
+            app,
+            Some("abc&x")
+        ));
+        expect!("POST /apps/site/suspend", |op| suspend(&op, app, false));
+        expect!("POST /apps/site/suspend?stop_container=true", |op| suspend(
+            &op, app, true
+        ));
+        expect!("POST /apps/site/resume", |op| resume(&op, app));
+        expect!(
+            "PUT /apps/site/tracking?repository=o%2Fr&connection=acme&deploy=true",
+            |op| track(&op, app, "o/r", "acme", None, None, Some(true))
+        );
+        expect!("GET /apps/site", |op| show(&op, app, false));
+        expect!("GET /apps/site?manifest=true", |op| show(&op, app, true));
+        expect!("GET /apps/site/secrets", |op| secrets(&op, app, None));
+        expect!("GET /apps/site/secrets?pattern=API_*", |op| secrets(
+            &op,
+            app,
+            Some(&"API_*".parse().unwrap())
+        ));
+        expect!("DELETE /apps/site/secrets/API_KEY", |op| delete_secret(
+            &op,
+            app,
+            &"API_KEY".parse().unwrap()
+        ));
+        expect!("DELETE /apps/site", |op| destroy(&op, app));
+        expect!("DELETE /connections/a%2Fb", |op| forget_connection(
+            &op, "a/b"
+        ));
+        expect!("PUT /auth/users/alice/identities/acme", |op| {
+            auth_user_connect(&op, user, "acme", "octocat")
+        });
+        expect!("DELETE /auth/users/alice/identities/acme", |op| {
+            auth_user_disconnect(&op, user, "acme")
+        });
+        expect!("POST /auth/users/alice/suspend", |op| auth_user_suspend(
+            &op, user
+        ));
+        expect!("POST /auth/users/alice/rename/bob", |op| auth_user_rename(
+            &op, user, slug
+        ));
+        expect!("POST /auth/users/alice/resume", |op| auth_user_resume(
+            &op, user
+        ));
+        expect!("DELETE /auth/users/alice", |op| auth_user_drop(&op, user));
+        expect!("PUT /auth/users/alice/entitlements/reader@site", |op| {
+            auth_grant(&op, user, entitlement)
+        });
+        expect!("DELETE /auth/users/alice/entitlements/site", |op| {
+            auth_revoke(&op, user, Some(scope))
+        });
+        expect!("DELETE /auth/users/alice/entitlements", |op| auth_revoke(
+            &op, user, None
+        ));
+        expect!("POST /auth/users/alice/api-keys/reader@site", |op| {
+            auth_api_key_mint(&op, user, entitlement, None)
+        });
+        expect!(
+            "POST /auth/users/alice/api-keys/reader@site?expires=90d",
+            |op| auth_api_key_mint(&op, user, entitlement, Some("90d"))
+        );
+        expect!("POST /auth/users/alice/sessions", |op| auth_session_mint(
+            &op, user, None
+        ));
+        expect!("POST /auth/users/alice/sessions?expires=12h", |op| {
+            auth_session_mint(&op, user, Some("12h"))
+        });
+        expect!("DELETE /auth/users/alice/sessions/0123456789abcdef", |op| {
+            auth_session_drop(&op, user, Some(session))
+        });
+        expect!("DELETE /auth/users/alice/sessions", |op| auth_session_drop(
+            &op, user, None
+        ));
+        expect!(
+            "GET /auth/users/alice/mapping-test",
+            |op| auth_mapping_test(&op, user)
+        );
+        expect!("DELETE /auth/mappings/ab-12", |op| auth_mapping_drop(
+            &op, "ab-12"
+        ));
+        expect!("POST /auth/keys/rotate", |op| auth_key_rotate(&op));
+    }
+
+    /// The calls that read their answer as data have to ask for it as data:
+    /// without the `Accept` header the far end answers in columns, and the
+    /// client would report a working spaceport as one it cannot read.
+    #[tokio::test]
+    async fn every_data_call_asks_for_json_on_its_own_route() {
+        let user = &a_user();
+
+        macro_rules! expect {
+            ($line:expr, $body:expr, |$op:ident| $call:expr) => {{
+                let (_, heard) = ask($body, |$op| async move { $call.await }).await;
+                assert_eq!(heard.line, $line);
+                assert_eq!(heard.accept.as_deref(), Some(wire::JSON), "{}", $line);
+            }};
+        }
+
+        expect!("GET /apps", "[]", |op| list(&op, None));
+        expect!("GET /apps?pattern=web-*", "[]", |op| list(
+            &op,
+            Some(&"web-*".parse().unwrap())
+        ));
+        expect!("GET /connections", "[]", |op| connections(&op));
+        expect!(
+            "GET /connections/acme",
+            r#"{"slug":"acme","name":"n","app_id":1,"owner":"o","client_id":"c","connected_at":"t","installations":{"installed":"nowhere"},"refreshed":{"refreshed":"never"}}"#,
+            |op| connection(&op, "acme")
+        );
+        expect!("GET /auth/users", "[]", |op| auth_user_list(&op, None));
+        expect!("GET /auth/users?pattern=a*", "[]", |op| auth_user_list(
+            &op,
+            Some(&"a*".parse().unwrap())
+        ));
+        expect!(
+            "GET /auth/users/alice/sessions",
+            r#"{"user":"alice","sessions":[],"keys":[]}"#,
+            |op| auth_session_list(&op, user)
+        );
+        expect!(
+            "GET /auth/users/alice/audit",
+            r#"{"user":"alice","id":"00000000-0000-4000-8000-000000000000","suspended":false,"email":null,"sso":[],"access":[],"entitlements":[]}"#,
+            |op| auth_audit(&op, user)
+        );
+        expect!("GET /auth/mappings", "[]", |op| auth_mapping_list(
+            &op, None
+        ));
+        expect!("GET /auth/mappings?app=site", "[]", |op| auth_mapping_list(
+            &op,
+            Some(&an_app())
+        ));
+        expect!("GET /auth/keys", "[]", |op| auth_key_list(&op));
+        expect!("GET /auth/log", "[]", |op| auth_log(&op, None));
+        expect!(
+            "GET /auth/log?user=00000000-0000-4000-8000-000000000000",
+            "[]",
+            |op| auth_log(
+                &op,
+                Some(&"00000000-0000-4000-8000-000000000000".parse().unwrap())
+            )
+        );
+    }
+
+    /// A manifest travels as the document it is, labelled as one, so the far
+    /// end reads YAML rather than guessing.
+    #[tokio::test]
+    async fn an_apply_carries_its_manifest_as_yaml() {
+        let (_, heard) = ask("applied", |op| async move {
+            apply(&op, &an_app(), "image: nginx\n".into(), false).await
+        })
+        .await;
+
+        assert_eq!(heard.content_type.as_deref(), Some("application/yaml"));
+        assert_eq!(heard.body, "image: nginx\n");
+    }
+
+    /// A secret's value is in the body and nowhere near the request line, which
+    /// every access log between here and the spaceport writes down — and what
+    /// comes back is read as what the spaceport did about it.
+    #[tokio::test]
+    async fn a_secret_travels_in_the_body_and_never_in_the_uri() {
+        let (set, heard) = ask(r#"{"created":true,"outcome":"stored"}"#, |op| async move {
+            set_secret(
+                &op,
+                &an_app(),
+                &"API_KEY".parse().unwrap(),
+                &Secret::new("hunter2&x=y"),
+            )
+            .await
+        })
+        .await;
+
+        assert_eq!(heard.line, "PUT /apps/site/secrets/API_KEY");
+        assert_eq!(heard.body, "hunter2&x=y");
+        assert!(!heard.line.contains("hunter2"), "{}", heard.line);
+        assert!(set.created);
+        assert_eq!(set.outcome, super::super::SecretOutcome::Stored);
+    }
+
+    /// An email may carry a `+` a query string would read as a space, so it is
+    /// the body; a create that binds an account names it in the query, encoded
+    /// whole.
+    #[tokio::test]
+    async fn a_user_create_sends_the_email_in_the_body() {
+        let (_, heard) = ask("created", |op| async move {
+            auth_user_create(
+                &op,
+                &"alice".parse().unwrap(),
+                Some("a+b@example.com"),
+                Some(("acme", "octocat")),
+            )
+            .await
+        })
+        .await;
+
+        assert_eq!(heard.line, "PUT /auth/users/alice?connect=acme%3Aoctocat");
+        assert_eq!(heard.body, "a+b@example.com");
+
+        let (_, heard) = ask("created", |op| async move {
+            auth_user_create(&op, &"alice".parse().unwrap(), None, None).await
+        })
+        .await;
+
+        assert_eq!(heard.line, "PUT /auth/users/alice");
+        assert_eq!(heard.body, "");
+    }
+
+    /// The handle a connect asserts rides in the body for the email's reason.
+    #[tokio::test]
+    async fn a_connect_sends_the_handle_in_the_body() {
+        let (_, heard) = ask("connected", |op| async move {
+            auth_user_connect(&op, &a_user(), "acme", "octo+cat").await
+        })
+        .await;
+
+        assert_eq!(heard.body, "octo+cat");
+    }
+
+    /// The three calls that carry JSON in the body label it as JSON and send
+    /// the fields the far end deserialises, secrets and all.
+    #[tokio::test]
+    async fn the_json_bodies_arrive_as_json() {
+        let registration = GithubRegistration {
+            slug: "acme".into(),
+            app_id: 7,
+            name: "Acme".into(),
+            owner: "acme-org".into(),
+            client_id: "cid".into(),
+            client_secret: "csecret".into(),
+            webhook_secret: "wsecret".into(),
+            private_key: "-----BEGIN-----".into(),
+        };
+        let (_, heard) = ask("connected", |op| async move {
+            connect_github(&op, &registration).await
+        })
+        .await;
+        assert_eq!(heard.line, "POST /connections/github");
+        assert_eq!(heard.content_type.as_deref(), Some("application/json"));
+        let sent: serde_json::Value = serde_json::from_str(&heard.body).unwrap();
+        assert_eq!(sent["app_id"], 7);
+        assert_eq!(sent["client_secret"], "csecret");
+
+        let request = GithubAppRequest {
+            org: Some("acme-org".into()),
+            name: None,
+        };
+        let (_, heard) = ask("visit https://github.com", |op| async move {
+            register_github(&op, &request).await
+        })
+        .await;
+        assert_eq!(heard.line, "POST /connections/github/register");
+        let sent: serde_json::Value = serde_json::from_str(&heard.body).unwrap();
+        assert_eq!(sent["org"], "acme-org");
+        assert!(sent["name"].is_null());
+
+        let mapping = MappingAdd {
+            via: "acme".into(),
+            app: an_app(),
+            roles: vec!["reader".parse().unwrap()],
+            conditions: Vec::new(),
+        };
+        let (_, heard) = ask("added", |op| async move {
+            auth_mapping_add(&op, &mapping).await
+        })
+        .await;
+        assert_eq!(heard.line, "POST /auth/mappings");
+        assert_eq!(heard.content_type.as_deref(), Some("application/json"));
+        let sent: serde_json::Value = serde_json::from_str(&heard.body).unwrap();
+        assert_eq!(sent["via"], "acme");
+        assert_eq!(sent["app"], "site");
+    }
+
+    /// A rule id is hex and hyphens, and anything else is refused before it
+    /// reaches a path where a reserved character would turn it into a string
+    /// the operator never typed. Nothing is sent: there is no socket to send it
+    /// to, and the refusal says so rather than that.
+    #[tokio::test]
+    async fn a_rule_id_that_is_not_one_is_refused_before_anything_is_sent() {
+        let operator = operator_on(nowhere(), Duration::from_secs(1));
+
+        for rule in ["", "ab/cd", "xyz"] {
+            let err = auth_mapping_drop(&operator, rule)
+                .await
+                .unwrap_err()
+                .to_string();
+
+            assert!(err.contains("is not a rule id"), "{err}");
+        }
+    }
+
+    /// A refusal's body is the message, because the far end wrote it for the
+    /// person who typed the command; the status only says whose problem it
+    /// is, and trailing whitespace is the server's formatting, not the point.
+    #[tokio::test]
+    async fn a_refusal_comes_back_as_exactly_what_the_server_said() {
+        let (path, _) =
+            a_spaceport_that_answers("refused", "409 Conflict", "app `site` is busy\n").await;
+        let operator = operator_on(path, Duration::from_secs(5));
+
+        let err = resume(&operator, &an_app()).await.unwrap_err();
+
+        assert_eq!(err.to_string(), "app `site` is busy");
+    }
+
+    /// A refusal is prose even when data was asked for, so a data call reports
+    /// it as the message and not as JSON it could not read.
+    #[tokio::test]
+    async fn a_refused_data_call_reports_the_message_rather_than_a_parse_failure() {
+        let (path, _) =
+            a_spaceport_that_answers("refusedj", "404 Not Found", "no user `alice`").await;
+        let operator = operator_on(path, Duration::from_secs(5));
+
+        let err = auth_audit(&operator, &a_user()).await.unwrap_err();
+
+        assert_eq!(err.to_string(), "no user `alice`");
+    }
+
+    /// `204` is a success with nothing to say, and a command that printed
+    /// whatever bytes came along with it would print nothing worse than nothing
+    /// — but it must still succeed, and say exactly nothing.
+    #[tokio::test]
+    async fn no_content_is_an_empty_answer() {
+        let (path, _) = a_spaceport_that_answers("empty", "204 No Content", "").await;
+        let operator = operator_on(path, Duration::from_secs(5));
+
+        assert_eq!(destroy(&operator, &an_app()).await.unwrap(), "");
+    }
+
+    /// An answer this version cannot read is a version mismatch and says so,
+    /// rather than surfacing serde's account of a column it did not expect.
+    #[tokio::test]
+    async fn an_answer_that_is_not_json_says_this_version_cannot_read_it() {
+        let (path, _) = a_spaceport_that_answers("garbage", "200 OK", "NAME  STATE").await;
+        let operator = operator_on(path, Duration::from_secs(5));
+
+        let err = format!("{:#}", list(&operator, None).await.unwrap_err());
+
+        assert!(err.contains("cannot read"), "{err}");
+    }
+
+    /// The two calls that read their answer as a typed value of their own say
+    /// which value it failed to be.
+    #[tokio::test]
+    async fn a_status_or_a_secret_outcome_that_is_not_one_says_so() {
+        let (path, _) = a_spaceport_that_answers("badstat", "200 OK", "fine").await;
+        let err = format!(
+            "{:#}",
+            status(&operator_on(path, Duration::from_secs(5)))
+                .await
+                .unwrap_err()
+        );
+        assert!(err.contains("not a status"), "{err}");
+
+        let (path, _) = a_spaceport_that_answers("badset", "200 OK", "stored").await;
+        let err = format!(
+            "{:#}",
+            set_secret(
+                &operator_on(path, Duration::from_secs(5)),
+                &an_app(),
+                &"API_KEY".parse().unwrap(),
+                &Secret::new("v"),
+            )
+            .await
+            .unwrap_err()
+        );
+        assert!(err.contains("setting a secret"), "{err}");
+    }
+
+    /// Nothing listening is the commonest failure there is, and the message has
+    /// to name the path that was tried — the operator's next question is
+    /// whether it was the right one.
+    #[tokio::test]
+    async fn no_socket_at_all_names_the_path_that_was_tried() {
+        let path = a_socket("absent");
+        let operator = operator_on(path.clone(), Duration::from_secs(1));
+
+        let err = format!("{:#}", show(&operator, &an_app(), false).await.unwrap_err());
+
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("no spaceport is listening"), "{err}");
+    }
+
+    /// A stream the far end refuses comes back as the far end's message, the
+    /// same as a refused command.
+    #[tokio::test]
+    async fn a_refused_stream_reports_the_message() {
+        let (path, _) =
+            a_spaceport_that_answers("refusedst", "400 Bad Request", "unknown level\n").await;
+        let operator = operator_on(path, Duration::from_secs(5));
+
+        let err = stream(&operator, &Watch::default(), |_| {})
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "unknown level");
+    }
 }

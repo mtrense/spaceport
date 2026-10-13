@@ -1004,6 +1004,137 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// A loopback port nobody is listening on, found by binding one and letting
+    /// it go. [`serve`] binds its own listeners and does not say where, so a
+    /// test that wants to knock on one has to choose the port up front — which
+    /// races anything else on the machine taking the same port in between, a
+    /// window narrow enough to live with in a test and no wider than this.
+    async fn free_port() -> std::net::SocketAddr {
+        TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    }
+
+    /// The whole edge, wired the way the daemon wires it: [`serve`] binds both
+    /// listeners, answers a real request on the plaintext one, and — once the
+    /// token is cancelled — stops accepting, lets the connection go and returns
+    /// `Ok`. Every other test here drives an accept loop by hand, so this is the
+    /// one that proves the pieces are put together and that a shutdown is a
+    /// clean return rather than a hang or an error.
+    ///
+    /// The request is a gate callback for a gated app, sent over plaintext,
+    /// because that is the one answer only a real plaintext listener can
+    /// provoke: the callback sets a `Secure` cookie, so over http it must
+    /// bounce the browser to the same URL over https rather than mint anything
+    /// — and the proxy tests' harness serves everything as https.
+    #[tokio::test]
+    async fn serves_until_shutdown_and_then_returns_cleanly() {
+        let http = free_port().await;
+        let https = free_port().await;
+        let config = Config::parse(&format!(
+            "schema_version: 1\nedge:\n  listen:\n    http: {http}\n    https: {https}\n"
+        ))
+        .unwrap();
+
+        let db = crate::state::Db::in_memory().unwrap();
+        let apps = Arc::new(AppStore::new());
+        apps.insert(crate::app::App {
+            id: "blog".parse().unwrap(),
+            manifest: crate::app::manifest::AppManifest::parse(
+                "schema_version: 1\nsource:\n  type: image\n  image: x\nrouting:\n  hosts: [alpha.test]\nauth:\n  gating: edge\n  roles: [reader]\n",
+            )
+            .unwrap(),
+            container: crate::runtime::ContainerId::new("test-container"),
+            upstream: free_port().await,
+        })
+        .unwrap();
+        let home = Arc::new(Home {
+            attempts: Arc::new(crate::connections::github::Attempts::new()),
+            connections: Arc::new(crate::connections::github::ConnectionRepository::new(
+                db.clone(),
+            )),
+            tracking: Arc::new(crate::connections::github::TrackingRepository::new(
+                db.clone(),
+            )),
+            github: crate::connections::github::api::testing::FakeGitHub::new(),
+            nudge: crate::connections::github::Nudge::new(),
+            builds: crate::connections::github::Nudge::new(),
+            hostname: None,
+            sessions: Arc::new(crate::auth::SessionRepository::new(db.clone())),
+            entitlements: Arc::new(crate::auth::EntitlementRepository::new(db.clone())),
+            auth_log: Arc::new(crate::auth::AuthLogRepository::new(db.clone())),
+            apps: apps.clone(),
+            signer: Arc::new(crate::auth::JwtSigner::new(db.clone())),
+            jwt_cache: Arc::new(crate::auth::JwtCache::new()),
+            https_port: https.port(),
+            logins: Arc::new(LoginAttempts::new()),
+            throttle: Arc::new(LoginThrottle::new()),
+            sso: Arc::new(crate::auth::SsoRepository::new(db.clone())),
+            identities: Arc::new(crate::auth::IdentityRepository::new(db)),
+        });
+        let acceptor = tls::acceptor(tls::resolver().unwrap()).unwrap();
+        let shutdown = CancellationToken::new();
+
+        let served = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                serve(
+                    &config,
+                    apps,
+                    home,
+                    acceptor,
+                    Arc::new(Challenges::new()),
+                    shutdown,
+                )
+                .await
+            }
+        });
+
+        // The listeners come up a moment after the spawn, so the first knock
+        // may find nobody home; a refused connect is that and nothing more.
+        let mut stream = None;
+        for _ in 0..200 {
+            if let Ok(connected) = TcpStream::connect(http).await {
+                stream = Some(connected);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut stream = stream.expect("the http listener never came up");
+
+        stream
+            .write_all(
+                b"GET /.spaceport/callback?nonce=unspent&next=%2Fposts HTTP/1.1\r\n\
+                  Host: alpha.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut answer = Vec::new();
+        tokio::time::timeout(PATIENCE, stream.read_to_end(&mut answer))
+            .await
+            .expect("the request was never answered")
+            .unwrap();
+        let answer = String::from_utf8_lossy(&answer).to_lowercase();
+        assert!(answer.starts_with("http/1.1 303 "), "{answer}");
+        assert!(
+            answer.contains(&format!(
+                "location: https://alpha.test:{}/.spaceport/callback?nonce=unspent&next=%2fposts\r\n",
+                https.port()
+            )),
+            "{answer}"
+        );
+        assert!(!answer.contains("set-cookie"), "{answer}");
+
+        shutdown.cancel();
+        let returned = tokio::time::timeout(PATIENCE, served)
+            .await
+            .expect("serve did not return after shutdown")
+            .unwrap();
+        assert!(returned.is_ok(), "{returned:?}");
+    }
+
     /// A client that will speak TLS to spaceport's self-signed certificate
     /// without an opinion about who signed it. The test is about what happens
     /// after the handshake, not about the handshake.

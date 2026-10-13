@@ -415,6 +415,35 @@ mod tests {
         }
     }
 
+    fn connection() -> wire::ConnectionRow {
+        wire::ConnectionRow {
+            slug: "spaceport-dev".to_owned(),
+            app_id: 12345,
+            owner: "acme".to_owned(),
+            connected_at: "2026-02-02T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn entry() -> wire::LogRow {
+        wire::LogRow {
+            at: "2026-02-02T00:00:00Z".to_owned(),
+            kind: "user.create".to_owned(),
+            user: Some("ada".to_owned()),
+            origin: "cli".to_owned(),
+            detail: None,
+        }
+    }
+
+    fn mapping() -> wire::MappingRow {
+        wire::MappingRow {
+            rule_id: "r1".to_owned(),
+            grants: "reader@wiki".to_owned(),
+            connection: "github".to_owned(),
+            conditions: vec!["org=acme".to_owned(), "team=ops".to_owned()],
+            created_at: "2026-02-02T00:00:00Z".to_owned(),
+        }
+    }
+
     #[test]
     fn writes_the_header_in_caps_and_the_rows_under_it() {
         let table = apps(&listed(), None, Colour::No);
@@ -590,6 +619,50 @@ mod tests {
                 .ends_with("2026-02-03T00:00:00Z"),
             "{table}"
         );
+    }
+
+    /// A connection is a decision, not a condition: the slug is bold and the
+    /// rest is written as it came, with no word of it changed by colour.
+    #[test]
+    fn writes_a_connection_under_its_header() {
+        let rows = &[connection()];
+        let table = connections(rows, Colour::No);
+
+        assert_eq!(
+            table,
+            "SLUG           APP ID  OWNER  CONNECTED\n\
+             spaceport-dev  12345   acme   2026-02-02T00:00:00Z\n",
+        );
+        assert_eq!(strip(&connections(rows, Colour::Yes)), table);
+    }
+
+    /// A log line with no detail ends where its origin does: an absent field is
+    /// an empty cell, and an empty last cell leaves nothing trailing.
+    #[test]
+    fn writes_a_log_entry_under_its_header() {
+        let rows = &[entry()];
+        let table = log(rows, None, Colour::No);
+
+        assert_eq!(
+            table,
+            "AT                    KIND         USER  ORIGIN  DETAIL\n\
+             2026-02-02T00:00:00Z  user.create  ada   cli\n",
+        );
+        assert_eq!(strip(&log(rows, None, Colour::Yes)), table);
+    }
+
+    /// A rule's conditions are one cell, joined the way they would be typed.
+    #[test]
+    fn writes_a_mapping_under_its_header() {
+        let rows = &[mapping()];
+        let table = mappings(rows, None, Colour::No);
+
+        assert_eq!(
+            table,
+            "RULE  MAPS         VIA     WHEN                CREATED\n\
+             r1    reader@wiki  github  org=acme, team=ops  2026-02-02T00:00:00Z\n",
+        );
+        assert_eq!(strip(&mappings(rows, None, Colour::Yes)), table);
     }
 
     /// Every empty listing names the command that would end it — which is why
